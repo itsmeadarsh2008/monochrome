@@ -1109,12 +1109,36 @@ return Response.json({ error: 'Playlist fetch failed: ' + e.message }, { status:
 
 
 // ─── Claudochrome 8SPINE Module Code ─────────────────────────────────────────
-// This is the self-contained JS that 8SPINE loads as a module.
-// __BASE_URL__ is replaced at runtime with the actual deployment URL.
+// Self-contained JS string loaded by 8SPINE's Module Manager.
+// - __BASE_URL__ is replaced at serve time with the actual deployment URL.
+// - All state (_token, _tokenPromise) lives inside this closure — completely
+//   isolated from Eclipse's withToken() / TOKEN_CACHE system. No cross-talk.
 const CLAUDOCHROME_SPINE_MODULE_CODE = `
+(function() {
 var MONO_BASE_URL = '__BASE_URL__';
 
-function monoFetch(path, params) {
+// ── Eager token pre-fetch — fires the moment 8SPINE loads this module ─────────
+// By the time the user taps search the token is already resolved.
+// Uses its own closure var — does NOT touch any Eclipse token state.
+var _spineTokenPromise = fetch(MONO_BASE_URL + '/generate', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({})
+}).then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
+  .then(function(d) { return d.token || null; })
+  .catch(function() { return null; });
+
+var _spineToken = null;
+
+function ensureToken() {
+  if (_spineToken) return Promise.resolve(_spineToken);
+  return _spineTokenPromise.then(function(t) {
+    _spineToken = t;
+    return t;
+  });
+}
+
+function spineFetch(tokenPath, params) {
   var qs = '';
   if (params) {
     var keys = Object.keys(params);
@@ -1124,160 +1148,100 @@ function monoFetch(path, params) {
       }).join('&');
     }
   }
-  return fetch(MONO_BASE_URL + path + qs, { headers: { 'Accept': 'application/json' } })
-    .then(function(r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    });
+  return fetch(MONO_BASE_URL + tokenPath + qs, { headers: { 'Accept': 'application/json' } })
+    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
 }
 
-var CLAUDOCHROME_MODULE = {
+var MODULE = {
   id: 'claudochrome-tidal',
   name: 'Claudochrome',
   version: '2.3.0',
   labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ'],
-  _token: null,
-
-  _ensureToken: async function() {
-    if (CLAUDOCHROME_MODULE._token) return CLAUDOCHROME_MODULE._token;
-    var genRes = await fetch(MONO_BASE_URL + '/generate', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({})
-    }).then(function(r) { return r.json(); }).catch(function() { return null; });
-    if (genRes && genRes.token) {
-      CLAUDOCHROME_MODULE._token = genRes.token;
-    }
-    return CLAUDOCHROME_MODULE._token;
-  },
 
   searchTracks: async function(query, limit) {
     var lim = limit || 20;
-    var token = await CLAUDOCHROME_MODULE._ensureToken();
+    var token = await ensureToken();
     if (!token) return { tracks: [], total: 0 };
-    return fetch(MONO_BASE_URL + '/u/' + token + '/search?q=' + encodeURIComponent(query) + '&limit=' + lim, {
-      headers: { 'Accept': 'application/json' }
-    }).then(function(r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    }).then(function(data) {
-      var tracks = (data.tracks || []).map(function(t) {
-        return {
-          id: token + '__' + t.id,
-          title: t.title || 'Unknown',
-          artist: t.artist || 'Unknown',
-          album: t.album || '',
-          duration: t.duration || 0,
-          albumCover: t.artworkURL || ''
-        };
-      });
-      return { tracks: tracks, total: tracks.length };
-    }).catch(function() { return { tracks: [], total: 0 }; });
+    return spineFetch('/u/' + token + '/search', { q: query, limit: lim })
+      .then(function(data) {
+        var tracks = (data.tracks || []).map(function(t) {
+          return {
+            id: token + '__' + t.id,
+            title: t.title || 'Unknown',
+            artist: t.artist || 'Unknown',
+            album: t.album || '',
+            duration: t.duration || 0,
+            albumCover: t.artworkURL || ''
+          };
+        });
+        return { tracks: tracks, total: tracks.length };
+      }).catch(function() { return { tracks: [], total: 0 }; });
   },
 
   getTrackStreamUrl: async function(trackId, quality) {
-    // trackId format: token__tidalId
     var sep = trackId.indexOf('__');
     if (sep === -1) return { streamUrl: null, track: { id: trackId, audioQuality: 'HIGH' } };
     var token = trackId.slice(0, sep);
     var tidalId = trackId.slice(sep + 2);
-    return fetch(MONO_BASE_URL + '/u/' + token + '/stream/' + encodeURIComponent(tidalId), {
-      headers: { 'Accept': 'application/json' }
-    }).then(function(r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    }).then(function(data) {
-      var aq = (data.quality === 'hires' || data.quality === 'lossless') ? 'LOSSLESS' : 'HIGH';
-      return {
-        streamUrl: data.url || data.streamUrl || null,
-        track: { id: trackId, audioQuality: aq }
-      };
-    }).catch(function() {
-      return { streamUrl: null, track: { id: trackId, audioQuality: 'HIGH' } };
-    });
+    return spineFetch('/u/' + token + '/stream/' + encodeURIComponent(tidalId), {})
+      .then(function(data) {
+        var aq = (data.quality === 'hires' || data.quality === 'lossless') ? 'LOSSLESS' : 'HIGH';
+        return { streamUrl: data.url || data.streamUrl || null, track: { id: trackId, audioQuality: aq } };
+      }).catch(function() {
+        return { streamUrl: null, track: { id: trackId, audioQuality: 'HIGH' } };
+      });
   },
 
   getAlbum: async function(albumId) {
-    var token = await CLAUDOCHROME_MODULE._ensureToken();
+    var token = await ensureToken();
     if (!token) return { album: null, tracks: [] };
     var sep = albumId.indexOf('__');
     var tok = sep !== -1 ? albumId.slice(0, sep) : token;
     var aid = sep !== -1 ? albumId.slice(sep + 2) : albumId;
-    return fetch(MONO_BASE_URL + '/u/' + tok + '/album/' + encodeURIComponent(aid), {
-      headers: { 'Accept': 'application/json' }
-    }).then(function(r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    }).then(function(data) {
-      var tracks = (data.tracks || []).map(function(t) {
+    return spineFetch('/u/' + tok + '/album/' + encodeURIComponent(aid), {})
+      .then(function(data) {
+        var tracks = (data.tracks || []).map(function(t) {
+          return {
+            id: tok + '__' + t.id,
+            title: t.title || 'Unknown',
+            artist: t.artist || data.artist || 'Unknown',
+            album: data.title || '',
+            duration: t.duration || 0,
+            albumCover: t.artworkURL || data.artworkURL || ''
+          };
+        });
         return {
-          id: tok + '__' + t.id,
-          title: t.title || 'Unknown',
-          artist: t.artist || data.artist || 'Unknown',
-          album: data.title || '',
-          duration: t.duration || 0,
-          albumCover: t.artworkURL || data.artworkURL || ''
+          album: { id: albumId, title: data.title || 'Unknown', artist: data.artist || 'Unknown', cover: data.artworkURL || '', year: data.year || '' },
+          tracks: tracks
         };
-      });
-      return {
-        album: {
-          id: albumId,
-          title: data.title || 'Unknown',
-          artist: data.artist || 'Unknown',
-          cover: data.artworkURL || '',
-          year: data.year || ''
-        },
-        tracks: tracks
-      };
-    }).catch(function() { return { album: null, tracks: [] }; });
+      }).catch(function() { return { album: null, tracks: [] }; });
   },
 
   getArtist: async function(artistId) {
-    var token = await CLAUDOCHROME_MODULE._ensureToken();
+    var token = await ensureToken();
     if (!token) return { artist: null, tracks: [], albums: [] };
     var sep = artistId.indexOf('__');
     var tok = sep !== -1 ? artistId.slice(0, sep) : token;
     var aid = sep !== -1 ? artistId.slice(sep + 2) : artistId;
-    return fetch(MONO_BASE_URL + '/u/' + tok + '/artist/' + encodeURIComponent(aid), {
-      headers: { 'Accept': 'application/json' }
-    }).then(function(r) {
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      return r.json();
-    }).then(function(data) {
-      var topTracks = (data.topTracks || []).map(function(t) {
+    return spineFetch('/u/' + tok + '/artist/' + encodeURIComponent(aid), {})
+      .then(function(data) {
+        var topTracks = (data.topTracks || []).map(function(t) {
+          return { id: tok + '__' + t.id, title: t.title || 'Unknown', artist: t.artist || data.name || 'Unknown', album: '', duration: t.duration || 0, albumCover: t.artworkURL || data.artworkURL || '' };
+        });
+        var albums = (data.albums || []).map(function(a) {
+          return { id: tok + '__' + a.id, title: a.title || 'Unknown', artist: a.artist || data.name || 'Unknown', cover: a.artworkURL || '', year: a.year || '' };
+        });
         return {
-          id: tok + '__' + t.id,
-          title: t.title || 'Unknown',
-          artist: t.artist || data.name || 'Unknown',
-          album: '',
-          duration: t.duration || 0,
-          albumCover: t.artworkURL || data.artworkURL || ''
+          artist: { id: artistId, name: data.name || 'Unknown', cover: data.artworkURL || '', bio: data.bio || null },
+          tracks: topTracks,
+          albums: albums
         };
-      });
-      var albums = (data.albums || []).map(function(a) {
-        return {
-          id: tok + '__' + a.id,
-          title: a.title || 'Unknown',
-          artist: a.artist || data.name || 'Unknown',
-          cover: a.artworkURL || '',
-          year: a.year || ''
-        };
-      });
-      return {
-        artist: {
-          id: artistId,
-          name: data.name || 'Unknown',
-          cover: data.artworkURL || '',
-          bio: data.bio || null
-        },
-        tracks: topTracks,
-        albums: albums
-      };
-    }).catch(function() { return { artist: null, tracks: [], albums: [] }; });
+      }).catch(function() { return { artist: null, tracks: [], albums: [] }; });
   }
 };
 
-return CLAUDOCHROME_MODULE;
+return MODULE;
+})();
 `;
 
 // ─── Helper: inject runtime base URL into module code ────────────────────────
@@ -1285,7 +1249,7 @@ function buildClaudochromeSpineJs(baseUrl) {
   return CLAUDOCHROME_SPINE_MODULE_CODE.replace(/__BASE_URL__/g, baseUrl);
 }
 
-// ─── 8SPINE Module info endpoint ─────────────────────────────────────────────
+// ─── 8SPINE: module info ──────────────────────────────────────────────────────
 app.get('/8spine', async c => {
   const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
   return c.json({
@@ -1298,7 +1262,7 @@ app.get('/8spine', async c => {
   });
 });
 
-// ─── 8SPINE Module JS download ────────────────────────────────────────────────
+// ─── 8SPINE: serve module JS ──────────────────────────────────────────────────
 app.get('/8spine.js', async c => {
   const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
   return new Response(buildClaudochromeSpineJs(base), {
@@ -1306,9 +1270,8 @@ app.get('/8spine.js', async c => {
   });
 });
 
-// ─── 8SPINE Source List ───────────────────────────────────────────────────────
-// Lists this addon + fetches and merges any extra source JSON URLs below.
-// To add more sources, just push their 8spine-source.json URL into this array.
+// ─── 8SPINE: source list — merges this addon + any extra source URLs ──────────
+// Add more 8spine-source.json URLs to EXTRA_SPINE_SOURCES to include them.
 const EXTRA_SPINE_SOURCES = [
   'https://all-in-one-seven-psi.vercel.app/8spine-source.json'
 ];
@@ -1316,7 +1279,6 @@ const EXTRA_SPINE_SOURCES = [
 app.get('/8spine-source.json', async c => {
   const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
 
-  // Claudochrome's own entry
   const ourEntry = {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
@@ -1329,7 +1291,6 @@ app.get('/8spine-source.json', async c => {
 
   const merged = { 'category:music': [ourEntry] };
 
-  // Fetch all extra source lists in parallel and merge
   const results = await Promise.all(
     EXTRA_SPINE_SOURCES.map(url =>
       fetch(url, { headers: { 'Accept': 'application/json' } })
@@ -1345,10 +1306,7 @@ app.get('/8spine-source.json', async c => {
       if (!Array.isArray(items)) continue;
       if (!merged[cat]) merged[cat] = [];
       for (const item of items) {
-        // Deduplicate by id
-        if (!merged[cat].find(e => e.id === item.id)) {
-          merged[cat].push(item);
-        }
+        if (!merged[cat].find(e => e.id === item.id)) merged[cat].push(item);
       }
     }
   }
