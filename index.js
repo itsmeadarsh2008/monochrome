@@ -149,11 +149,14 @@ return 0;
 // PREF_LOSSLESS: 16-bit 44.1 kHz CD lossless  (format 6 → 7 → 27 fallback)
 // PREF_320:      320 kbps MP3                  (format 5 only — no lossless upscale)
 // null/auto:     all formats best → worst
+// Format lists: for hi-res/lossless tiers, include lower as fallbacks (better than silence).
+// For PREF_320 and PREF_LOSSLESS: STRICT — do not silently upscale to a higher quality
+// than the user asked for. If the exact tier isn't available, TIDAL handles fallback.
 const QOBUZ_PREF_FMTS = {
-  PREF_HIMAX:    [27, 7, 6, 5],
-  PREF_HI96:     [7, 27, 6, 5],
-  PREF_LOSSLESS: [6, 7, 27, 5],
-  PREF_320:      [5],
+  PREF_HIMAX:    [27, 7, 6],   // 192→96→lossless; stop before 320 (lossy)
+  PREF_HI96:     [7, 27, 6],   // 96→192→lossless; stop before 320 (lossy)
+  PREF_LOSSLESS: [6],          // strict: lossless only — no surprise hi-res upscale
+  PREF_320:      [5],          // strict: 320 only — handled by TIDAL fallback if unavail
 };
 
 async function qobuzStream(trackId, prefKey) {
@@ -758,7 +761,7 @@ const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
-return dedupeCall('stream:' + tid + ':' + (inst || 'pool'), async () => {
+return dedupeCall('stream:' + tid + ':' + (inst || 'pool') + ':' + (pref || 'auto'), async () => {
 
 // Step 1: title+artist from Eclipse query params (some clients send these)
 let qTitle = String(c.req.query('title') || '').trim();
@@ -804,7 +807,10 @@ const tidalStartKey = qMap.tidalStart;
 
 // Step 4: Qobuz — ISRC exact match first, title+artist fuzzy fallback.
 // Skip Qobuz when user picked PREF_96 / LOW (TIDAL-only preference).
-const skipQobuz = (pref === 'PREF_96' || pref === 'LOW');
+// Skip Qobuz for low-quality prefs: PREF_96/LOW always, PREF_320/HIGH also skip
+// because Qobuz 320 kbps (format 5) is rarely available and the fallback inside
+// qobuzStream would return lossless anyway — defeating the user's quality choice.
+const skipQobuz = (pref === 'PREF_96' || pref === 'LOW' || pref === 'PREF_320' || pref === 'HIGH');
 if (!skipQobuz && (qTitle || qIsrc)) {
 try {
 const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc);
