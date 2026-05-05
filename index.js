@@ -886,12 +886,12 @@ if (!hasUrl) continue;
 // Check what tier TIDAL actually returned
 const returnedTierIdx = detectReturnedTier(payload, decoded);
 
-// If TIDAL returned higher quality than requested, SKIP this result.
-// The user explicitly wants lower quality — don't betray that.
-// Exception: if this is the last option (no lower tier to try), accept it anyway.
-const isLastOption = (qi === qualities.length - 1);
-if (returnedTierIdx < requestedTierIdx && !isLastOption) {
-  console.log('tidal: returned tier', ALL_QUALITIES[returnedTierIdx], 'but requested', ql, '— skipping, trying lower');
+// If TIDAL returned a HIGHER quality than requested, skip — never betray the user pref.
+// NO last-option exception: serving wrong quality is worse than returning nothing.
+// When no pref is set (tidalStartKey=null / AUTO_QUALITIES), always accept any tier.
+const hasPref = !!tidalStartKey;
+if (hasPref && returnedTierIdx < requestedTierIdx) {
+  console.log('tidal: returned tier', ALL_QUALITIES[returnedTierIdx], 'but requested', ql, '— skipping (strict pref)');
   continue;
 }
 
@@ -906,7 +906,9 @@ if (qi === qualities.length - 1) return Response.json({ error: 'Could not get st
 }
 }
 
-return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
+// If we exhausted all quality tiers and every response was too high (strict pref),
+// return a clear error so Eclipse shows "unavailable" rather than wrong quality.
+return Response.json({ error: 'No stream at requested quality (' + (pref || 'auto') + ') for track ' + tid + '. Track may not be available at this quality tier.' }, { status: 404 });
 }); // end dedupeCall
 
 });
