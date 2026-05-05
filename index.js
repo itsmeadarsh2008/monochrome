@@ -193,7 +193,7 @@ async function qobuzStream(trackId, prefKey) {
       const { url, inst } = hit.value;
       if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
       const result = {
-        url, format: fmtLabel[fmt], quality: fmtQuality[fmt],
+        url, format: fmtLabel[fmt], quality: fmtQuality[fmt], fmt,
         source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1680
       };
       cSet(cacheKey, result, 1680);
@@ -811,14 +811,28 @@ const tidalStartKey = qMap.tidalStart;
 // because Qobuz 320 kbps (format 5) is rarely available and the fallback inside
 // qobuzStream would return lossless anyway — defeating the user's quality choice.
 const skipQobuz = (pref === 'PREF_96' || pref === 'LOW' || pref === 'PREF_320' || pref === 'HIGH');
+// Qobuz quality tier index (higher = lower quality, matches TIDAL tier scale)
+// fmt 27/7 → tier 0 (hires), fmt 6 → tier 1 (lossless), fmt 5 → tier 2 (320), absent → tier 3
+const QOBUZ_PREF_TIER = { PREF_HIMAX: 0, PREF_HI96: 0, PREF_LOSSLESS: 1, PREF_320: 2, PREF_96: 3, HI_RES_LOSSLESS: 0, LOSSLESS: 1, HIGH: 2, LOW: 3 };
+const QOBUZ_FMT_TIER  = { 27: 0, 7: 0, 6: 1, 5: 2 };
+
 if (!skipQobuz && (qTitle || qIsrc)) {
 try {
 const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc);
 if (qTrack && qTrack.id) {
 const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
 if (qStream) {
-console.log('qobuz: HIT', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '->', qTrack.id, qStream.quality, '(pref:', pref || 'auto', ')');
-return Response.json(qStream);
+  // Validate: reject if Qobuz returned higher quality than the user requested.
+  // This catches stale cache hits and format fallbacks returning lossless for a 320 pref.
+  const returnedFmtTier = QOBUZ_FMT_TIER[qStream.fmt] !== undefined ? QOBUZ_FMT_TIER[qStream.fmt]
+    : (qStream.quality === 'lossless' ? 1 : qStream.quality === '320kbps' ? 2 : qStream.quality && qStream.quality.includes('hires') ? 0 : 1);
+  const requestedQTier = (pref && QOBUZ_PREF_TIER[pref] !== undefined) ? QOBUZ_PREF_TIER[pref] : -1; // -1 = no pref = accept anything
+  if (requestedQTier >= 0 && returnedFmtTier < requestedQTier) {
+    console.log('qobuz: rejected result (tier', returnedFmtTier, ') — higher than requested pref tier', requestedQTier, '(', pref, ') — TIDAL fallback');
+  } else {
+    console.log('qobuz: HIT', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '->', qTrack.id, qStream.quality, '(pref:', pref || 'auto', ')');
+    return Response.json(qStream);
+  }
 }
 }
 console.log('qobuz: no match for', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '- TIDAL fallback');
