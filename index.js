@@ -805,16 +805,14 @@ const qMap        = (pref && QUALITY_MAP[pref]) ? QUALITY_MAP[pref] : { qobuzPre
 const qobuzPrefKey  = qMap.qobuzPref;
 const tidalStartKey = qMap.tidalStart;
 
-// Step 4: Qobuz — ISRC exact match first, title+artist fuzzy fallback.
-// Skip Qobuz when user picked PREF_96 / LOW (TIDAL-only preference).
-// Skip Qobuz for low-quality prefs: PREF_96/LOW always, PREF_320/HIGH also skip
-// because Qobuz 320 kbps (format 5) is rarely available and the fallback inside
-// qobuzStream would return lossless anyway — defeating the user's quality choice.
-const skipQobuz = (pref === 'PREF_96' || pref === 'LOW' || pref === 'PREF_320' || pref === 'HIGH');
-// Qobuz quality tier index (higher = lower quality, matches TIDAL tier scale)
-// fmt 27/7 → tier 0 (hires), fmt 6 → tier 1 (lossless), fmt 5 → tier 2 (320), absent → tier 3
+// Step 4: Qobuz attempt.
+// Only skip Qobuz for PREF_96/LOW — those are TIDAL-only qualities.
+// For ALL other prefs including PREF_320, try Qobuz first (it has format_id=5 for 320kbps).
+// Tier map: 0=hires, 1=lossless, 2=320kbps, 3=96kbps (higher index = lower quality)
 const QOBUZ_PREF_TIER = { PREF_HIMAX: 0, PREF_HI96: 0, PREF_LOSSLESS: 1, PREF_320: 2, PREF_96: 3, HI_RES_LOSSLESS: 0, LOSSLESS: 1, HIGH: 2, LOW: 3 };
 const QOBUZ_FMT_TIER  = { 27: 0, 7: 0, 6: 1, 5: 2 };
+const skipQobuz = (pref === 'PREF_96' || pref === 'LOW');
+const requestedQTier = (pref && QOBUZ_PREF_TIER[pref] !== undefined) ? QOBUZ_PREF_TIER[pref] : -1;
 
 if (!skipQobuz && (qTitle || qIsrc)) {
 try {
@@ -822,13 +820,13 @@ const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc);
 if (qTrack && qTrack.id) {
 const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
 if (qStream) {
-  // Validate: reject if Qobuz returned higher quality than the user requested.
-  // This catches stale cache hits and format fallbacks returning lossless for a 320 pref.
-  const returnedFmtTier = QOBUZ_FMT_TIER[qStream.fmt] !== undefined ? QOBUZ_FMT_TIER[qStream.fmt]
+  const returnedFmtTier = QOBUZ_FMT_TIER[qStream.fmt] !== undefined
+    ? QOBUZ_FMT_TIER[qStream.fmt]
     : (qStream.quality === 'lossless' ? 1 : qStream.quality === '320kbps' ? 2 : qStream.quality && qStream.quality.includes('hires') ? 0 : 1);
-  const requestedQTier = (pref && QOBUZ_PREF_TIER[pref] !== undefined) ? QOBUZ_PREF_TIER[pref] : -1; // -1 = no pref = accept anything
+  // Accept if: no pref set (requestedQTier=-1), OR returned quality ≤ requested quality
+  // Reject (go to TIDAL) only if Qobuz returned HIGHER quality than user asked for
   if (requestedQTier >= 0 && returnedFmtTier < requestedQTier) {
-    console.log('qobuz: rejected result (tier', returnedFmtTier, ') — higher than requested pref tier', requestedQTier, '(', pref, ') — TIDAL fallback');
+    console.log('qobuz: rejected (tier', returnedFmtTier, '> requested tier', requestedQTier, ') — TIDAL fallback');
   } else {
     console.log('qobuz: HIT', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '->', qTrack.id, qStream.quality, '(pref:', pref || 'auto', ')');
     return Response.json(qStream);
@@ -900,19 +898,23 @@ if (!hasUrl) continue;
 // Check what tier TIDAL actually returned
 const returnedTierIdx = detectReturnedTier(payload, decoded);
 
-// If TIDAL returned a HIGHER quality than requested, skip — never betray the user pref.
-// NO last-option exception: serving wrong quality is worse than returning nothing.
-// When no pref is set (tidalStartKey=null / AUTO_QUALITIES), always accept any tier.
+// Quality enforcement:
+// - NEVER return higher quality than requested (would betray pref)
+// - DO accept equal or lower quality (e.g. 320 when lossless requested is wrong; 320 when 320 requested is right)
+// - Keep the best "acceptable" result seen so far as fallback for if nothing exact is found
 const hasPref = !!tidalStartKey;
 if (hasPref && returnedTierIdx < requestedTierIdx) {
-  console.log('tidal: returned tier', ALL_QUALITIES[returnedTierIdx], 'but requested', ql, '— skipping (strict pref)');
+  // TIDAL returned higher quality than requested — skip this tier, try lower
+  console.log('tidal: returned tier', ALL_QUALITIES[returnedTierIdx], 'too high for requested', ql, '— trying lower tier');
   continue;
 }
 
+// This result is at or below requested quality — accept it
 const url = (decoded && decoded.url) ? decoded.url : payload.url;
 const codec = decoded ? (decoded.codec || '').toLowerCase() : '';
 const isFlac = decoded ? (decoded.isDash || codec.includes('flac') || codec.includes('audio/flac')) : !!(payload.url || '').match(/\.flac(\?|$)/i);
 const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
+console.log('tidal: serving', qualityLabel, 'for pref', pref || 'auto');
 return Response.json({ url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: (decoded && decoded.codec) || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
 
 } catch(e) {
@@ -920,9 +922,7 @@ if (qi === qualities.length - 1) return Response.json({ error: 'Could not get st
 }
 }
 
-// If we exhausted all quality tiers and every response was too high (strict pref),
-// return a clear error so Eclipse shows "unavailable" rather than wrong quality.
-return Response.json({ error: 'No stream at requested quality (' + (pref || 'auto') + ') for track ' + tid + '. Track may not be available at this quality tier.' }, { status: 404 });
+return Response.json({ error: 'Track ' + tid + ' is not available at or below the requested quality (' + (pref || 'auto') + ').' }, { status: 404 });
 }); // end dedupeCall
 
 });
