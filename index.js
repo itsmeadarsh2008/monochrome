@@ -143,30 +143,22 @@ return 0;
 // ─── Qobuz client ─────────────────────────────────────────────────────────────
 // qobuzStream: races ALL (instance × format) combos in parallel — picks best quality winner.
 // Stream URLs are cached for 28 min (Qobuz URLs expire at 30 min).
-// Qobuz quality preference → format_ids to try (best-first within that preference)
-// PREF_HIMAX:    Hi-Res 24-bit up to 192 kHz (format 27 → 7 → 6 fallback)
-// PREF_HI96:     Hi-Res 24-bit up to  96 kHz (format 7 → 27 → 6 fallback)
-// PREF_LOSSLESS: 16-bit 44.1 kHz CD lossless  (format 6 → 7 → 27 fallback)
-// PREF_320:      320 kbps MP3                  (format 5 only — no lossless upscale)
-// null/auto:     all formats best → worst
-// Format lists: for hi-res/lossless tiers, include lower as fallbacks (better than silence).
-// For PREF_320 and PREF_LOSSLESS: STRICT — do not silently upscale to a higher quality
-// than the user asked for. If the exact tier isn't available, TIDAL handles fallback.
-const QOBUZ_PREF_FMTS = {
-  PREF_HIMAX:    [27, 7, 6],   // 192→96→lossless; stop before 320 (lossy)
-  PREF_HI96:     [7, 27, 6],   // 96→192→lossless; stop before 320 (lossy)
-  PREF_LOSSLESS: [6],          // strict: lossless only — no surprise hi-res upscale
-  PREF_320:      [5],          // strict: 320 only — handled by TIDAL fallback if unavail
-};
-
 async function qobuzStream(trackId, prefKey) {
-  const allFmtOrder = [27, 7, 6, 5];
-  const fmtOrder = (prefKey && QOBUZ_PREF_FMTS[prefKey]) ? QOBUZ_PREF_FMTS[prefKey] : allFmtOrder;
-
+  // prefKey: 'HIMAX'|'HI96'|'LOSSLESS'|'AAC320'|'AAC96'|null
+  if (prefKey === 'AAC96') return null; // TIDAL-only tier — skip Qobuz
   const cacheKey = 'qstream:' + trackId + ':' + (prefKey || 'auto');
   const cached = cGet(cacheKey);
   if (cached) return cached;
 
+  // Build format priority list based on user preference
+  const PREF_FMT_ORDER = {
+    'HIMAX':    [27, 7, 6, 5],
+    'HI96':     [7, 27, 6, 5],
+    'LOSSLESS': [6, 7, 27, 5],
+    'AAC320':   [5],
+    'HI_RES_LOSSLESS': [27, 7, 6, 5],
+  };
+  const fmtOrder = (prefKey && PREF_FMT_ORDER[prefKey]) || [27, 7, 6, 5];
   const fmtQuality = { 27: 'hires-192', 7: 'hires-96', 6: 'lossless', 5: '320kbps' };
   const fmtLabel   = { 27: 'flac',      7: 'flac',     6: 'flac',     5: 'mp3' };
 
@@ -186,17 +178,17 @@ async function qobuzStream(trackId, prefKey) {
     })
   ));
 
-  // Pick best result respecting fmtOrder preference
+  // Pick highest-quality successful result
   for (const fmt of fmtOrder) {
     const hit = results.find(r => r.status === 'fulfilled' && r.value.fmt === fmt);
     if (hit) {
       const { url, inst } = hit.value;
       if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
       const result = {
-        url, format: fmtLabel[fmt], quality: fmtQuality[fmt], fmt,
+        url, format: fmtLabel[fmt], quality: fmtQuality[fmt],
         source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1680
       };
-      cSet(cacheKey, result, 1680);
+      cSet(cacheKey, result, 1680); // cache for 28 min
       return result;
     }
   }
@@ -523,15 +515,18 @@ h += '<div class="lbl">Custom Hi&#8209;Fi Instance <span style="color:#2a2a2a;fo
 h += '<input type="text" id="customInstance" placeholder="https://your-instance.example.com">';
 h += '<div class="hint">Leave blank to use the shared pool. Paste your own self-hosted Hi-Fi API URL to lock this token exclusively to your instance.</div>';
 h += '<div class="lbl">Preferred Audio Quality <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
+h += '<div style="font-size:10px;color:#555;margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em">Qobuz Quality</div>';
 h += '<div class="ql-row">';
-h += '<div style="font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Qobuz &amp; TIDAL quality</div>';
-h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-PREF_HIMAX" onclick="selectQuality(\'PREF_HIMAX\')">Hi-Res 192<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / 192 kHz</span></div>';
-h += '<div class="ql-btn" id="ql-PREF_HI96" onclick="selectQuality(\'PREF_HI96\')">Hi-Res 96<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / 96 kHz</span></div>';
-h += '<div class="ql-btn" id="ql-PREF_LOSSLESS" onclick="selectQuality(\'PREF_LOSSLESS\')">Lossless<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">16-bit / 44.1 kHz</span></div>';
-h += '<div class="ql-btn" id="ql-PREF_320" onclick="selectQuality(\'PREF_320\')">320 kbps<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">Qobuz MP3 / TIDAL AAC</span></div>';
-h += '<div class="ql-btn" id="ql-PREF_96" onclick="selectQuality(\'PREF_96\')">96 kbps<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">TIDAL AAC only</span></div>';
+h += '<div class="ql-btn" id="ql-HIMAX" onclick="selectQuality(\'HIMAX\')">Hi-Res 192<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / up to 192kHz</span></div>';
+h += '<div class="ql-btn" id="ql-HI96" onclick="selectQuality(\'HI96\')">Hi-Res 96<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / up to 96kHz</span></div>';
+h += '<div class="ql-btn" id="ql-LOSSLESS" onclick="selectQuality(\'LOSSLESS\')">Lossless<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">16-bit / 44.1kHz</span></div>';
+h += '<div class="ql-btn" id="ql-AAC320" onclick="selectQuality(\'AAC320\')">320 kbps<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">Qobuz AAC 320</span></div>';
 h += '</div>';
+h += '<div style="font-size:10px;color:#555;margin-bottom:5px;margin-top:10px;text-transform:uppercase;letter-spacing:.06em">TIDAL Quality</div>';
+h += '<div class="ql-row">';
+h += '<div class="ql-btn" id="ql-HI_RES_LOSSLESS" onclick="selectQuality(\'HI_RES_LOSSLESS\')">Hi-Res Max<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / up to 192kHz</span></div>';
+h += '<div class="ql-btn" id="ql-HIGH" onclick="selectQuality(\'HIGH\')">CD Lossless<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">16-bit / 44.1kHz</span></div>';
+h += '<div class="ql-btn" id="ql-LOW" onclick="selectQuality(\'LOW\')">AAC 96<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">96 kbps</span></div>';
 h += '</div>';
 h += '<div class="hint" id="qlHint">No preference &mdash; addon auto-selects: Qobuz Hi-Res &rarr; TIDAL Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
 h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
@@ -560,10 +555,8 @@ h += '</div>';
 h += '<footer>Claudochrome Eclipse Addon v2.3.0 &bull; TIDAL search + Qobuz Hi-Res streams</footer>';
 h += '<script>';
 h += 'var gu,ru,selQ=null;';
-h += 'var QLABELS={"HI_RES_LOSSLESS":"Hi-Res Max (TIDAL MAX / MQA)","LOSSLESS":"Lossless (FLAC 16-bit CD)","HIGH":"AAC 320 kbps","LOW":"AAC 96 kbps"};';
-h += 'var QLABELS={PREF_HIMAX:"Qobuz Hi-Res 24-bit / 192 kHz",PREF_HI96:"Qobuz Hi-Res 24-bit / 96 kHz",PREF_LOSSLESS:"Lossless 16-bit 44.1 kHz (Qobuz & TIDAL)",PREF_320:"320 kbps (Qobuz MP3 / TIDAL AAC)",PREF_96:"96 kbps (TIDAL AAC only)"};';
-h += 'var ALL_QL=["PREF_HIMAX","PREF_HI96","PREF_LOSSLESS","PREF_320","PREF_96"];';
-h += 'function selectQuality(q){if(selQ===q)selQ=null;else selQ=q;ALL_QL.forEach(function(k){var el=document.getElementById("ql-"+k);if(el)el.classList.toggle("sel",selQ===k);});document.getElementById("qlHint").textContent=selQ?"\u25b6 "+QLABELS[selQ]+" \u2014 fallback to lower if unavailable.":"\u00a0No preference \u2014 auto-selects: Qobuz Hi-Res 192 \u2192 96 \u2192 Lossless \u2192 320 kbps \u2192 96 kbps.";}';
+h += 'var QLABELS={"HIMAX":"Hi-Res 192 · 24-bit/192kHz (Qobuz)","HI96":"Hi-Res 96 · 24-bit/96kHz (Qobuz)","LOSSLESS":"Lossless · 16-bit/44.1kHz FLAC","AAC320":"320 kbps AAC (Qobuz)","HI_RES_LOSSLESS":"TIDAL Hi-Res Max · 24-bit/192kHz","HIGH":"TIDAL CD Lossless · 16-bit/44.1kHz","LOW":"TIDAL AAC 96 kbps"};';
+h += 'function selectQuality(q){if(selQ===q)selQ=null;else selQ=q;["HIMAX","HI96","LOSSLESS","AAC320","HI_RES_LOSSLESS","HIGH","LOW"].forEach(function(k){var el=document.getElementById("ql-"+k);if(el)el.classList.toggle("sel",selQ===k);});document.getElementById("qlHint").textContent=selQ?"Preferred: "+QLABELS[selQ]+" \u2014 fallback to lower if unavailable.":"\u00a0No preference \u2014 auto-selects: Qobuz Hi-Res \u2192 TIDAL Lossless \u2192 AAC 320 \u2192 AAC 96.";}';
 h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";var ci=document.getElementById("customInstance").value.trim();while(ci.length&&ci[ci.length-1]=="/")ci=ci.slice(0,-1);var body={};if(ci)body.instanceUrl=ci;if(selQ)body.preferredQuality=selQ;fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}gu=d.manifestUrl;document.getElementById("genUrl").textContent=gu;document.getElementById("genBadge").style.display=d.usingCustomInstance?"block":"none";document.getElementById("genBox").style.display="block";btn.disabled=false;btn.textContent="Regenerate URL";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}';
 h += 'function copyGen(){if(!gu)return;navigator.clipboard.writeText(gu).then(function(){var b=document.getElementById("copyGenBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);});}';
 h += 'function doRefresh(){var btn=document.getElementById("refBtn");var eu=document.getElementById("existingUrl").value.trim();if(!eu){alert("Paste your existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu})}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh Existing URL";return;}ru=d.manifestUrl;document.getElementById("refUrl").textContent=ru;document.getElementById("refBox").style.display="block";btn.disabled=false;btn.textContent="Refresh Again";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh Existing URL";});}';
@@ -592,7 +585,7 @@ try {
 await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, timeout: 8000 });
 } catch(e) { return Response.json({ error: 'Could not reach your instance: ' + e.message }, { status: 400 }); }
 }
-const VALID_QUALITIES = ['PREF_HIMAX', 'PREF_HI96', 'PREF_LOSSLESS', 'PREF_320', 'PREF_96', 'HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
+const VALID_QUALITIES = ['HI_RES_LOSSLESS','HIRESLOSSLESS','HIMAX','HI96','LOSSLESS','HIGH','AAC320','LOW','AAC96'];
 const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
 const token = generateToken();
 const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality };
@@ -761,7 +754,7 @@ const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
-return dedupeCall('stream:' + tid + ':' + (inst || 'pool') + ':' + (pref || 'auto'), async () => {
+return dedupeCall('stream:' + tid + ':' + (inst || 'pool'), async () => {
 
 // Step 1: title+artist from Eclipse query params (some clients send these)
 let qTitle = String(c.req.query('title') || '').trim();
@@ -782,55 +775,24 @@ if (redisMeta) { qTitle = redisMeta.title; qArtist = redisMeta.artist; if (!qIsr
 
 if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid, '- skipping Qobuz');
 
-// ── Unified quality key → Qobuz pref + TIDAL start tier ─────────────────────
-// New unified keys:
-//   PREF_HIMAX    → Qobuz 192kHz hires   / TIDAL HI_RES_LOSSLESS
-//   PREF_HI96     → Qobuz 96kHz hires    / TIDAL HI_RES_LOSSLESS
-//   PREF_LOSSLESS → Qobuz CD lossless    / TIDAL LOSSLESS
-//   PREF_320      → Qobuz 320 kbps       / TIDAL HIGH
-//   PREF_96       → skip Qobuz           / TIDAL LOW only
-// Legacy TIDAL-only keys kept for backwards compat with old tokens.
-const QUALITY_MAP = {
-  PREF_HIMAX:      { qobuzPref: 'PREF_HIMAX',    tidalStart: 'HI_RES_LOSSLESS' },
-  PREF_HI96:       { qobuzPref: 'PREF_HI96',     tidalStart: 'HI_RES_LOSSLESS' },
-  PREF_LOSSLESS:   { qobuzPref: 'PREF_LOSSLESS',  tidalStart: 'LOSSLESS' },
-  PREF_320:        { qobuzPref: 'PREF_320',       tidalStart: 'HIGH' },
-  PREF_96:         { qobuzPref: null,              tidalStart: 'LOW' },
-  HI_RES_LOSSLESS: { qobuzPref: 'PREF_HIMAX',    tidalStart: 'HI_RES_LOSSLESS' },
-  LOSSLESS:        { qobuzPref: 'PREF_LOSSLESS',  tidalStart: 'LOSSLESS' },
-  HIGH:            { qobuzPref: 'PREF_320',       tidalStart: 'HIGH' },
-  LOW:             { qobuzPref: null,              tidalStart: 'LOW' },
-};
-const qMap        = (pref && QUALITY_MAP[pref]) ? QUALITY_MAP[pref] : { qobuzPref: null, tidalStart: null };
-const qobuzPrefKey  = qMap.qobuzPref;
-const tidalStartKey = qMap.tidalStart;
-
-// Step 4: Qobuz attempt.
-// Only skip Qobuz for PREF_96/LOW — those are TIDAL-only qualities.
-// For ALL other prefs including PREF_320, try Qobuz first (it has format_id=5 for 320kbps).
-// Tier map: 0=hires, 1=lossless, 2=320kbps, 3=96kbps (higher index = lower quality)
-const QOBUZ_PREF_TIER = { PREF_HIMAX: 0, PREF_HI96: 0, PREF_LOSSLESS: 1, PREF_320: 2, PREF_96: 3, HI_RES_LOSSLESS: 0, LOSSLESS: 1, HIGH: 2, LOW: 3 };
-const QOBUZ_FMT_TIER  = { 27: 0, 7: 0, 6: 1, 5: 2 };
-const skipQobuz = (pref === 'PREF_96' || pref === 'LOW');
-const requestedQTier = (pref && QOBUZ_PREF_TIER[pref] !== undefined) ? QOBUZ_PREF_TIER[pref] : -1;
-
-if (!skipQobuz && (qTitle || qIsrc)) {
+// Step 4: Qobuz Hi-Res — ISRC exact match first, title+artist fuzzy fallback
+if (qTitle || qIsrc) {
 try {
 const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc);
 if (qTrack && qTrack.id) {
-const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
+// Map stored pref key to Qobuz tier
+        const PREF_TO_QOBUZ_KEY = {
+          'HI_RES_LOSSLESS': 'HIMAX', 'HIRESLOSSLESS': 'HIMAX', 'HIMAX': 'HIMAX',
+          'HI96': 'HI96',
+          'LOSSLESS': 'LOSSLESS',
+          'HIGH': 'AAC320', 'AAC320': 'AAC320',
+          'LOW': 'AAC96',  'AAC96': 'AAC96',
+        };
+        const qobuzPrefKey = pref ? (PREF_TO_QOBUZ_KEY[pref] || null) : null;
+        const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
 if (qStream) {
-  const returnedFmtTier = QOBUZ_FMT_TIER[qStream.fmt] !== undefined
-    ? QOBUZ_FMT_TIER[qStream.fmt]
-    : (qStream.quality === 'lossless' ? 1 : qStream.quality === '320kbps' ? 2 : qStream.quality && qStream.quality.includes('hires') ? 0 : 1);
-  // Accept if: no pref set (requestedQTier=-1), OR returned quality ≤ requested quality
-  // Reject (go to TIDAL) only if Qobuz returned HIGHER quality than user asked for
-  if (requestedQTier >= 0 && returnedFmtTier < requestedQTier) {
-    console.log('qobuz: rejected (tier', returnedFmtTier, '> requested tier', requestedQTier, ') — TIDAL fallback');
-  } else {
-    console.log('qobuz: HIT', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '->', qTrack.id, qStream.quality, '(pref:', pref || 'auto', ')');
-    return Response.json(qStream);
-  }
+console.log('qobuz: HIT', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '->', qTrack.id, qStream.quality);
+return Response.json(qStream);
 }
 }
 console.log('qobuz: no match for', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '- TIDAL fallback');
@@ -840,89 +802,47 @@ console.warn('qobuz: error', e.message);
 }
 
 // Step 5: TIDAL fallback
-const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
-const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
-const qualities = tidalStartKey
-  ? [tidalStartKey, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(tidalStartKey))]
-  : AUTO_QUALITIES;
-
-// TIDAL's HiFi API ignores the quality param and returns whatever tier it has for that
-// account/track. We must inspect the actual returned codec and REJECT responses that are
-// higher quality than requested — otherwise a PREF_320 user always gets FLAC.
-// Tier hierarchy (higher index = lower quality):
-//   0: HI_RES_LOSSLESS  → flac hi-res (>44.1kHz or MQA)
-//   1: LOSSLESS         → flac 44.1kHz 16-bit
-//   2: HIGH             → aac 320kbps  (or mp4a, m4a)
-//   3: LOW              → aac 96kbps
-function getTidalTierIndex(ql) {
-  return ALL_QUALITIES.indexOf(ql); // 0=best, 3=worst
-}
-function detectReturnedTier(payload, decoded) {
-  // Inspect codec + audioQuality fields to figure out what TIDAL actually returned
-  const aq = (payload.audioQuality || '').toUpperCase();
-  if (aq === 'HI_RES_LOSSLESS' || aq === 'HI_RES') return 0;
-  if (aq === 'LOSSLESS') return 1;
-  if (aq === 'HIGH') return 2;
-  if (aq === 'LOW') return 3;
-  // Fallback: infer from codec
-  if (decoded) {
-    const codec = (decoded.codec || decoded.mimeType || '').toLowerCase();
-    const isDash = decoded.isDash;
-    if (isDash || codec.includes('flac') || codec.includes('audio/flac')) {
-      // DASH FLAC could be hi-res or lossless — treat as LOSSLESS (tier 1) worst case
-      return 1;
-    }
-    if (codec.includes('aac') || codec.includes('mp4a') || codec.includes('m4a')) return 2;
-  }
-  if (payload.url) {
-    const u = payload.url.toLowerCase();
-    if (u.includes('.flac')) return 1;
-    if (u.includes('.m4a') || u.includes('.aac')) return 2;
-  }
-  return 1; // unknown — assume lossless to be safe
-}
+// Map any pref key to TIDAL's native quality tier
+    const PREF_TO_TIDAL = {
+      'HI_RES_LOSSLESS': 'HI_RES_LOSSLESS', 'HIRESLOSSLESS': 'HI_RES_LOSSLESS',
+      'HIMAX': 'HI_RES_LOSSLESS', 'HI96': 'HI_RES_LOSSLESS',
+      'LOSSLESS': 'LOSSLESS',
+      'HIGH': 'HIGH', 'AAC320': 'HIGH',
+      'LOW': 'LOW',   'AAC96': 'LOW',
+    };
+    const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
+    const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
+    const tidalStartTier = pref ? (PREF_TO_TIDAL[pref] || 'LOSSLESS') : null;
+    const qualities = tidalStartTier
+      ? [tidalStartTier, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(tidalStartTier))]
+      : AUTO_QUALITIES;
 
 for (let qi = 0; qi < qualities.length; qi++) {
 const ql = qualities[qi];
-const requestedTierIdx = getTidalTierIndex(ql);
 try {
 const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
 const payload = data && data.data ? data.data : data;
-let decoded = null;
 if (payload && payload.manifest) {
-  decoded = decodeManifest(payload.manifest);
-}
-const hasUrl = (decoded && decoded.url) || (payload && payload.url);
-if (!hasUrl) continue;
-
-// Check what tier TIDAL actually returned
-const returnedTierIdx = detectReturnedTier(payload, decoded);
-
-// Quality enforcement:
-// - NEVER return higher quality than requested (would betray pref)
-// - DO accept equal or lower quality (e.g. 320 when lossless requested is wrong; 320 when 320 requested is right)
-// - Keep the best "acceptable" result seen so far as fallback for if nothing exact is found
-const hasPref = !!tidalStartKey;
-if (hasPref && returnedTierIdx < requestedTierIdx) {
-  // TIDAL returned higher quality than requested — skip this tier, try lower
-  console.log('tidal: returned tier', ALL_QUALITIES[returnedTierIdx], 'too high for requested', ql, '— trying lower tier');
-  continue;
-}
-
-// This result is at or below requested quality — accept it
-const url = (decoded && decoded.url) ? decoded.url : payload.url;
-const codec = decoded ? (decoded.codec || '').toLowerCase() : '';
-const isFlac = decoded ? (decoded.isDash || codec.includes('flac') || codec.includes('audio/flac')) : !!(payload.url || '').match(/\.flac(\?|$)/i);
+const decoded = decodeManifest(payload.manifest);
+if (decoded && decoded.url) {
+const codec = (decoded.codec || '').toLowerCase();
+const isFlac = decoded.isDash || codec.includes('flac') || codec.includes('audio/flac');
 const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
-console.log('tidal: serving', qualityLabel, 'for pref', pref || 'auto');
-return Response.json({ url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: (decoded && decoded.codec) || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
-
+return Response.json({ url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
+}
+}
+if (payload && payload.url) {
+const looksLikeFlac = (payload.url || '').match(/\.flac(\?|$)/i);
+const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
+const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
+return Response.json({ url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
+}
 } catch(e) {
 if (qi === qualities.length - 1) return Response.json({ error: 'Could not get stream URL for track ' + tid + ': ' + e.message }, { status: 502 });
 }
 }
 
-return Response.json({ error: 'Track ' + tid + ' is not available at or below the requested quality (' + (pref || 'auto') + ').' }, { status: 404 });
+return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
 }); // end dedupeCall
 
 });
