@@ -143,12 +143,27 @@ return 0;
 // ─── Qobuz client ─────────────────────────────────────────────────────────────
 // qobuzStream: races ALL (instance × format) combos in parallel — picks best quality winner.
 // Stream URLs are cached for 28 min (Qobuz URLs expire at 30 min).
-async function qobuzStream(trackId) {
-  const cacheKey = 'qstream:' + trackId;
+// Qobuz quality preference → format_ids to try (best-first within that preference)
+// PREF_HIMAX:    Hi-Res 24-bit up to 192 kHz (format 27 → 7 → 6 fallback)
+// PREF_HI96:     Hi-Res 24-bit up to  96 kHz (format 7 → 27 → 6 fallback)
+// PREF_LOSSLESS: 16-bit 44.1 kHz CD lossless  (format 6 → 7 → 27 fallback)
+// PREF_320:      320 kbps MP3                  (format 5 only — no lossless upscale)
+// null/auto:     all formats best → worst
+const QOBUZ_PREF_FMTS = {
+  PREF_HIMAX:    [27, 7, 6, 5],
+  PREF_HI96:     [7, 27, 6, 5],
+  PREF_LOSSLESS: [6, 7, 27, 5],
+  PREF_320:      [5],
+};
+
+async function qobuzStream(trackId, prefKey) {
+  const allFmtOrder = [27, 7, 6, 5];
+  const fmtOrder = (prefKey && QOBUZ_PREF_FMTS[prefKey]) ? QOBUZ_PREF_FMTS[prefKey] : allFmtOrder;
+
+  const cacheKey = 'qstream:' + trackId + ':' + (prefKey || 'auto');
   const cached = cGet(cacheKey);
   if (cached) return cached;
 
-  const fmtOrder = [27, 7, 6, 5]; // best → worst
   const fmtQuality = { 27: 'hires-192', 7: 'hires-96', 6: 'lossless', 5: '320kbps' };
   const fmtLabel   = { 27: 'flac',      7: 'flac',     6: 'flac',     5: 'mp3' };
 
@@ -168,7 +183,7 @@ async function qobuzStream(trackId) {
     })
   ));
 
-  // Pick highest-quality successful result
+  // Pick best result respecting fmtOrder preference
   for (const fmt of fmtOrder) {
     const hit = results.find(r => r.status === 'fulfilled' && r.value.fmt === fmt);
     if (hit) {
@@ -178,7 +193,7 @@ async function qobuzStream(trackId) {
         url, format: fmtLabel[fmt], quality: fmtQuality[fmt],
         source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1680
       };
-      cSet(cacheKey, result, 1680); // cache for 28 min
+      cSet(cacheKey, result, 1680);
       return result;
     }
   }
@@ -506,10 +521,14 @@ h += '<input type="text" id="customInstance" placeholder="https://your-instance.
 h += '<div class="hint">Leave blank to use the shared pool. Paste your own self-hosted Hi-Fi API URL to lock this token exclusively to your instance.</div>';
 h += '<div class="lbl">Preferred Audio Quality <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-HI_RES_LOSSLESS" onclick="selectQuality(\'HI_RES_LOSSLESS\')">Hi-Res Max<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">TIDAL MAX / MQA</span></div>';
-h += '<div class="ql-btn" id="ql-LOSSLESS" onclick="selectQuality(\'LOSSLESS\')">Lossless<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">FLAC 16-bit CD</span></div>';
-h += '<div class="ql-btn" id="ql-HIGH" onclick="selectQuality(\'HIGH\')">AAC 320<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 320 kbps</span></div>';
-h += '<div class="ql-btn" id="ql-LOW" onclick="selectQuality(\'LOW\')">AAC 96<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">AAC 96 kbps</span></div>';
+h += '<div style="font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px">Qobuz &amp; TIDAL quality</div>';
+h += '<div class="ql-row">';
+h += '<div class="ql-btn" id="ql-PREF_HIMAX" onclick="selectQuality(\'PREF_HIMAX\')">Hi-Res 192<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / 192 kHz</span></div>';
+h += '<div class="ql-btn" id="ql-PREF_HI96" onclick="selectQuality(\'PREF_HI96\')">Hi-Res 96<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / 96 kHz</span></div>';
+h += '<div class="ql-btn" id="ql-PREF_LOSSLESS" onclick="selectQuality(\'PREF_LOSSLESS\')">Lossless<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">16-bit / 44.1 kHz</span></div>';
+h += '<div class="ql-btn" id="ql-PREF_320" onclick="selectQuality(\'PREF_320\')">320 kbps<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">Qobuz MP3 / TIDAL AAC</span></div>';
+h += '<div class="ql-btn" id="ql-PREF_96" onclick="selectQuality(\'PREF_96\')">96 kbps<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">TIDAL AAC only</span></div>';
+h += '</div>';
 h += '</div>';
 h += '<div class="hint" id="qlHint">No preference &mdash; addon auto-selects: Qobuz Hi-Res &rarr; TIDAL Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
 h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
@@ -539,7 +558,9 @@ h += '<footer>Claudochrome Eclipse Addon v2.3.0 &bull; TIDAL search + Qobuz Hi-R
 h += '<script>';
 h += 'var gu,ru,selQ=null;';
 h += 'var QLABELS={"HI_RES_LOSSLESS":"Hi-Res Max (TIDAL MAX / MQA)","LOSSLESS":"Lossless (FLAC 16-bit CD)","HIGH":"AAC 320 kbps","LOW":"AAC 96 kbps"};';
-h += 'function selectQuality(q){if(selQ===q)selQ=null;else selQ=q;["HI_RES_LOSSLESS","LOSSLESS","HIGH","LOW"].forEach(function(k){document.getElementById("ql-"+k).classList.toggle("sel",selQ===k);});document.getElementById("qlHint").textContent=selQ?"Preferred: "+QLABELS[selQ]+" \u2014 fallback to lower if unavailable.":"\u00a0No preference \u2014 auto-selects: Qobuz Hi-Res \u2192 TIDAL Lossless \u2192 AAC 320 \u2192 AAC 96.";}';
+h += 'var QLABELS={PREF_HIMAX:"Qobuz Hi-Res 24-bit / 192 kHz",PREF_HI96:"Qobuz Hi-Res 24-bit / 96 kHz",PREF_LOSSLESS:"Lossless 16-bit 44.1 kHz (Qobuz & TIDAL)",PREF_320:"320 kbps (Qobuz MP3 / TIDAL AAC)",PREF_96:"96 kbps (TIDAL AAC only)"};';
+h += 'var ALL_QL=["PREF_HIMAX","PREF_HI96","PREF_LOSSLESS","PREF_320","PREF_96"];';
+h += 'function selectQuality(q){if(selQ===q)selQ=null;else selQ=q;ALL_QL.forEach(function(k){var el=document.getElementById("ql-"+k);if(el)el.classList.toggle("sel",selQ===k);});document.getElementById("qlHint").textContent=selQ?"\u25b6 "+QLABELS[selQ]+" \u2014 fallback to lower if unavailable.":"\u00a0No preference \u2014 auto-selects: Qobuz Hi-Res 192 \u2192 96 \u2192 Lossless \u2192 320 kbps \u2192 96 kbps.";}';
 h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";var ci=document.getElementById("customInstance").value.trim();while(ci.length&&ci[ci.length-1]=="/")ci=ci.slice(0,-1);var body={};if(ci)body.instanceUrl=ci;if(selQ)body.preferredQuality=selQ;fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}gu=d.manifestUrl;document.getElementById("genUrl").textContent=gu;document.getElementById("genBadge").style.display=d.usingCustomInstance?"block":"none";document.getElementById("genBox").style.display="block";btn.disabled=false;btn.textContent="Regenerate URL";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}';
 h += 'function copyGen(){if(!gu)return;navigator.clipboard.writeText(gu).then(function(){var b=document.getElementById("copyGenBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);});}';
 h += 'function doRefresh(){var btn=document.getElementById("refBtn");var eu=document.getElementById("existingUrl").value.trim();if(!eu){alert("Paste your existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu})}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh Existing URL";return;}ru=d.manifestUrl;document.getElementById("refUrl").textContent=ru;document.getElementById("refBox").style.display="block";btn.disabled=false;btn.textContent="Refresh Again";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh Existing URL";});}';
@@ -568,7 +589,7 @@ try {
 await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, timeout: 8000 });
 } catch(e) { return Response.json({ error: 'Could not reach your instance: ' + e.message }, { status: 400 }); }
 }
-const VALID_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
+const VALID_QUALITIES = ['PREF_HIMAX', 'PREF_HI96', 'PREF_LOSSLESS', 'PREF_320', 'PREF_96', 'HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
 const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
 const token = generateToken();
 const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality };
@@ -758,14 +779,39 @@ if (redisMeta) { qTitle = redisMeta.title; qArtist = redisMeta.artist; if (!qIsr
 
 if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid, '- skipping Qobuz');
 
-// Step 4: Qobuz Hi-Res — ISRC exact match first, title+artist fuzzy fallback
-if (qTitle || qIsrc) {
+// ── Unified quality key → Qobuz pref + TIDAL start tier ─────────────────────
+// New unified keys:
+//   PREF_HIMAX    → Qobuz 192kHz hires   / TIDAL HI_RES_LOSSLESS
+//   PREF_HI96     → Qobuz 96kHz hires    / TIDAL HI_RES_LOSSLESS
+//   PREF_LOSSLESS → Qobuz CD lossless    / TIDAL LOSSLESS
+//   PREF_320      → Qobuz 320 kbps       / TIDAL HIGH
+//   PREF_96       → skip Qobuz           / TIDAL LOW only
+// Legacy TIDAL-only keys kept for backwards compat with old tokens.
+const QUALITY_MAP = {
+  PREF_HIMAX:      { qobuzPref: 'PREF_HIMAX',    tidalStart: 'HI_RES_LOSSLESS' },
+  PREF_HI96:       { qobuzPref: 'PREF_HI96',     tidalStart: 'HI_RES_LOSSLESS' },
+  PREF_LOSSLESS:   { qobuzPref: 'PREF_LOSSLESS',  tidalStart: 'LOSSLESS' },
+  PREF_320:        { qobuzPref: 'PREF_320',       tidalStart: 'HIGH' },
+  PREF_96:         { qobuzPref: null,              tidalStart: 'LOW' },
+  HI_RES_LOSSLESS: { qobuzPref: 'PREF_HIMAX',    tidalStart: 'HI_RES_LOSSLESS' },
+  LOSSLESS:        { qobuzPref: 'PREF_LOSSLESS',  tidalStart: 'LOSSLESS' },
+  HIGH:            { qobuzPref: 'PREF_320',       tidalStart: 'HIGH' },
+  LOW:             { qobuzPref: null,              tidalStart: 'LOW' },
+};
+const qMap        = (pref && QUALITY_MAP[pref]) ? QUALITY_MAP[pref] : { qobuzPref: null, tidalStart: null };
+const qobuzPrefKey  = qMap.qobuzPref;
+const tidalStartKey = qMap.tidalStart;
+
+// Step 4: Qobuz — ISRC exact match first, title+artist fuzzy fallback.
+// Skip Qobuz when user picked PREF_96 / LOW (TIDAL-only preference).
+const skipQobuz = (pref === 'PREF_96' || pref === 'LOW');
+if (!skipQobuz && (qTitle || qIsrc)) {
 try {
 const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc);
 if (qTrack && qTrack.id) {
-const qStream = await qobuzStream(qTrack.id);
+const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
 if (qStream) {
-console.log('qobuz: HIT', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '->', qTrack.id, qStream.quality);
+console.log('qobuz: HIT', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '->', qTrack.id, qStream.quality, '(pref:', pref || 'auto', ')');
 return Response.json(qStream);
 }
 }
@@ -778,7 +824,9 @@ console.warn('qobuz: error', e.message);
 // Step 5: TIDAL fallback
 const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
 const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
-const qualities = pref ? [pref, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(pref))] : AUTO_QUALITIES;
+const qualities = tidalStartKey
+  ? [tidalStartKey, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(tidalStartKey))]
+  : AUTO_QUALITIES;
 
 for (let qi = 0; qi < qualities.length; qi++) {
 const ql = qualities[qi];
