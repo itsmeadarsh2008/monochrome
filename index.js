@@ -834,26 +834,73 @@ const qualities = tidalStartKey
   ? [tidalStartKey, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(tidalStartKey))]
   : AUTO_QUALITIES;
 
+// TIDAL's HiFi API ignores the quality param and returns whatever tier it has for that
+// account/track. We must inspect the actual returned codec and REJECT responses that are
+// higher quality than requested — otherwise a PREF_320 user always gets FLAC.
+// Tier hierarchy (higher index = lower quality):
+//   0: HI_RES_LOSSLESS  → flac hi-res (>44.1kHz or MQA)
+//   1: LOSSLESS         → flac 44.1kHz 16-bit
+//   2: HIGH             → aac 320kbps  (or mp4a, m4a)
+//   3: LOW              → aac 96kbps
+function getTidalTierIndex(ql) {
+  return ALL_QUALITIES.indexOf(ql); // 0=best, 3=worst
+}
+function detectReturnedTier(payload, decoded) {
+  // Inspect codec + audioQuality fields to figure out what TIDAL actually returned
+  const aq = (payload.audioQuality || '').toUpperCase();
+  if (aq === 'HI_RES_LOSSLESS' || aq === 'HI_RES') return 0;
+  if (aq === 'LOSSLESS') return 1;
+  if (aq === 'HIGH') return 2;
+  if (aq === 'LOW') return 3;
+  // Fallback: infer from codec
+  if (decoded) {
+    const codec = (decoded.codec || decoded.mimeType || '').toLowerCase();
+    const isDash = decoded.isDash;
+    if (isDash || codec.includes('flac') || codec.includes('audio/flac')) {
+      // DASH FLAC could be hi-res or lossless — treat as LOSSLESS (tier 1) worst case
+      return 1;
+    }
+    if (codec.includes('aac') || codec.includes('mp4a') || codec.includes('m4a')) return 2;
+  }
+  if (payload.url) {
+    const u = payload.url.toLowerCase();
+    if (u.includes('.flac')) return 1;
+    if (u.includes('.m4a') || u.includes('.aac')) return 2;
+  }
+  return 1; // unknown — assume lossless to be safe
+}
+
 for (let qi = 0; qi < qualities.length; qi++) {
 const ql = qualities[qi];
+const requestedTierIdx = getTidalTierIndex(ql);
 try {
 const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
 const payload = data && data.data ? data.data : data;
+let decoded = null;
 if (payload && payload.manifest) {
-const decoded = decodeManifest(payload.manifest);
-if (decoded && decoded.url) {
-const codec = (decoded.codec || '').toLowerCase();
-const isFlac = decoded.isDash || codec.includes('flac') || codec.includes('audio/flac');
+  decoded = decodeManifest(payload.manifest);
+}
+const hasUrl = (decoded && decoded.url) || (payload && payload.url);
+if (!hasUrl) continue;
+
+// Check what tier TIDAL actually returned
+const returnedTierIdx = detectReturnedTier(payload, decoded);
+
+// If TIDAL returned higher quality than requested, SKIP this result.
+// The user explicitly wants lower quality — don't betray that.
+// Exception: if this is the last option (no lower tier to try), accept it anyway.
+const isLastOption = (qi === qualities.length - 1);
+if (returnedTierIdx < requestedTierIdx && !isLastOption) {
+  console.log('tidal: returned tier', ALL_QUALITIES[returnedTierIdx], 'but requested', ql, '— skipping, trying lower');
+  continue;
+}
+
+const url = (decoded && decoded.url) ? decoded.url : payload.url;
+const codec = decoded ? (decoded.codec || '').toLowerCase() : '';
+const isFlac = decoded ? (decoded.isDash || codec.includes('flac') || codec.includes('audio/flac')) : !!(payload.url || '').match(/\.flac(\?|$)/i);
 const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
-return Response.json({ url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
-}
-}
-if (payload && payload.url) {
-const looksLikeFlac = (payload.url || '').match(/\.flac(\?|$)/i);
-const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
-const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
-return Response.json({ url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
-}
+return Response.json({ url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: (decoded && decoded.codec) || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
+
 } catch(e) {
 if (qi === qualities.length - 1) return Response.json({ error: 'Could not get stream URL for track ' + tid + ': ' + e.message }, { status: 502 });
 }
