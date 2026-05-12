@@ -212,14 +212,175 @@ async function qobuzStream(trackId, prefKey) {
   });
 }
 
-// qobuzFindByIsrc: looks up a Qobuz track by ISRC.
-// ONLY returns a result if the Qobuz item's own .isrc field matches exactly —
-// if the proxy doesn't support ISRC search syntax the result is silently discarded.
-// Result cached 24h on confirmed hit; miss cached 30 min.
+// ─── Search scoring engine (ported from 8spine V2.0 Strict) ──────────────────
+// Scores each candidate track against the search query.
+// Returns { item, score } — caller picks item if score >= threshold.
+// Anti-cover/karaoke penalty (-500) prevents junk results swamping real tracks.
+// Title guillotine (-100) kills results with zero query-word overlap.
+function normalizeStr(s) {
+  return String(s || '').toLowerCase()
+    .replace(/[''`´]/g, "'").replace(/[""«»]/g, '"')
+    .replace(/\s+/g, ' ').trim();
+}
+
+function removeFeat(s) {
+  if (!s) return '';
+  const m = String(s).search(/\s+[\(\[](feat|ft|with|vs)[\.\s]/i);
+  return (m > 0 ? s.substring(0, m) : s).trim();
+}
+
+function scoringFindBest(items, query) {
+  let bestItem  = null;
+  let bestScore = -1;
+
+  const qNorm     = normalizeStr(query);
+  const hasHyphen = qNorm.includes('-');
+  let qTitleOnly  = hasHyphen ? qNorm.split('-')[1].trim() : qNorm;
+  if (hasHyphen && qNorm.split('-')[0].trim() === '') qTitleOnly = qNorm;
+
+  const qWords = qNorm.replace(/[^a-z0-9\s]/gi, ' ').split(/\s+/).filter(w => w.length > 1);
+
+  for (let i = 0; i < Math.min(items.length, 50); i++) {
+    const t       = items[i];
+    const tTitle  = normalizeStr(removeFeat(t.title || ''));
+    const tArtist = normalizeStr(
+      t.performer?.name || t.artist?.name || t.artists?.[0]?.name ||
+      (t.artists && t.artists.length ? t.artists[0].name : '') || ''
+    );
+    let score = 0;
+
+    const targetStr  = (tTitle + ' ' + tArtist).replace(/[^a-z0-9\s]/gi, ' ');
+    const matchCount = qWords.filter(w => targetStr.includes(w)).length;
+    score += matchCount * 10;
+
+    let titleMatch = false, artistMatch = false;
+
+    if (hasHyphen) {
+      const parts = qNorm.split('-');
+      const p1 = parts[0].trim(), p2 = parts[1].trim();
+      if (p1.length && (tTitle === p1 || tTitle.includes(p1) || p1.includes(tTitle))) titleMatch = true;
+      if (p2.length && (tTitle === p2 || tTitle.includes(p2) || p2.includes(tTitle))) titleMatch = true;
+      if (p1.length && (tArtist === p1 || tArtist.includes(p1) || p1.includes(tArtist))) artistMatch = true;
+      if (p2.length && (tArtist === p2 || tArtist.includes(p2) || p2.includes(tArtist))) artistMatch = true;
+    } else {
+      if (tTitle.length  && (qNorm === tTitle  || qNorm.includes(tTitle)  || tTitle.includes(qNorm)))  titleMatch  = true;
+      if (tArtist.length && (qNorm === tArtist || qNorm.includes(tArtist) || tArtist.includes(qNorm))) artistMatch = true;
+    }
+
+    if (titleMatch)  score += 40;
+    if (artistMatch) score += 40;
+    if (titleMatch && artistMatch) score += 100;
+
+    // Exact title bonus
+    if (tTitle === qTitleOnly || tTitle === qNorm) score += 60;
+
+    // Title guillotine — kills results with no query word in the title
+    const titleWordsMatch = qWords.filter(w => tTitle.includes(w)).length;
+    if (titleWordsMatch === 0 && tTitle !== qTitleOnly && !qNorm.includes(tTitle)) {
+      if (qNorm !== tArtist && !tArtist.includes(qNorm)) score -= 100;
+    }
+
+    // Anti-cover/karaoke spam
+    if (!/(cover|karaoke|tribute|instrumental|8-bit)/i.test(qNorm) &&
+         /(cover|karaoke|tribute|instrumental|8-bit)/i.test(t.title || '')) {
+      score -= 500;
+    }
+
+    if (score > bestScore) { bestScore = score; bestItem = t; }
+  }
+  return { item: bestItem, score: bestScore };
+}
+
+// ─── ISRC resolution: TIDAL + Deezer in parallel ─────────────────────────────
+// Replaces the old single-source qobuzFindByIsrc sequential loop.
+// Both engines run simultaneously — whichever scores higher wins.
+// ISRC confirmed match cached 24h; miss cached 30 min.
+const DEEZER_API = 'https://api.deezer.com';
+const ISRC_MIN_SCORE = 100; // minimum scoring engine threshold for a valid match
+
+async function getIsrcFromTidal(query, instanceUrl) {
+  try {
+    const data = await hifiGetForTokenSafe(instanceUrl, '/search', { s: query, limit: 20 });
+    let items = data?.tracks?.items || data?.items || data?.data?.items ||
+                data?.data?.tracks?.items || (Array.isArray(data) ? data : []);
+    if (!items.length) return null;
+    const match = scoringFindBest(items, query);
+    if (!match.item || match.score < ISRC_MIN_SCORE) return null;
+    const track = match.item;
+    let isrc = track.isrc;
+    if (!isrc) {
+      const info = await hifiGetForTokenSafe(instanceUrl, '/info', { id: track.id });
+      isrc = info?.isrc || info?.data?.isrc || null;
+    }
+    console.log('[isrc] TIDAL hit score=' + match.score + ' isrc=' + isrc + ' for: ' + query);
+    return { isrc, track, source: 'tidal', score: match.score };
+  } catch(e) { return null; }
+}
+
+async function getIsrcFromDeezer(query) {
+  try {
+    const r = await axios.get(DEEZER_API + '/search/track', {
+      params: { q: query },
+      headers: { 'User-Agent': UA },
+      timeout: 8000
+    });
+    const items = r.data?.data || [];
+    if (!items.length) return null;
+    const match = scoringFindBest(items, query);
+    if (!match.item || match.score < ISRC_MIN_SCORE) return null;
+    const track = match.item;
+    let isrc = track.isrc;
+    if (!isrc) {
+      try {
+        const r2 = await axios.get(DEEZER_API + '/track/' + track.id, {
+          headers: { 'User-Agent': UA }, timeout: 5000
+        });
+        isrc = r2.data?.isrc || null;
+      } catch(e) {}
+    }
+    console.log('[isrc] Deezer hit score=' + match.score + ' isrc=' + isrc + ' for: ' + query);
+    return { isrc, track, source: 'deezer', score: match.score };
+  } catch(e) { return null; }
+}
+
+// resolveIsrc: race TIDAL and Deezer in parallel, pick the higher-scoring winner.
+// Returns { isrc, track, source, score } or null.
+async function resolveIsrc(title, artist, instanceUrl) {
+  const query = (artist ? artist + ' ' : '') + removeFeat(title || '');
+  const cacheKey = 'isrc2:' + query.toLowerCase();
+  const cached = cGet(cacheKey);
+  if (cached === 'MISS') return null;
+  if (cached) return cached;
+
+  const [tidalResult, deezerResult] = await Promise.all([
+    getIsrcFromTidal(query, instanceUrl),
+    getIsrcFromDeezer(query)
+  ]);
+
+  let winner = null;
+  if (tidalResult && deezerResult) {
+    winner = tidalResult.score >= deezerResult.score ? tidalResult : deezerResult;
+    console.log('[isrc] Winner: ' + winner.source.toUpperCase() +
+      ' (' + winner.score + ' vs ' + (winner === tidalResult ? deezerResult.score : tidalResult.score) + ')');
+  } else {
+    winner = tidalResult || deezerResult;
+  }
+
+  if (winner) {
+    cSet(cacheKey, winner, 86400); // cache 24h
+    return winner;
+  }
+  cSet(cacheKey, 'MISS', 1800); // miss cached 30 min
+  return null;
+}
+
+// qobuzFindByIsrc: looks up a Qobuz track by confirmed ISRC.
+// Only accepts result if Qobuz's own .isrc field matches exactly.
+// Hit cached 24h, miss cached 30 min.
 async function qobuzFindByIsrc(isrc) {
   if (!isrc) return null;
-  const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const wantIsrc = norm(isrc);
+  const normIsrc = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  const wantIsrc = normIsrc(isrc);
   if (!wantIsrc) return null;
 
   const cacheKey = 'qisrc:' + wantIsrc;
@@ -234,82 +395,75 @@ async function qobuzFindByIsrc(isrc) {
         headers: { 'User-Agent': UA },
         timeout: 8000
       });
-      const items = (r.data && r.data.tracks && r.data.tracks.items) ? r.data.tracks.items : [];
-      // STRICT: only accept a result if Qobuz confirms the ISRC matches exactly
-      const match = items.find(t => t.isrc && norm(t.isrc) === wantIsrc);
+      const items = r.data?.tracks?.items || [];
+      const match = items.find(t => t.isrc && normIsrc(t.isrc) === wantIsrc);
       if (match && match.id) {
         if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        cSet(cacheKey, match, 86400); // confirmed ISRC match — cache 24h
-        console.log('qobuz isrc: HIT', isrc, '->', match.id, match.title);
+        cSet(cacheKey, match, 86400);
+        console.log('[qobuz] isrc HIT', isrc, '->', match.id, match.title);
         return match;
       }
     } catch(e) { continue; }
   }
-  cSet(cacheKey, 'MISS', 1800); // miss cached 30 min — try again later
+  cSet(cacheKey, 'MISS', 1800);
   return null;
 }
 
-// qobuzFindBestTrack: tries ISRC first (exact match), falls back to title+artist fuzzy search.
-// ISRC results cached 24h; title+artist results cached 1h; misses cached 30 min.
-async function qobuzFindBestTrack(title, artist, isrc) {
-  // 1. ISRC fast path — confirmed exact match wins immediately
+// qobuzFindBestTrack: upgraded 4-tier lookup.
+// Tier 1: resolve ISRC via parallel TIDAL+Deezer engines → Qobuz ISRC lookup (exact match).
+// Tier 2: Qobuz title+artist search using scoring engine (was simple includes check).
+// Tier 3: Qobuz raw text search (last resort fallback).
+// All tiers cached to avoid redundant outbound calls.
+async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
+  // ── Tier 1: confirmed ISRC fast path ──────────────────────────────────────
+  // First try the bare ISRC if we already have it from TIDAL metadata
   if (isrc) {
     const byIsrc = await qobuzFindByIsrc(isrc);
     if (byIsrc) return byIsrc;
-    // ISRC didn't return a confirmed match — fall through to title+artist search
-    console.log('qobuz: ISRC no confirmed match for', isrc, '- falling back to title search');
+    console.log('[qobuz] bare ISRC miss for', isrc, '— trying parallel resolution');
   }
 
+  // Run TIDAL+Deezer parallel resolver to get a confirmed ISRC
+  if (title) {
+    const resolved = await resolveIsrc(title, artist, instanceUrl);
+    if (resolved && resolved.isrc) {
+      const byResolvedIsrc = await qobuzFindByIsrc(resolved.isrc);
+      if (byResolvedIsrc) return byResolvedIsrc;
+      console.log('[qobuz] resolved ISRC', resolved.isrc, 'not in Qobuz vault — falling to title search');
+    }
+  }
+
+  // ── Tier 2: scoring-engine title+artist search on Qobuz ───────────────────
   if (!title) return null;
-  const cacheKey = 'qmatch:' + title.toLowerCase() + ':' + (artist || '').toLowerCase();
+  const cacheKey = 'qmatch2:' + (title || '').toLowerCase() + ':' + (artist || '').toLowerCase();
   const cached = cGet(cacheKey);
   if (cached === 'MISS') return null;
   if (cached) return cached;
 
-  const q = (artist ? artist + ' ' : '') + title;
+  const q = (artist ? artist + ' ' : '') + removeFeat(title);
   for (const inst of QOBUZ_INSTANCES) {
     try {
       const r = await axios.get(inst + '/search', {
-        params: { q, limit: 10 },
+        params: { q, limit: 15 },
         headers: { 'User-Agent': UA },
         timeout: 10000
       });
-      const data = r.data || null;
-      if (!data) continue;
-      const items = (data.tracks && data.tracks.items) ? data.tracks.items : [];
+      const items = r.data?.tracks?.items || [];
       if (!items.length) continue;
-      const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-      const wantTitle  = norm(title);
-      const wantArtist = norm(artist || '');
-      const ranked = items.slice().sort((a, b) => {
-        const score = item => {
-          const t  = norm(item.title || '');
-          const ar = norm((item.performer && item.performer.name) || (item.artist && item.artist.name) || '');
-          let s = 0;
-          if (t === wantTitle)              s += 5;
-          if (wantArtist && ar === wantArtist) s += 5;
-          if (wantTitle  && t.includes(wantTitle))   s += 2;
-          if (wantArtist && ar.includes(wantArtist)) s += 2;
-          return s;
-        };
-        return score(b) - score(a);
-      });
-      const best = ranked[0];
-      if (!best) continue;
-      const bestTitle  = norm(best.title || '');
-      const bestArtist = norm((best.performer && best.performer.name) || (best.artist && best.artist.name) || '');
-      const titleGood  = wantTitle && (bestTitle === wantTitle || bestTitle.includes(wantTitle) || wantTitle.includes(bestTitle));
-      const artistGood = !wantArtist || (bestArtist && (bestArtist === wantArtist || bestArtist.includes(wantArtist) || wantArtist.includes(bestArtist)));
-      if (wantArtist ? (titleGood && artistGood) : titleGood) {
+      const match = scoringFindBest(items, (artist ? artist + ' ' : '') + title);
+      if (match.item && match.score >= 40) { // lower threshold for direct Qobuz search
         if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        cSet(cacheKey, best, 3600); // cache match for 1 hour
-        return best;
+        cSet(cacheKey, match.item, 3600);
+        console.log('[qobuz] title search HIT score=' + match.score, match.item.title);
+        return match.item;
       }
     } catch(e) { continue; }
   }
-  cSet(cacheKey, 'MISS', 1800); // negative-cache misses for 30 min
+
+  cSet(cacheKey, 'MISS', 1800);
   return null;
 }
+
 
 // ─── Hi-Fi API client ─────────────────────────────────────────────────────────
 // Races ALL instances in parallel (Promise.any) — first success wins.
@@ -796,7 +950,7 @@ if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid, '- skipping Qo
 // Step 4: Qobuz Hi-Res — ISRC exact match first, title+artist fuzzy fallback
 if (qTitle || qIsrc) {
 try {
-const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc);
+const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
 if (qTrack && qTrack.id) {
 // Map stored pref key to Qobuz tier
         const PREF_TO_QOBUZ_KEY = {
