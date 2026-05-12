@@ -141,8 +141,9 @@ return 0;
 }
 
 // ─── Qobuz client ─────────────────────────────────────────────────────────────
-// qobuzStream: races ALL (instance × format) combos in parallel — picks best quality winner.
-// Stream URLs are cached for 28 min (Qobuz URLs expire at 30 min).
+// qobuzStream: race-with-priority — fires ALL (instance × format) combos at once,
+// resolves immediately when the highest-priority format responds.
+// Never waits for slow instances. Stream URLs cached 28 min (Qobuz URLs expire 30 min).
 async function qobuzStream(trackId, prefKey) {
   // prefKey: 'HIMAX'|'HI96'|'LOSSLESS'|'AAC320'|'AAC96'|null
   if (prefKey === 'AAC96') return null; // TIDAL-only tier — skip Qobuz
@@ -150,7 +151,6 @@ async function qobuzStream(trackId, prefKey) {
   const cached = cGet(cacheKey);
   if (cached) return cached;
 
-  // Build format priority list based on user preference
   const PREF_FMT_ORDER = {
     'HIMAX':    [27, 7, 6, 5],
     'HI96':     [7, 27, 6, 5],
@@ -158,41 +158,58 @@ async function qobuzStream(trackId, prefKey) {
     'AAC320':   [5],
     'HI_RES_LOSSLESS': [27, 7, 6, 5],
   };
-  const fmtOrder = (prefKey && PREF_FMT_ORDER[prefKey]) || [27, 7, 6, 5];
+  const fmtOrder   = (prefKey && PREF_FMT_ORDER[prefKey]) || [27, 7, 6, 5];
   const fmtQuality = { 27: 'hires-192', 7: 'hires-96', 6: 'lossless', 5: '320kbps' };
   const fmtLabel   = { 27: 'flac',      7: 'flac',     6: 'flac',     5: 'mp3' };
 
-  const combos = [];
-  for (const inst of QOBUZ_INSTANCES)
-    for (const fmt of fmtOrder)
-      combos.push({ inst, fmt });
+  // ─── Race-with-priority ────────────────────────────────────────────────────
+  // Fire every (instance × format) combo simultaneously.
+  // Resolve as soon as the top-priority available format wins.
+  // Never blocked by the slowest instance — returns on the first winner.
+  return new Promise((resolve) => {
+    let resolved = false;
+    let pending   = 0;
+    const best    = { idx: Infinity, val: null };
 
-  const results = await Promise.allSettled(combos.map(({ inst, fmt }) =>
-    axios.get(inst + '/stream/' + trackId, {
-      params: { format_id: fmt },
-      headers: { 'User-Agent': UA },
-      timeout: 10000
-    }).then(r => {
-      if (r.data && r.data.url) return { url: r.data.url, fmt, inst };
-      throw new Error('no url');
-    })
-  ));
+    const tryResolve = () => {
+      if (resolved) return;
+      if (best.val) {
+        resolved = true;
+        const { url, fmt, inst } = best.val;
+        if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
+        const result = {
+          url, format: fmtLabel[fmt], quality: fmtQuality[fmt],
+          source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1680
+        };
+        cSet(cacheKey, result, 1680); // cache 28 min
+        resolve(result);
+      } else if (pending === 0) {
+        resolve(null); // all combos failed
+      }
+    };
 
-  // Pick highest-quality successful result
-  for (const fmt of fmtOrder) {
-    const hit = results.find(r => r.status === 'fulfilled' && r.value.fmt === fmt);
-    if (hit) {
-      const { url, inst } = hit.value;
-      if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-      const result = {
-        url, format: fmtLabel[fmt], quality: fmtQuality[fmt],
-        source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1680
-      };
-      cSet(cacheKey, result, 1680); // cache for 28 min
-      return result;
+    for (const inst of QOBUZ_INSTANCES) {
+      for (let i = 0; i < fmtOrder.length; i++) {
+        const fmt = fmtOrder[i];
+        pending++;
+        axios.get(inst + '/stream/' + trackId, {
+          params: { format_id: fmt },
+          headers: { 'User-Agent': UA },
+          timeout: 8000  // reduced from 10000 — fail fast on slow instances
+        }).then(r => {
+          if (r.data && r.data.url) {
+            // Only upgrade best if this is a higher-priority (lower index) format
+            if (i < best.idx) { best.idx = i; best.val = { url: r.data.url, fmt, inst }; }
+            // Got top-priority format (idx 0) — no need to wait for anything else
+            if (best.idx === 0) { pending = 0; tryResolve(); }
+          }
+        }).catch(() => {}).finally(() => {
+          if (!resolved) { pending--; tryResolve(); }
+        });
+      }
     }
-  }
-  return null;
+    if (pending === 0) resolve(null);
+  });
 }
 
 // qobuzFindByIsrc: looks up a Qobuz track by ISRC.
@@ -556,12 +573,12 @@ h += '</div>';
 h += '<footer>Claudochrome Eclipse Addon v2.3.0 &bull; TIDAL search + Qobuz Hi-Res streams</footer>';
 h += '<script>';
 h += 'var gu,ru,selQ=null;';
-h += 'var QLABELS={"HIMAX":"Hi-Res 192 · 24-bit/192kHz (Qobuz)","HI96":"Hi-Res 96 · 24-bit/96kHz (Qobuz)","LOSSLESS":"Lossless · 16-bit/44.1kHz FLAC","AAC320":"320 kbps AAC (Qobuz)","HI_RES_LOSSLESS":"TIDAL Hi-Res Max · 24-bit/192kHz","LOSSLESS":"TIDAL High · 16-bit/44.1kHz","HIGH":"TIDAL Low · 320 kbps","LOW":"TIDAL Low · 96 kbps"};';
+h += 'var QLABELS={"HIMAX":"Hi-Res 192 · 24-bit/192kHz (Qobuz)","HI96":"Hi-Res 96 · 24-bit/96kHz (Qobuz)","LOSSLESS":"Lossless · 16-bit/44.1kHz FLAC","AAC320":"320 kbps AAC (Qobuz)","HI_RES_LOSSLESS":"TIDAL Hi-Res Max · 24-bit/192kHz","LOSSLESS_TIDAL":"TIDAL High · 16-bit/44.1kHz","HIGH":"TIDAL Low · 320 kbps","LOW":"TIDAL Low · 96 kbps"};';
 h += 'function selectQuality(q){if(selQ===q)selQ=null;else selQ=q;["HIMAX","HI96","LOSSLESS","AAC320","HI_RES_LOSSLESS","LOSSLESS_TIDAL","HIGH","LOW"].forEach(function(k){var el=document.getElementById("ql-"+k);if(el)el.classList.toggle("sel",selQ===k);});document.getElementById("qlHint").textContent=selQ?"Preferred: "+QLABELS[selQ]+" \u2014 fallback to lower if unavailable.":"\u00a0No preference \u2014 auto-selects: Qobuz Hi-Res \u2192 TIDAL Lossless \u2192 AAC 320 \u2192 AAC 96.";}';
 h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";var ci=document.getElementById("customInstance").value.trim();while(ci.length&&ci[ci.length-1]=="/")ci=ci.slice(0,-1);var body={};if(ci)body.instanceUrl=ci;if(selQ)body.preferredQuality=selQ;fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}gu=d.manifestUrl;document.getElementById("genUrl").textContent=gu;document.getElementById("genBadge").style.display=d.usingCustomInstance?"block":"none";document.getElementById("genBox").style.display="block";btn.disabled=false;btn.textContent="Regenerate URL";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}';
-h += 'function copyGen(){if(!gu)return;navigator.clipboard.writeText(gu).then(function(){var b=document.getElementById("copyGenBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);});}';
+h += 'function copyGen(){if(!gu)return;try{var _ta=document.createElement("textarea");_ta.value=gu;_ta.style.position="fixed";_ta.style.opacity="0";document.body.appendChild(_ta);_ta.select();document.execCommand("copy");document.body.removeChild(_ta);}catch(_e){try{navigator.clipboard.writeText(gu);}catch(_e2){}}var b=document.getElementById("copyGenBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);}';
 h += 'function doRefresh(){var btn=document.getElementById("refBtn");var eu=document.getElementById("existingUrl").value.trim();if(!eu){alert("Paste your existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu})}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh Existing URL";return;}ru=d.manifestUrl;document.getElementById("refUrl").textContent=ru;document.getElementById("refBox").style.display="block";btn.disabled=false;btn.textContent="Refresh Again";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh Existing URL";});}';
-h += 'function copyRef(){if(!ru)return;navigator.clipboard.writeText(ru).then(function(){var b=document.getElementById("copyRefBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);});}';
+h += 'function copyRef(){if(!ru)return;try{var _ta=document.createElement("textarea");_ta.value=ru;_ta.style.position="fixed";_ta.style.opacity="0";document.body.appendChild(_ta);_ta.select();document.execCommand("copy");document.body.removeChild(_ta);}catch(_e){try{navigator.clipboard.writeText(ru);}catch(_e2){}}var b=document.getElementById("copyRefBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);}';
 h += 'function checkHealth(){var list=document.getElementById("instList");list.innerHTML=\'<div style="color:#333;font-size:13px">Checking...</div>\';fetch("/instances").then(function(r){return r.json();}).then(function(data){list.innerHTML="";data.instances.forEach(function(inst){var row=document.createElement("div");row.className="inst";var dot=document.createElement("span");dot.className=inst.ok?"dot ok":"dot err";var urlSpan=document.createElement("span");urlSpan.className="inst-url";function maskUrl(u){var pre="https://";if(u.startsWith(pre)){var rest=u.slice(pre.length);return pre+rest.slice(0,6)+"\u2022".repeat(Math.max(0,rest.length-6));}return u.slice(0,14)+"\u2022".repeat(Math.max(0,u.length-14));}urlSpan.textContent=maskUrl(inst.url);row.appendChild(dot);row.appendChild(urlSpan);if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}list.appendChild(row);});}).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Could not reach server</div>\';});}';
 h += 'checkHealth();';
 h += '</script></body></html>';
