@@ -141,8 +141,9 @@ return 0;
 }
 
 // ─── Qobuz client ─────────────────────────────────────────────────────────────
-// qobuzStream: races ALL (instance × format) combos in parallel — picks best quality winner.
-// Stream URLs are cached for 28 min (Qobuz URLs expire at 30 min).
+// qobuzStream: race-with-priority — fires ALL (instance × format) combos at once,
+// resolves immediately when the highest-priority format responds.
+// Never waits for slow instances. Stream URLs cached 28 min (Qobuz URLs expire 30 min).
 async function qobuzStream(trackId, prefKey) {
   // prefKey: 'HIMAX'|'HI96'|'LOSSLESS'|'AAC320'|'AAC96'|null
   if (prefKey === 'AAC96') return null; // TIDAL-only tier — skip Qobuz
@@ -150,7 +151,6 @@ async function qobuzStream(trackId, prefKey) {
   const cached = cGet(cacheKey);
   if (cached) return cached;
 
-  // Build format priority list based on user preference
   const PREF_FMT_ORDER = {
     'HIMAX':    [27, 7, 6, 5],
     'HI96':     [7, 27, 6, 5],
@@ -158,277 +158,58 @@ async function qobuzStream(trackId, prefKey) {
     'AAC320':   [5],
     'HI_RES_LOSSLESS': [27, 7, 6, 5],
   };
-  const fmtOrder = (prefKey && PREF_FMT_ORDER[prefKey]) || [27, 7, 6, 5];
+  const fmtOrder   = (prefKey && PREF_FMT_ORDER[prefKey]) || [27, 7, 6, 5];
   const fmtQuality = { 27: 'hires-192', 7: 'hires-96', 6: 'lossless', 5: '320kbps' };
   const fmtLabel   = { 27: 'flac',      7: 'flac',     6: 'flac',     5: 'mp3' };
 
-  const combos = [];
-  for (const inst of QOBUZ_INSTANCES)
-    for (const fmt of fmtOrder)
-      combos.push({ inst, fmt });
+  // ─── Race-with-priority ────────────────────────────────────────────────────
+  // Fire every (instance × format) combo simultaneously.
+  // Resolve as soon as the top-priority available format wins.
+  // Never blocked by the slowest instance — returns on the first winner.
+  return new Promise((resolve) => {
+    let resolved = false;
+    let pending   = 0;
+    const best    = { idx: Infinity, val: null };
 
-  const results = await Promise.allSettled(combos.map(({ inst, fmt }) =>
-    axios.get(inst + '/stream/' + trackId, {
-      params: { format_id: fmt },
-      headers: { 'User-Agent': UA },
-      timeout: 10000
-    }).then(r => {
-      if (r.data && r.data.url) return { url: r.data.url, fmt, inst };
-      throw new Error('no url');
-    })
-  ));
-
-  // Pick highest-quality successful result
-  for (const fmt of fmtOrder) {
-    const hit = results.find(r => r.status === 'fulfilled' && r.value.fmt === fmt);
-    if (hit) {
-      const { url, inst } = hit.value;
-      if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-      const result = {
-        url, format: fmtLabel[fmt], quality: fmtQuality[fmt],
-        source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1680
-      };
-      cSet(cacheKey, result, 1680); // cache for 28 min
-      return result;
-    }
-  }
-  return null;
-}
-
-// qobuzFindByIsrc: looks up a Qobuz track by ISRC.
-// ONLY returns a result if the Qobuz item's own .isrc field matches exactly —
-// if the proxy doesn't support ISRC search syntax the result is silently discarded.
-// Result cached 24h on confirmed hit; miss cached 30 min.
-async function qobuzFindByIsrc(isrc) {
-  if (!isrc) return null;
-  const norm = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const wantIsrc = norm(isrc);
-  if (!wantIsrc) return null;
-
-  const cacheKey = 'qisrc:' + wantIsrc;
-  const cached = cGet(cacheKey);
-  if (cached === 'MISS') return null;
-  if (cached) return cached;
-
-  for (const inst of QOBUZ_INSTANCES) {
-    try {
-      const r = await axios.get(inst + '/search', {
-        params: { q: isrc, limit: 5 },
-        headers: { 'User-Agent': UA },
-        timeout: 8000
-      });
-      const items = (r.data && r.data.tracks && r.data.tracks.items) ? r.data.tracks.items : [];
-      // STRICT: only accept a result if Qobuz confirms the ISRC matches exactly
-      const match = items.find(t => t.isrc && norm(t.isrc) === wantIsrc);
-      if (match && match.id) {
+    const tryResolve = () => {
+      if (resolved) return;
+      if (best.val) {
+        resolved = true;
+        const { url, fmt, inst } = best.val;
         if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        cSet(cacheKey, match, 86400); // confirmed ISRC match — cache 24h
-        console.log('qobuz isrc: HIT', isrc, '->', match.id, match.title);
-        return match;
-      }
-    } catch(e) { continue; }
-  }
-  cSet(cacheKey, 'MISS', 1800); // miss cached 30 min — try again later
-  return null;
-}
-
-// qobuzFindBestTrack: tries ISRC first (exact match), falls back to title+artist fuzzy search.
-// ISRC results cached 24h; title+artist results cached 1h; misses cached 30 min.
-async function qobuzFindBestTrack(title, artist, isrc) {
-  // 1. ISRC fast path — confirmed exact match wins immediately
-  if (isrc) {
-    const byIsrc = await qobuzFindByIsrc(isrc);
-    if (byIsrc) return byIsrc;
-    // ISRC didn't return a confirmed match — fall through to title+artist search
-    console.log('qobuz: ISRC no confirmed match for', isrc, '- falling back to title search');
-  }
-
-  if (!title) return null;
-  const cacheKey = 'qmatch:' + title.toLowerCase() + ':' + (artist || '').toLowerCase();
-  const cached = cGet(cacheKey);
-  if (cached === 'MISS') return null;
-  if (cached) return cached;
-
-  const q = (artist ? artist + ' ' : '') + title;
-  for (const inst of QOBUZ_INSTANCES) {
-    try {
-      const r = await axios.get(inst + '/search', {
-        params: { q, limit: 10 },
-        headers: { 'User-Agent': UA },
-        timeout: 10000
-      });
-      const data = r.data || null;
-      if (!data) continue;
-      const items = (data.tracks && data.tracks.items) ? data.tracks.items : [];
-      if (!items.length) continue;
-      const norm = s => String(s || '').toLowerCase().replace(/\s+/g, ' ').trim();
-      const wantTitle  = norm(title);
-      const wantArtist = norm(artist || '');
-      const ranked = items.slice().sort((a, b) => {
-        const score = item => {
-          const t  = norm(item.title || '');
-          const ar = norm((item.performer && item.performer.name) || (item.artist && item.artist.name) || '');
-          let s = 0;
-          if (t === wantTitle)              s += 5;
-          if (wantArtist && ar === wantArtist) s += 5;
-          if (wantTitle  && t.includes(wantTitle))   s += 2;
-          if (wantArtist && ar.includes(wantArtist)) s += 2;
-          return s;
+        const result = {
+          url, format: fmtLabel[fmt], quality: fmtQuality[fmt],
+          source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1680
         };
-        return score(b) - score(a);
-      });
-      const best = ranked[0];
-      if (!best) continue;
-      const bestTitle  = norm(best.title || '');
-      const bestArtist = norm((best.performer && best.performer.name) || (best.artist && best.artist.name) || '');
-      const titleGood  = wantTitle && (bestTitle === wantTitle || bestTitle.includes(wantTitle) || wantTitle.includes(bestTitle));
-      const artistGood = !wantArtist || (bestArtist && (bestArtist === wantArtist || bestArtist.includes(wantArtist) || wantArtist.includes(bestArtist)));
-      if (wantArtist ? (titleGood && artistGood) : titleGood) {
-        if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        cSet(cacheKey, best, 3600); // cache match for 1 hour
-        return best;
+        cSet(cacheKey, result, 1680); // cache 28 min
+        resolve(result);
+      } else if (pending === 0) {
+        resolve(null); // all combos failed
       }
-    } catch(e) { continue; }
-  }
-  cSet(cacheKey, 'MISS', 1800); // negative-cache misses for 30 min
-  return null;
-}
+    };
 
-// ─── Hi-Fi API client ─────────────────────────────────────────────────────────
-// Races ALL instances in parallel (Promise.any) — first success wins.
-// Eliminates the sequential 15s-per-instance fallback that caused retry storms.
-async function hifiGet(path, params) {
-  const instances = instanceHealthy
-    ? [activeInstance].concat(HIFI_INSTANCES.filter(i => i !== activeInstance))
-    : HIFI_INSTANCES.slice();
-
-  try {
-    return await Promise.any(instances.map(inst =>
-      axios.get(inst + path, {
-        params,
-        headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-        timeout: 8000
-      }).then(r => {
-        if (r.status === 200 && r.data) {
-          if (inst !== activeInstance) { activeInstance = inst; instanceHealthy = true; }
-          return r.data;
-        }
-        throw new Error('bad response from ' + inst);
-      })
-    ));
-  } catch(e) {
-    throw new Error('All Hi-Fi instances failed');
-  }
-}
-
-async function hifiGetSafe(path, params) {
-  try { return await hifiGet(path, params); } catch(e) { return null; }
-}
-
-async function hifiGetForToken(instanceUrl, path, params) {
-  if (instanceUrl) {
-    try {
-      const r = await axios.get(instanceUrl + path, {
-        params,
-        headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-        timeout: 8000
-      });
-      if (r.status === 200 && r.data) return r.data;
-      throw new Error('Non-200 from custom instance: ' + r.status);
-    } catch(e) {
-      throw new Error('Custom instance failed: ' + instanceUrl + ': ' + e.message);
+    for (const inst of QOBUZ_INSTANCES) {
+      for (let i = 0; i < fmtOrder.length; i++) {
+        const fmt = fmtOrder[i];
+        pending++;
+        axios.get(inst + '/stream/' + trackId, {
+          params: { format_id: fmt },
+          headers: { 'User-Agent': UA },
+          timeout: 8000  // reduced from 10000 — fail fast on slow instances
+        }).then(r => {
+          if (r.data && r.data.url) {
+            // Only upgrade best if this is a higher-priority (lower index) format
+            if (i < best.idx) { best.idx = i; best.val = { url: r.data.url, fmt, inst }; }
+            // Got top-priority format (idx 0) — no need to wait for anything else
+            if (best.idx === 0) { pending = 0; tryResolve(); }
+          }
+        }).catch(() => {}).finally(() => {
+          if (!resolved) { pending--; tryResolve(); }
+        });
+      }
     }
-  }
-  return hifiGet(path, params);
-}
-
-async function hifiGetForTokenSafe(instanceUrl, path, params) {
-  try { return await hifiGetForToken(instanceUrl, path, params); } catch(e) { return null; }
-}
-
-// ─── Upstash Redis REST API ───────────────────────────────────────────────────
-const UPSTASH_URL = typeof UPSTASH_REDIS_REST_URL !== 'undefined' ? UPSTASH_REDIS_REST_URL : null;
-const UPSTASH_TOKEN = typeof UPSTASH_REDIS_REST_TOKEN !== 'undefined' ? UPSTASH_REDIS_REST_TOKEN : null;
-
-async function upstashCmd(...args) {
-if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
-try {
-const res = await fetch(UPSTASH_URL, {
-method: 'POST',
-headers: { 'Authorization': 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' },
-body: JSON.stringify(args)
-});
-const json = await res.json();
-return json.result ?? null;
-} catch(e) { return null; }
-}
-
-// Save title+artist+isrc to Redis keyed by TIDAL track id (TTL 24h)
-async function redisCacheTrackMeta(tid, title, artist, isrc) {
-if (!tid || !title) return;
-await upstashCmd('SET', 'mc:tmeta:' + tid, JSON.stringify({ title, artist: artist || 'Unknown', isrc: isrc || null }), 'EX', 86400);
-}
-
-// Load title+artist+isrc from Redis by TIDAL track id
-async function redisLoadTrackMeta(tid) {
-const raw = await upstashCmd('GET', 'mc:tmeta:' + tid);
-if (!raw) return null;
-try { return JSON.parse(raw); } catch(e) { return null; }
-}
-
-async function redisSave(token, entry) {
-await upstashCmd('SET', 'mc:token:' + token, JSON.stringify({
-createdAt: entry.createdAt,
-lastUsed: entry.lastUsed,
-reqCount: entry.reqCount || 0,
-instanceUrl: entry.instanceUrl || null,
-preferredQuality: entry.preferredQuality || null
-}), 'EX', 2592000);
-}
-
-async function redisLoad(token) {
-const raw = await upstashCmd('GET', 'mc:token:' + token);
-if (!raw) return null;
-try {
-const p = JSON.parse(raw);
-return {
-createdAt: p.createdAt || Date.now(),
-lastUsed: p.lastUsed || Date.now(),
-reqCount: p.reqCount || 0,
-instanceUrl: p.instanceUrl || null,
-preferredQuality: p.preferredQuality || null
-};
-} catch(e) { return null; }
-}
-
-// ─── Token auth ───────────────────────────────────────────────────────────────
-const TOKEN_CACHE = new Map();
-const IP_CREATES = new Map();
-const MAX_TOKENS_PER_IP = 10, RATE_MAX = 80, RATE_WINDOW_MS = 60000;
-
-function generateToken() { return crypto.randomBytes(14).toString('hex'); }
-
-function getOrCreateIpBucket(ip) {
-var now = Date.now();
-var b = IP_CREATES.get(ip);
-if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + 86400000 }; IP_CREATES.set(ip, b); }
-return b;
-}
-
-async function getTokenEntry(token) {
-if (TOKEN_CACHE.has(token)) return TOKEN_CACHE.get(token);
-var saved = await redisLoad(token);
-if (saved) {
-var entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, instanceUrl: saved.instanceUrl || null, preferredQuality: saved.preferredQuality || null, rateWin: [] };
-TOKEN_CACHE.set(token, entry);
-return entry;
-}
-if (/^[a-f0-9]{28}$/.test(token)) {
-var fresh = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl: null, preferredQuality: null };
-TOKEN_CACHE.set(token, fresh);
-return fresh;
-}
-return null;
+    if (pending === 0) resolve(null);
+  });
 }
 
 function checkRateLimit(entry) {
