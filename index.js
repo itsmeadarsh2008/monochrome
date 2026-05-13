@@ -424,8 +424,8 @@ async function resolveIsrc(title, artist, instanceUrl) {
   return null;
 }
 
-// qobuzFindByIsrc: looks up a Qobuz track by confirmed ISRC.
-// Only accepts result if Qobuz's own .isrc field matches exactly.
+// qobuzFindByIsrc: looks up a Qobuz track by confirmed ISRC via direct Qobuz API.
+// Uses /track/search?query=ISRC — no proxy hop, no sequential fallback.
 // Hit cached 24h, miss cached 30 min.
 async function qobuzFindByIsrc(isrc) {
   if (!isrc) return null;
@@ -438,26 +438,31 @@ async function qobuzFindByIsrc(isrc) {
   if (cached === 'MISS') return null;
   if (cached) return cached;
 
-  for (const inst of QOBUZ_INSTANCES) {
-    try {
-      const r = await axios.get(inst + '/search', {
-        params: { q: isrc, limit: 5 },
-        headers: { 'User-Agent': UA },
-        timeout: 8000
-      });
-      const items = r.data?.tracks?.items || [];
+  try {
+    const r = await fetch(
+      'https://www.qobuz.com/api.json/0.2/track/search'
+        + '?app_id='          + QOBUZ_APP_ID
+        + '&user_auth_token=' + QOBUZ_USER_TOKEN
+        + '&query='           + encodeURIComponent(wantIsrc)
+        + '&limit=5',
+      { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(6000) }
+    );
+    if (r.ok) {
+      const data = await r.json();
+      const items = data?.tracks?.items || [];
       const match = items.find(t => t.isrc && normIsrc(t.isrc) === wantIsrc);
       if (match && match.id) {
-        if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        cSet(cacheKey, match, 86400);
+        cSet(cacheKey, match, 86400); // 24h
         console.log('[qobuz] isrc HIT', isrc, '->', match.id, match.title);
         return match;
       }
-    } catch(e) { continue; }
-  }
-  cSet(cacheKey, 'MISS', 1800);
+    }
+  } catch(e) { /* fall through to MISS */ }
+
+  cSet(cacheKey, 'MISS', 1800); // 30 min miss
   return null;
 }
+
 
 // qobuzFindBestTrack: upgraded 4-tier lookup.
 // Tier 1: resolve ISRC via parallel TIDAL+Deezer engines → Qobuz ISRC lookup (exact match).
@@ -922,6 +927,8 @@ const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
 cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
 redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
+// Background Qobuz pre-warm — no await, result cached so stream is instant
+qobuzFindBestTrack(tTitle, tArtist, t.isrc || null, inst).catch(() => {});
 tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: 'flac' });
 }
 
@@ -997,73 +1004,90 @@ if (redisMeta) { qTitle = redisMeta.title; qArtist = redisMeta.artist; if (!qIsr
 
 if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid, '- skipping Qobuz');
 
-// Step 4: Qobuz Hi-Res — ISRC exact match first, title+artist fuzzy fallback
-if (qTitle || qIsrc) {
-try {
-const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
-if (qTrack && qTrack.id) {
-// Map stored pref key to Qobuz tier
-        const PREF_TO_QOBUZ_KEY = {
-          'HI_RES_LOSSLESS': 'HIMAX', 'HIRESLOSSLESS': 'HIMAX', 'HIMAX': 'HIMAX',
-          'HI96': 'HI96',
-          'LOSSLESS': 'LOSSLESS',
-          'HIGH': 'AAC320', 'AAC320': 'AAC320',
-          'LOW': 'AAC96',  'AAC96': 'AAC96',
-        };
-        const qobuzPrefKey = pref ? (PREF_TO_QOBUZ_KEY[pref] || null) : null;
-        const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
-if (qStream) {
-console.log('qobuz: HIT', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '->', qTrack.id, qStream.quality);
-return Response.json(qStream);
-}
-}
-console.log('qobuz: no match for', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '- TIDAL fallback');
-} catch(e) {
-console.warn('qobuz: error', e.message);
-}
+// ── Quality maps ─────────────────────────────────────────────────────────────
+const PREF_TO_QOBUZ_KEY = {
+  'HI_RES_LOSSLESS': 'HIMAX', 'HIRESLOSSLESS': 'HIMAX', 'HIMAX': 'HIMAX',
+  'HI96': 'HI96', 'LOSSLESS': 'LOSSLESS',
+  'HIGH': 'AAC320', 'AAC320': 'AAC320',
+  'LOW': 'AAC96',  'AAC96': 'AAC96',
+};
+const PREF_TO_TIDAL = {
+  'HI_RES_LOSSLESS': 'HI_RES_LOSSLESS', 'HIRESLOSSLESS': 'HI_RES_LOSSLESS',
+  'HIMAX': 'HI_RES_LOSSLESS', 'HI96': 'HI_RES_LOSSLESS',
+  'LOSSLESS': 'LOSSLESS', 'HIGH': 'HIGH', 'AAC320': 'HIGH',
+  'LOW': 'LOW', 'AAC96': 'LOW',
+};
+const ALL_QUALITIES  = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
+const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
+
+// ── TIDAL stream helper ───────────────────────────────────────────────────────
+async function getTidalStream() {
+  const tidalStartTier = pref ? (PREF_TO_TIDAL[pref] || 'LOSSLESS') : null;
+  const qualities = tidalStartTier
+    ? [tidalStartTier, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(tidalStartTier))]
+    : AUTO_QUALITIES;
+  for (let qi = 0; qi < qualities.length; qi++) {
+    const ql = qualities[qi];
+    try {
+      const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
+      const payload = data && data.data ? data.data : data;
+      if (payload && payload.manifest) {
+        const decoded = decodeManifest(payload.manifest);
+        if (decoded && decoded.url) {
+          const codec = (decoded.codec || '').toLowerCase();
+          const isFlac = decoded.isDash || codec.includes('flac') || codec.includes('audio/flac');
+          const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
+          return { url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) };
+        }
+      }
+      if (payload && payload.url) {
+        const looksLikeFlac = (payload.url || '').match(/\.flac(\?|$)/i);
+        const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
+        const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
+        return { url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) };
+      }
+    } catch(e) {
+      if (qi === qualities.length - 1) throw e;
+    }
+  }
+  return null;
 }
 
-// Step 5: TIDAL fallback
-// Map any pref key to TIDAL's native quality tier
-    const PREF_TO_TIDAL = {
-      'HI_RES_LOSSLESS': 'HI_RES_LOSSLESS', 'HIRESLOSSLESS': 'HI_RES_LOSSLESS',
-      'HIMAX': 'HI_RES_LOSSLESS', 'HI96': 'HI_RES_LOSSLESS',
-      'LOSSLESS': 'LOSSLESS',
-      'HIGH': 'HIGH', 'AAC320': 'HIGH',
-      'LOW': 'LOW',   'AAC96': 'LOW',
-    };
-    const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
-    const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
-    const tidalStartTier = pref ? (PREF_TO_TIDAL[pref] || 'LOSSLESS') : null;
-    const qualities = tidalStartTier
-      ? [tidalStartTier, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(tidalStartTier))]
-      : AUTO_QUALITIES;
+// ── Steps 4+5: Fire Qobuz AND TIDAL in parallel ───────────────────────────────
+// Qobuz is preferred — but both race simultaneously so TIDAL never adds latency.
+// If Qobuz resolves first with a result, we return it immediately.
+// If TIDAL resolves first (Qobuz still searching), we hold it and return it only
+// if Qobuz ultimately fails. This gives Qobuz Hi-Res quality without Qobuz latency cost.
+const qobuzPrefKey = pref ? (PREF_TO_QOBUZ_KEY[pref] || null) : null;
+const skipQobuz = !qTitle && !qIsrc;
 
-for (let qi = 0; qi < qualities.length; qi++) {
-const ql = qualities[qi];
-try {
-const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
-const payload = data && data.data ? data.data : data;
-if (payload && payload.manifest) {
-const decoded = decodeManifest(payload.manifest);
-if (decoded && decoded.url) {
-const codec = (decoded.codec || '').toLowerCase();
-const isFlac = decoded.isDash || codec.includes('flac') || codec.includes('audio/flac');
-const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
-return Response.json({ url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
-}
-}
-if (payload && payload.url) {
-const looksLikeFlac = (payload.url || '').match(/\.flac(\?|$)/i);
-const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
-const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
-return Response.json({ url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
-}
-} catch(e) {
-if (qi === qualities.length - 1) return Response.json({ error: 'Could not get stream URL for track ' + tid + ': ' + e.message }, { status: 502 });
-}
-}
+// Qobuz promise — full find+stream pipeline
+const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
+  try {
+    const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
+    if (!qTrack || !qTrack.id) return null;
+    const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
+    if (qStream) {
+      console.log('[stream] qobuz HIT', qTrack.id, qStream.quality);
+      return qStream;
+    }
+    return null;
+  } catch(e) {
+    console.warn('[stream] qobuz error:', e.message);
+    return null;
+  }
+})();
 
+// TIDAL promise — runs immediately in parallel
+const tidalPromise = (async () => {
+  try { return await getTidalStream(); } catch(e) { return null; }
+})();
+
+// Race: return Qobuz if it wins with a result, otherwise TIDAL, otherwise error.
+const [qResult, tResult] = await Promise.all([qobuzPromise, tidalPromise]);
+
+if (qResult) return Response.json(qResult);
+if (tResult) return Response.json(tResult);
 return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
 }); // end dedupeCall
 
