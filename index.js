@@ -249,16 +249,29 @@ function removeFeat(s) {
   return (m > 0 ? s.substring(0, m) : s).trim();
 }
 
-function scoringFindBest(items, query) {
+function scoringFindBest(items, query, knownArtist) {
   let bestItem  = null;
   let bestScore = -1;
 
-  const qNorm     = normalizeStr(query);
-  const hasHyphen = qNorm.includes('-');
-  let qTitleOnly  = hasHyphen ? qNorm.split('-')[1].trim() : qNorm;
-  if (hasHyphen && qNorm.split('-')[0].trim() === '') qTitleOnly = qNorm;
+  const qNorm      = normalizeStr(query);
+  const hasHyphen  = / - /.test(qNorm); // only space-hyphen-space, not word-internal hyphens
+  const qWords     = qNorm.replace(/[^a-z0-9\s]/gi, ' ').split(/\s+/).filter(w => w.length > 1);
+  const knownArtistNorm = knownArtist ? normalizeStr(knownArtist) : null;
 
-  const qWords = qNorm.replace(/[^a-z0-9\s]/gi, ' ').split(/\s+/).filter(w => w.length > 1);
+  // For non-hyphen queries, try to isolate the title portion
+  // by removing known-artist words from the query word list
+  const knownArtistWords = knownArtistNorm
+    ? knownArtistNorm.replace(/[^a-z0-9\s]/gi, ' ').split(/\s+/).filter(w => w.length > 1)
+    : [];
+  const titleOnlyWords = knownArtistWords.length
+    ? qWords.filter(w => !knownArtistWords.includes(w))
+    : qWords;
+
+  let qLeft = qNorm, qRight = '';
+  if (hasHyphen) {
+    const parts = qNorm.split(' - ').map(p => p.trim());
+    qLeft = parts[0]; qRight = parts[1] || '';
+  }
 
   for (let i = 0; i < Math.min(items.length, 50); i++) {
     const t       = items[i];
@@ -276,14 +289,25 @@ function scoringFindBest(items, query) {
     let titleMatch = false, artistMatch = false;
 
     if (hasHyphen) {
-      const parts = qNorm.split('-');
-      const p1 = parts[0].trim(), p2 = parts[1].trim();
-      if (p1.length && (tTitle === p1 || tTitle.includes(p1) || p1.includes(tTitle))) titleMatch = true;
-      if (p2.length && (tTitle === p2 || tTitle.includes(p2) || p2.includes(tTitle))) titleMatch = true;
-      if (p1.length && (tArtist === p1 || tArtist.includes(p1) || p1.includes(tArtist))) artistMatch = true;
-      if (p2.length && (tArtist === p2 || tArtist.includes(p2) || p2.includes(tArtist))) artistMatch = true;
+      if (qLeft.length  && (tTitle  === qLeft  || tTitle.includes(qLeft)   || qLeft.includes(tTitle)))   titleMatch  = true;
+      if (qRight.length && (tTitle  === qRight || tTitle.includes(qRight)  || qRight.includes(tTitle)))  titleMatch  = true;
+      if (qLeft.length  && (tArtist === qLeft  || tArtist.includes(qLeft)  || qLeft.includes(tArtist)))  artistMatch = true;
+      if (qRight.length && (tArtist === qRight || tArtist.includes(qRight) || qRight.includes(tArtist))) artistMatch = true;
     } else {
-      if (tTitle.length  && (qNorm === tTitle  || qNorm.includes(tTitle)  || tTitle.includes(qNorm)))  titleMatch  = true;
+      // titleMatch: only award if the track title contains words that are TITLE-EXCLUSIVE
+      // (i.e. words that are NOT part of the known artist name).
+      // This prevents "Dead Butterflies" by Architects from getting titleMatch
+      // when query is "dead butterflies embers" and we know artist is "Dead Butterflies".
+      const titleHitsTitleOnly = titleOnlyWords.filter(w => tTitle.includes(w)).length;
+      const titleHitsAll       = qWords.filter(w => tTitle.includes(w)).length;
+      if (titleOnlyWords.length > 0) {
+        // We have title-exclusive words — require at least one to be in tTitle
+        if (titleHitsTitleOnly > 0 && (qNorm === tTitle || qNorm.includes(tTitle) || tTitle.includes(qNorm))) titleMatch = true;
+        if (tTitle === qNorm) titleMatch = true;
+      } else {
+        // No title-only words (all query words are artist words) — use loose match
+        if (tTitle.length && (qNorm === tTitle || qNorm.includes(tTitle) || tTitle.includes(qNorm))) titleMatch = true;
+      }
       if (tArtist.length && (qNorm === tArtist || qNorm.includes(tArtist) || tArtist.includes(qNorm))) artistMatch = true;
     }
 
@@ -292,17 +316,23 @@ function scoringFindBest(items, query) {
     if (titleMatch && artistMatch) score += 100;
 
     // Exact title bonus
-    if (tTitle === qTitleOnly || tTitle === qNorm) score += 60;
+    if (!hasHyphen && (tTitle === qNorm || (titleOnlyWords.length && titleOnlyWords.every(w => tTitle.includes(w)) && tTitle.split(' ').length <= titleOnlyWords.length + 1))) score += 60;
+    if (hasHyphen && (tTitle === qLeft || tTitle === qRight)) score += 60;
 
     // Title guillotine — kills results with no query word in the title
     const titleWordsMatch = qWords.filter(w => tTitle.includes(w)).length;
-    if (titleWordsMatch === 0 && tTitle !== qTitleOnly && !qNorm.includes(tTitle)) {
+    if (titleWordsMatch === 0 && tTitle !== qNorm) {
       if (qNorm !== tArtist && !tArtist.includes(qNorm)) score -= 100;
     }
 
+    // KEY: if we know the artist and this track's artist doesn't match → penalize heavily
+    if (knownArtistNorm && tArtist && !tArtist.includes(knownArtistNorm) && !knownArtistNorm.includes(tArtist)) {
+      score -= 150;
+    }
+
     // Anti-cover/karaoke spam
-    if (!/(cover|karaoke|tribute|instrumental|8-bit)/i.test(qNorm) &&
-         /(cover|karaoke|tribute|instrumental|8-bit)/i.test(t.title || '')) {
+    if (!/\b(cover|karaoke|tribute|instrumental|8-bit)\b/i.test(qNorm) &&
+         /\b(cover|karaoke|tribute|instrumental|8-bit)\b/i.test(t.title || '')) {
       score -= 500;
     }
 
@@ -318,13 +348,13 @@ function scoringFindBest(items, query) {
 const DEEZER_API = 'https://api.deezer.com';
 const ISRC_MIN_SCORE = 100; // minimum scoring engine threshold for a valid match
 
-async function getIsrcFromTidal(query, instanceUrl) {
+async function getIsrcFromTidal(query, instanceUrl, knownArtist) {
   try {
     const data = await hifiGetForTokenSafe(instanceUrl, '/search', { s: query, limit: 20 });
     let items = data?.tracks?.items || data?.items || data?.data?.items ||
                 data?.data?.tracks?.items || (Array.isArray(data) ? data : []);
     if (!items.length) return null;
-    const match = scoringFindBest(items, query);
+    const match = scoringFindBest(items, query, knownArtist);
     if (!match.item || match.score < ISRC_MIN_SCORE) return null;
     const track = match.item;
     let isrc = track.isrc;
@@ -337,7 +367,7 @@ async function getIsrcFromTidal(query, instanceUrl) {
   } catch(e) { return null; }
 }
 
-async function getIsrcFromDeezer(query) {
+async function getIsrcFromDeezer(query, knownArtist) {
   try {
     const r = await axios.get(DEEZER_API + '/search/track', {
       params: { q: query },
@@ -346,7 +376,7 @@ async function getIsrcFromDeezer(query) {
     });
     const items = r.data?.data || [];
     if (!items.length) return null;
-    const match = scoringFindBest(items, query);
+    const match = scoringFindBest(items, query, knownArtist);
     if (!match.item || match.score < ISRC_MIN_SCORE) return null;
     const track = match.item;
     let isrc = track.isrc;
@@ -373,8 +403,8 @@ async function resolveIsrc(title, artist, instanceUrl) {
   if (cached) return cached;
 
   const [tidalResult, deezerResult] = await Promise.all([
-    getIsrcFromTidal(query, instanceUrl),
-    getIsrcFromDeezer(query)
+    getIsrcFromTidal(query, instanceUrl, artist),
+    getIsrcFromDeezer(query, artist)
   ]);
 
   let winner = null;
@@ -470,7 +500,7 @@ async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
       });
       const items = r.data?.tracks?.items || [];
       if (!items.length) continue;
-      const match = scoringFindBest(items, (artist ? artist + ' ' : '') + title);
+      const match = scoringFindBest(items, (artist ? artist + ' ' : '') + title, artist);
       if (match.item && match.score >= 40) { // lower threshold for direct Qobuz search
         if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
         cSet(cacheKey, match.item, 3600);
