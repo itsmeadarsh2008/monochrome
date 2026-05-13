@@ -140,76 +140,96 @@ if (n.includes(q) || q.includes(n)) return 2;
 return 0;
 }
 
-// ─── Qobuz client ─────────────────────────────────────────────────────────────
-// qobuzStream: race-with-priority — fires ALL (instance × format) combos at once,
-// resolves immediately when the highest-priority format responds.
-// Never waits for slow instances. Stream URLs cached 28 min (Qobuz URLs expire 30 min).
+// ─── Qobuz credentials (direct API — no proxy needed) ────────────────────────
+const QOBUZ_APP_ID    = '312369995';
+const QOBUZ_USER_TOKEN = '12h9GluBRKayx3VJAtOz3h-5upKgDN3uR8gSXQPrFQj7qexs9zsrF36CHLlfLd_Nq037d6HKEz1mGGF7OxTDrA';
+const QOBUZ_SECRET    = 'e79f8b9be485692b0e5f9dd895826368';
+
+// Format ID map — same as QTE
+const QOBUZ_FORMAT_MAP = {
+  'HIMAX':    27,  // 24-bit / up to 192kHz
+  'HI96':     7,   // 24-bit / up to 96kHz
+  'LOSSLESS': 6,   // 16-bit / 44.1kHz FLAC
+  'AAC320':   5,   // 320 kbps MP3
+  'HI_RES_LOSSLESS': 27,
+  'HIRESLOSSLESS':   27,
+};
+
+function md5(str) {
+  return crypto.createHash('md5').update(str).digest('hex');
+}
+
+// qobuzQualityLabel — mirrors QTE exactly
+function qobuzQualityLabel(formatId, data) {
+  const sr  = data?.sampling_rate || 0;
+  const bd  = data?.bit_depth      || 0;
+  if (formatId === 27) return 'hires-192';
+  if (formatId === 7)  return 'hires-96';
+  if (formatId === 6)  return 'lossless';
+  if (formatId === 5)  return '320kbps';
+  return 'unknown';
+}
+
+// ─── Qobuz client — direct signed API call (replaces proxy racing) ────────────
+// Mirrors QTE's getTrackStreamUrl Qobuz path exactly:
+//   ts   = Math.floor(Date.now() / 1000)
+//   sig  = md5('trackgetFileUrlformat_id' + fmt + 'intentstreamtrack_id' + id + ts + secret)
+//   hits https://www.qobuz.com/api.json/0.2/track/getFileUrl directly
+// Stream URLs cached 28 min (Qobuz URLs expire ~30 min).
+// Falls back through format priority order if a tier returns an error.
 async function qobuzStream(trackId, prefKey) {
-  // prefKey: 'HIMAX'|'HI96'|'LOSSLESS'|'AAC320'|'AAC96'|null
-  if (prefKey === 'AAC96') return null; // TIDAL-only tier — skip Qobuz
+  if (prefKey === 'AAC96') return null; // TIDAL-only tier
+
   const cacheKey = 'qstream:' + trackId + ':' + (prefKey || 'auto');
   const cached = cGet(cacheKey);
   if (cached) return cached;
 
+  // Determine format priority order based on prefKey (same as old proxy version)
   const PREF_FMT_ORDER = {
     'HIMAX':    [27, 7, 6, 5],
     'HI96':     [7, 27, 6, 5],
     'LOSSLESS': [6, 7, 27, 5],
     'AAC320':   [5],
     'HI_RES_LOSSLESS': [27, 7, 6, 5],
+    'HIRESLOSSLESS':   [27, 7, 6, 5],
   };
-  const fmtOrder   = (prefKey && PREF_FMT_ORDER[prefKey]) || [27, 7, 6, 5];
-  const fmtQuality = { 27: 'hires-192', 7: 'hires-96', 6: 'lossless', 5: '320kbps' };
-  const fmtLabel   = { 27: 'flac',      7: 'flac',     6: 'flac',     5: 'mp3' };
+  const fmtOrder = (prefKey && PREF_FMT_ORDER[prefKey]) || [27, 7, 6, 5];
+  const fmtLabel = { 27: 'flac', 7: 'flac', 6: 'flac', 5: 'mp3' };
 
-  // ─── Race-with-priority ────────────────────────────────────────────────────
-  // Fire every (instance × format) combo simultaneously.
-  // Resolve as soon as the top-priority available format wins.
-  // Never blocked by the slowest instance — returns on the first winner.
-  return new Promise((resolve) => {
-    let resolved = false;
-    let pending   = 0;
-    const best    = { idx: Infinity, val: null };
+  // Try each format in priority order — exactly like QTE's loop
+  for (const fmt of fmtOrder) {
+    try {
+      const ts  = Math.floor(Date.now() / 1000);
+      const sig = md5('trackgetFileUrlformat_id' + fmt + 'intentstreamtrack_id' + trackId + ts + QOBUZ_SECRET);
+      const url = 'https://www.qobuz.com/api.json/0.2/track/getFileUrl'
+        + '?app_id='          + QOBUZ_APP_ID
+        + '&user_auth_token=' + QOBUZ_USER_TOKEN
+        + '&track_id='        + trackId
+        + '&format_id='       + fmt
+        + '&intent=stream'
+        + '&request_ts='      + ts
+        + '&request_sig='     + sig;
 
-    const tryResolve = () => {
-      if (resolved) return;
-      if (best.val) {
-        resolved = true;
-        const { url, fmt, inst } = best.val;
-        if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        const result = {
-          url, format: fmtLabel[fmt], quality: fmtQuality[fmt],
-          source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1680
-        };
-        cSet(cacheKey, result, 1680); // cache 28 min
-        resolve(result);
-      } else if (pending === 0) {
-        resolve(null); // all combos failed
-      }
-    };
+      const res = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
+      if (!res.ok) continue; // try next format
+      const data = await res.json();
+      if (!data?.url) continue;
 
-    for (const inst of QOBUZ_INSTANCES) {
-      for (let i = 0; i < fmtOrder.length; i++) {
-        const fmt = fmtOrder[i];
-        pending++;
-        axios.get(inst + '/stream/' + trackId, {
-          params: { format_id: fmt },
-          headers: { 'User-Agent': UA },
-          timeout: 8000  // reduced from 10000 — fail fast on slow instances
-        }).then(r => {
-          if (r.data && r.data.url) {
-            // Only upgrade best if this is a higher-priority (lower index) format
-            if (i < best.idx) { best.idx = i; best.val = { url: r.data.url, fmt, inst }; }
-            // Got top-priority format (idx 0) — no need to wait for anything else
-            if (best.idx === 0) { pending = 0; tryResolve(); }
-          }
-        }).catch(() => {}).finally(() => {
-          if (!resolved) { pending--; tryResolve(); }
-        });
-      }
+      const result = {
+        url:       data.url,
+        format:    fmtLabel[fmt] || 'flac',
+        quality:   qobuzQualityLabel(fmt, data),
+        source:    'qobuz',
+        expiresAt: Math.floor(Date.now() / 1000) + 1680, // 28 min
+      };
+      cSet(cacheKey, result, 1680);
+      return result;
+    } catch (e) {
+      continue; // network error — try next format
     }
-    if (pending === 0) resolve(null);
-  });
+  }
+
+  return null; // all formats failed
 }
 
 // ─── Search scoring engine (ported from 8spine V2.0 Strict) ──────────────────
