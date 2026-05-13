@@ -12,7 +12,6 @@ try { return await c.req.json(); } catch(e) { return {}; }
 }
 
 const HIFI_INSTANCES = [
-'https://hifi-api-workers.anothermoumen4.workers.dev',
 'https://hifi-api-pj08.onrender.com',
 'https://mono.kennyy.com.br/hifi-api',
 'https://api.iwakura.workers.dev',
@@ -694,8 +693,9 @@ function buildConfigPage(baseUrl) {
 var h = '';
 h += '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">';
 h += '<meta name="viewport" content="width=device-width,initial-scale=1">';
-h += '<title>Claudochrome - TIDAL Addon</title>';
-h += '<style>*{box-sizing:border-box;margin:0;padding:0}';
+h += '<title>Monochrome - TIDAL + Qobuz</title>';
+h += '<style>';
+h += '*{box-sizing:border-box;margin:0;padding:0}';
 h += 'body{background:#080808;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px 64px}';
 h += '.card{background:#111;border:1px solid #1e1e1e;border-radius:18px;padding:36px;max-width:540px;width:100%;box-shadow:0 24px 64px rgba(0,0,0,.6);margin-bottom:20px}';
 h += 'h1{font-size:22px;font-weight:700;margin-bottom:6px;color:#fff}h2{font-size:16px;font-weight:700;margin-bottom:14px;color:#fff}';
@@ -720,80 +720,217 @@ h += '.steps{display:flex;flex-direction:column;gap:12px}.step{display:flex;gap:
 h += '.sn{background:#161616;border:1px solid #222;border-radius:50%;width:26px;height:26px;min-width:26px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#555}';
 h += '.st{font-size:13px;color:#555;line-height:1.6}.st b{color:#999}';
 h += '.warn{background:#0d0d0d;border:1px solid #1e1e1e;border-radius:10px;padding:14px;margin-top:20px;font-size:12px;color:#555;line-height:1.7}';
+// Quality selector styles — two groups, single selection across both
+h += '.ql-section{margin-bottom:4px}';
+h += '.ql-group-label{font-size:10px;color:#555;text-transform:uppercase;letter-spacing:.06em;margin-bottom:6px;margin-top:12px}';
+h += '.ql-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px}';
+h += '.ql-btn{flex:1;min-width:calc(50% - 4px);cursor:pointer;border:1px solid #2a2a2a;border-radius:12px;background:#0a0a0a;color:#555;font-size:12px;font-weight:700;padding:12px 8px;text-align:center;transition:all .15s;letter-spacing:.04em;line-height:1.4}';
+h += '.ql-btn:hover{border-color:#444;color:#aaa}';
+h += '.ql-btn.sel-q{background:#0d1520;border-color:#4a9eff;color:#4a9eff}';  // Qobuz selected
+h += '.ql-btn.sel-t{background:#120d20;border-color:#9b4aff;color:#9b4aff}';  // TIDAL selected
+h += '.ql-sub{font-size:10px;font-weight:400;opacity:.6;display:block;margin-top:2px}';
+h += '.qual-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;margin-bottom:10px}';
+h += '.qual-badge.qobuz{background:#0d1520;color:#4a9eff;border:1px solid #1a3050}';
+h += '.qual-badge.tidal{background:#120d20;color:#9b4aff;border:1px solid #1a2a40}';
+h += '.qual-badge.none{background:#111;color:#555;border:1px solid #1e1e1e}';
+// Instance health
 h += '.inst-list{display:flex;flex-direction:column;gap:6px;margin-top:10px}';
 h += '.inst{display:flex;align-items:center;gap:8px;font-size:12px;padding:8px 12px;background:#0a0a0a;border:1px solid #161616;border-radius:8px}';
 h += '.dot{width:7px;height:7px;border-radius:50%;background:#333;flex-shrink:0}.dot.ok{background:#4a9a4a}.dot.err{background:#c04040}';
 h += '.inst-url{flex:1;color:#666;font-family:"SF Mono","Fira Code",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}';
 h += '.inst-ms{color:#444;margin-left:auto;font-size:11px}';
-h += '.badge{display:none;background:#0d1a0d;border:1px solid #1a3a1a;border-radius:8px;padding:8px 12px;font-size:12px;color:#4a9a4a;margin-bottom:10px}';
-h += '.ql-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}';
-h += '.ql-btn{flex:1;cursor:pointer;border:1px solid #2a2a2a;border-radius:10px;background:#0a0a0a;color:#555;font-size:12px;font-weight:700;padding:10px 6px;text-align:center;transition:all .15s;letter-spacing:.04em}';
-h += '.ql-btn:hover{border-color:#444;color:#aaa}';
-h += '.ql-btn.sel{background:#0d1520;border-color:#4a9eff;color:#4a9eff}';
-h += 'footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-height:1.8}';
 h += '</style></head><body>';
+
+// Logo
 h += '<svg width="52" height="52" viewBox="0 0 52 52" fill="none" style="margin-bottom:22px"><circle cx="26" cy="26" r="26" fill="#fff"/><rect x="10" y="20" width="4" height="12" rx="2" fill="#000"/><rect x="17" y="14" width="4" height="24" rx="2" fill="#000"/><rect x="24" y="18" width="4" height="16" rx="2" fill="#000"/><rect x="31" y="11" width="4" height="30" rx="2" fill="#000"/><rect x="38" y="17" width="4" height="18" rx="2" fill="#000"/></svg>';
+
 h += '<div class="card">';
-h += '<h1>Claudochrome for Eclipse</h1>';
-h += '<p class="sub">Full TIDAL catalog &mdash; lossless FLAC, HiRes, AAC 320 &mdash; no account, no subscription. Streams: Qobuz Hi-Res &rarr; TIDAL &rarr; fallback.</p>';
+h += '<h1>Monochrome for Eclipse</h1>';
+h += '<p class="sub">Full TIDAL catalog &mdash; lossless FLAC, HiRes, AAC 320 &mdash; no account needed. Qobuz Hi-Res &rarr; TIDAL &rarr; fallback.</p>';
 h += '<div class="tip"><b>Save your URL.</b> Paste it below to refresh without reinstalling.</div>';
 h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC / HiRes</span><span class="pill hi">AAC 320</span><span class="pill hi">Qobuz 24-bit</span></div>';
+
 h += '<div class="lbl">Custom Hi&#8209;Fi Instance <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<input type="text" id="customInstance" placeholder="https://your-instance.example.com">';
 h += '<div class="hint">Leave blank to use the shared pool. Paste your own self-hosted Hi-Fi API URL to lock this token exclusively to your instance.</div>';
+
+// Quality selector — split into Qobuz group + TIDAL group, single selection across both
 h += '<div class="lbl">Preferred Audio Quality <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
-h += '<div style="font-size:10px;color:#555;margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em">Qobuz Quality</div>';
+
+h += '<div class="ql-group-label">&#9675; Qobuz</div>';
 h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-HIMAX" onclick="selectQuality(\'HIMAX\')">Hi-Res 192<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / up to 192kHz</span></div>';
-h += '<div class="ql-btn" id="ql-HI96" onclick="selectQuality(\'HI96\')">Hi-Res 96<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / up to 96kHz</span></div>';
-h += '<div class="ql-btn" id="ql-LOSSLESS" onclick="selectQuality(\'LOSSLESS\')">Lossless<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">16-bit / 44.1kHz</span></div>';
-h += '<div class="ql-btn" id="ql-AAC320" onclick="selectQuality(\'AAC320\')">320 kbps<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">Qobuz AAC 320</span></div>';
+h += '<div class="ql-btn" id="ql-HIMAX"       onclick="selectQ(\'HIMAX\',\'q\')">Hi-Res 192<span class="ql-sub">24-bit / up to 192kHz</span></div>';
+h += '<div class="ql-btn" id="ql-HI96"        onclick="selectQ(\'HI96\',\'q\')">Hi-Res 96<span class="ql-sub">24-bit / up to 96kHz</span></div>';
 h += '</div>';
-h += '<div style="font-size:10px;color:#555;margin-bottom:5px;margin-top:10px;text-transform:uppercase;letter-spacing:.06em">TIDAL Quality</div>';
 h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-HI_RES_LOSSLESS" onclick="selectQuality(\'HI_RES_LOSSLESS\')">Hi-Res Max<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / up to 192kHz</span></div>';
-h += '<div class="ql-btn" id="ql-LOSSLESS_TIDAL" onclick="selectQuality(\'LOSSLESS\')">High<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">16-bit / 44.1kHz</span></div>';
-h += '<div class="ql-btn" id="ql-HIGH" onclick="selectQuality(\'HIGH\')">Low (320)<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">320 kbps</span></div>';
-h += '<div class="ql-btn" id="ql-LOW" onclick="selectQuality(\'LOW\')">Low (96)<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">96 kbps</span></div>';
+h += '<div class="ql-btn" id="ql-LOSSLESS"    onclick="selectQ(\'LOSSLESS\',\'q\')">CD Quality<span class="ql-sub">16-bit / 44.1kHz</span></div>';
+h += '<div class="ql-btn" id="ql-AAC320"      onclick="selectQ(\'AAC320\',\'q\')">320 kbps<span class="ql-sub">Qobuz AAC 320</span></div>';
 h += '</div>';
-h += '<div class="hint" id="qlHint">No preference &mdash; addon auto-selects: Qobuz Hi-Res &rarr; TIDAL Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
+
+h += '<div class="ql-group-label" style="margin-top:14px">&#9675; TIDAL (skips Qobuz)</div>';
+h += '<div class="ql-row">';
+h += '<div class="ql-btn" id="ql-TIDAL_HIMAX"    onclick="selectQ(\'TIDAL_HIMAX\',\'t\')">Hi-Res Max<span class="ql-sub">24-bit / up to 192kHz</span></div>';
+h += '<div class="ql-btn" id="ql-TIDAL_LOSSLESS" onclick="selectQ(\'TIDAL_LOSSLESS\',\'t\')">CD Quality<span class="ql-sub">16-bit / 44.1kHz</span></div>';
+h += '</div>';
+h += '<div class="ql-row">';
+h += '<div class="ql-btn" id="ql-TIDAL_HIGH"  onclick="selectQ(\'TIDAL_HIGH\',\'t\')">320 kbps<span class="ql-sub">TIDAL AAC 320</span></div>';
+h += '<div class="ql-btn" id="ql-TIDAL_LOW"   onclick="selectQ(\'TIDAL_LOW\',\'t\')">96 kbps<span class="ql-sub">TIDAL AAC 96</span></div>';
+h += '</div>';
+
+h += '<div class="hint" id="qlHint" style="margin-top:8px">No preference &mdash; auto-selects: Qobuz Hi-Res &rarr; TIDAL Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
+
 h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
-h += '<div class="box" id="genBox"><div class="badge" id="genBadge">&#10003; Locked to your custom instance</div><div class="blbl">Your addon URL &mdash; paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button></div>';
+
+// Generate result box — styled like QTE screenshot
+h += '<div class="box" id="genBox">';
+h += '<div id="genQualBadge" class="qual-badge none"></div>';
+h += '<div class="blbl">Your Addon URL &mdash; paste into Eclipse</div>';
+h += '<div class="burl" id="genUrl"></div>';
+h += '<button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button>';
+h += '</div>';
+
 h += '<hr>';
 h += '<div class="lbl">Refresh existing URL</div>';
 h += '<input type="text" id="existingUrl" placeholder="Paste your existing addon URL here">';
 h += '<div class="hint">Keeps the same URL active &mdash; nothing to reinstall.</div>';
 h += '<button class="bg" id="refBtn" onclick="doRefresh()">Refresh Existing URL</button>';
 h += '<div class="box" id="refBox"><div class="blbl">Refreshed &mdash; same URL still works in Eclipse</div><div class="burl" id="refUrl"></div><button class="bd" id="copyRefBtn" onclick="copyRef()">Copy URL</button></div>';
+
 h += '<hr>';
 h += '<div class="steps">';
-h += '<div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>';
+h += '<div class="step"><div class="sn">1</div><div class="st">Select a quality tier above, then click <b>Generate</b></div></div>';
 h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>';
-h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap Install</div></div>';
+h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>';
 h += '<div class="step"><div class="sn">4</div><div class="st">Search TIDAL\'s full catalog &mdash; Qobuz Hi-Res played first automatically</div></div>';
 h += '</div>';
-h += '<div class="warn">Stream priority: <b>Qobuz Hi-Res 24-bit</b> &rarr; TIDAL Lossless/HiRes &rarr; lower quality fallback. Searches always use TIDAL catalog.</div>';
+h += '<div class="warn">Stream priority: <b>Qobuz Hi-Res 24-bit</b> &rarr; TIDAL Lossless/HiRes &rarr; lower quality fallback. Selecting a <b>TIDAL</b> tier skips Qobuz entirely.</div>';
 h += '</div>';
+
+// Qobuz Instance Health card
 h += '<div class="card">';
-h += '<h2>Instance Health</h2>';
-h += '<p class="sub" style="margin-bottom:14px">Live status of all Hi-Fi API v2.7 instances.</p>';
+h += '<h2>Qobuz API Status</h2>';
+h += '<p class="sub" style="margin-bottom:14px">Direct Qobuz API &mdash; your credentials are active.</p>';
+h += '<div style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:#0a0a0a;border:1px solid #161616;border-radius:8px;font-size:13px">';
+h += '<div class="dot ok" id="qobuzDot"></div>';
+h += '<span style="color:#666;font-family:monospace;font-size:12px">www.qobuz.com/api.json/0.2</span>';
+h += '<span id="qobuzMs" style="margin-left:auto;font-size:11px;color:#444"></span>';
+h += '</div>';
+h += '</div>';
+
+// TIDAL Instance Health card
+h += '<div class="card">';
+h += '<h2>TIDAL Instance Health</h2>';
+h += '<p class="sub" style="margin-bottom:14px">Live status of all Hi-Fi API instances.</p>';
 h += '<div class="inst-list" id="instList"><div style="color:#333;font-size:13px">Checking...</div></div>';
 h += '<button class="bg" style="margin-top:14px" onclick="checkHealth()">Refresh Status</button>';
 h += '</div>';
-h += '<footer>Claudochrome Eclipse Addon v2.3.0 &bull; TIDAL search + Qobuz Hi-Res streams</footer>';
+
+h += '<footer>Monochrome Eclipse Addon &bull; TIDAL search &bull; Qobuz Hi-Res streams</footer>';
+
+// JS
 h += '<script>';
-h += 'var gu,ru,selQ=null;';
-h += 'var QLABELS={"HIMAX":"Hi-Res 192 · 24-bit/192kHz (Qobuz)","HI96":"Hi-Res 96 · 24-bit/96kHz (Qobuz)","LOSSLESS":"Lossless · 16-bit/44.1kHz FLAC","AAC320":"320 kbps AAC (Qobuz)","HI_RES_LOSSLESS":"TIDAL Hi-Res Max · 24-bit/192kHz","LOSSLESS_TIDAL":"TIDAL High · 16-bit/44.1kHz","HIGH":"TIDAL Low · 320 kbps","LOW":"TIDAL Low · 96 kbps"};';
-h += 'function selectQuality(q){if(selQ===q)selQ=null;else selQ=q;["HIMAX","HI96","LOSSLESS","AAC320","HI_RES_LOSSLESS","LOSSLESS_TIDAL","HIGH","LOW"].forEach(function(k){var el=document.getElementById("ql-"+k);if(el)el.classList.toggle("sel",selQ===k);});document.getElementById("qlHint").textContent=selQ?"Preferred: "+QLABELS[selQ]+" \u2014 fallback to lower if unavailable.":"\u00a0No preference \u2014 auto-selects: Qobuz Hi-Res \u2192 TIDAL Lossless \u2192 AAC 320 \u2192 AAC 96.";}';
-h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";var ci=document.getElementById("customInstance").value.trim();while(ci.length&&ci[ci.length-1]=="/")ci=ci.slice(0,-1);var body={};if(ci)body.instanceUrl=ci;if(selQ)body.preferredQuality=selQ;fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}gu=d.manifestUrl;document.getElementById("genUrl").textContent=gu;document.getElementById("genBadge").style.display=d.usingCustomInstance?"block":"none";document.getElementById("genBox").style.display="block";btn.disabled=false;btn.textContent="Regenerate URL";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}';
-h += 'function copyGen(){if(!gu)return;try{var _ta=document.createElement("textarea");_ta.value=gu;_ta.style.position="fixed";_ta.style.opacity="0";document.body.appendChild(_ta);_ta.select();document.execCommand("copy");document.body.removeChild(_ta);}catch(_e){try{navigator.clipboard.writeText(gu);}catch(_e2){}}var b=document.getElementById("copyGenBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);}';
+h += 'var gu,ru,selQ=null,selGroup=null;';
+
+h += 'var QKEYS=["HIMAX","HI96","LOSSLESS","AAC320"];';
+h += 'var TKEYS=["TIDAL_HIMAX","TIDAL_LOSSLESS","TIDAL_HIGH","TIDAL_LOW"];';
+h += 'var ALLKEYS=QKEYS.concat(TKEYS);';
+
+h += 'var QLABELS={';
+h += '"HIMAX":"Hi-Res 192 \u00b7 24-bit/192kHz",';
+h += '"HI96":"Hi-Res 96 \u00b7 24-bit/96kHz",';
+h += '"LOSSLESS":"CD Quality \u00b7 16-bit/44.1kHz",';
+h += '"AAC320":"320 kbps \u00b7 Qobuz AAC",';
+h += '"TIDAL_HIMAX":"TIDAL Hi-Res \u00b7 24-bit/192kHz",';
+h += '"TIDAL_LOSSLESS":"TIDAL CD Quality \u00b7 16-bit/44.1kHz",';
+h += '"TIDAL_HIGH":"TIDAL 320 kbps",';
+h += '"TIDAL_LOW":"TIDAL 96 kbps"';
+h += '};';
+
+h += 'function selectQ(q,grp){';
+h += '  if(selQ===q){selQ=null;selGroup=null;}else{selQ=q;selGroup=grp;}';
+h += '  ALLKEYS.forEach(function(k){';
+h += '    var el=document.getElementById("ql-"+k);';
+h += '    if(!el)return;';
+h += '    el.classList.remove("sel-q","sel-t");';
+h += '    if(selQ===k)el.classList.add(selGroup==="q"?"sel-q":"sel-t");';
+h += '  });';
+h += '  var hint=document.getElementById("qlHint");';
+h += '  if(selQ){';
+h += '    hint.textContent="Selected: "+QLABELS[selQ]+(selGroup==="t"?" \u2014 TIDAL only, skips Qobuz":" \u2014 Qobuz first, TIDAL fallback")+".";';
+h += '  }else{';
+h += '    hint.textContent="No preference \u2014 auto-selects: Qobuz Hi-Res \u2192 TIDAL Lossless \u2192 AAC 320 \u2192 AAC 96.";';
+h += '  }';
+h += '  updateBadge();';
+h += '}';
+
+h += 'function updateBadge(){';
+h += '  var b=document.getElementById("genQualBadge");';
+h += '  if(!b)return;';
+h += '  if(!selQ){b.className="qual-badge none";b.textContent="No quality preference";return;}';
+h += '  if(selGroup==="q"){b.className="qual-badge qobuz";b.innerHTML="&#9675; Qobuz \u00b7 "+QLABELS[selQ];}';
+h += '  else{b.className="qual-badge tidal";b.innerHTML="&#9675; TIDAL \u00b7 "+QLABELS[selQ];}';
+h += '}';
+
+h += 'function generate(){';
+h += '  var btn=document.getElementById("genBtn");';
+h += '  btn.disabled=true;btn.textContent="Generating...";';
+h += '  var ci=document.getElementById("customInstance").value.trim();';
+h += '  while(ci.length&&ci[ci.length-1]==="/")ci=ci.slice(0,-1);';
+h += '  var body={};';
+h += '  if(ci)body.instanceUrl=ci;';
+h += '  if(selQ)body.preferredQuality=selQ;';
+h += '  fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})';
+h += '  .then(function(r){return r.json();})';
+h += '  .then(function(d){';
+h += '    if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}';
+h += '    gu=d.manifestUrl;';
+h += '    document.getElementById("genUrl").textContent=gu;';
+h += '    updateBadge();';
+h += '    document.getElementById("genQualBadge").style.display="inline-flex";';
+h += '    document.getElementById("genBox").style.display="block";';
+h += '    btn.disabled=false;btn.textContent="Generate Another URL";';
+h += '  })';
+h += '  .catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});';
+h += '}';
+
+h += 'function copyGen(){if(!gu)return;try{navigator.clipboard.writeText(gu);}catch(e){var t=document.createElement("textarea");t.value=gu;document.body.appendChild(t);t.select();document.execCommand("copy");document.body.removeChild(t);}var b=document.getElementById("copyGenBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);}';
 h += 'function doRefresh(){var btn=document.getElementById("refBtn");var eu=document.getElementById("existingUrl").value.trim();if(!eu){alert("Paste your existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu})}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh Existing URL";return;}ru=d.manifestUrl;document.getElementById("refUrl").textContent=ru;document.getElementById("refBox").style.display="block";btn.disabled=false;btn.textContent="Refresh Again";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh Existing URL";});}';
-h += 'function copyRef(){if(!ru)return;try{var _ta=document.createElement("textarea");_ta.value=ru;_ta.style.position="fixed";_ta.style.opacity="0";document.body.appendChild(_ta);_ta.select();document.execCommand("copy");document.body.removeChild(_ta);}catch(_e){try{navigator.clipboard.writeText(ru);}catch(_e2){}}var b=document.getElementById("copyRefBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);}';
-h += 'function checkHealth(){var list=document.getElementById("instList");list.innerHTML=\'<div style="color:#333;font-size:13px">Checking...</div>\';fetch("/instances").then(function(r){return r.json();}).then(function(data){list.innerHTML="";data.instances.forEach(function(inst){var row=document.createElement("div");row.className="inst";var dot=document.createElement("span");dot.className=inst.ok?"dot ok":"dot err";var urlSpan=document.createElement("span");urlSpan.className="inst-url";function maskUrl(u){var pre="https://";if(u.startsWith(pre)){var rest=u.slice(pre.length);return pre+rest.slice(0,6)+"\u2022".repeat(Math.max(0,rest.length-6));}return u.slice(0,14)+"\u2022".repeat(Math.max(0,u.length-14));}urlSpan.textContent=maskUrl(inst.url);row.appendChild(dot);row.appendChild(urlSpan);if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}list.appendChild(row);});}).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Could not reach server</div>\';});}';
-h += 'checkHealth();';
-h += '</script></body></html>';
+h += 'function copyRef(){if(!ru)return;try{navigator.clipboard.writeText(ru);}catch(e){var t=document.createElement("textarea");t.value=ru;document.body.appendChild(t);t.select();document.execCommand("copy");document.body.removeChild(t);}var b=document.getElementById("copyRefBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);}';
+
+h += 'function checkHealth(){';
+h += '  var list=document.getElementById("instList");';
+h += '  list.innerHTML=\'<div style="color:#333;font-size:13px">Checking...</div>\';';
+h += '  fetch("/instances").then(function(r){return r.json();}).then(function(data){';
+h += '    list.innerHTML="";';
+h += '    data.instances.forEach(function(inst){';
+h += '      var row=document.createElement("div");row.className="inst";';
+h += '      var dot=document.createElement("span");dot.className="dot "+(inst.ok?"ok":"err");';
+h += '      var urlSpan=document.createElement("span");urlSpan.className="inst-url";';
+h += '      urlSpan.textContent=inst.url.replace(/^https?:\\/\\//,"");';
+h += '      row.appendChild(dot);row.appendChild(urlSpan);';
+h += '      if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}';
+h += '      list.appendChild(row);';
+h += '    });';
+h += '  }).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Could not reach server</div>\';});';
+h += '}';
+
+// Qobuz ping
+h += 'function pingQobuz(){';
+h += '  var dot=document.getElementById("qobuzDot");';
+h += '  var ms=document.getElementById("qobuzMs");';
+h += '  var t=Date.now();';
+h += '  fetch("/qobuz-ping").then(function(r){return r.json();}).then(function(d){';
+h += '    dot.className="dot "+(d.ok?"ok":"err");';
+h += '    ms.textContent=d.ok?(Date.now()-t)+"ms":"error";';
+h += '  }).catch(function(){dot.className="dot err";ms.textContent="error";});';
+h += '}';
+
+h += 'checkHealth();pingQobuz();';
+h += '</script>';
+h += '</body></html>';
 return h;
 }
+
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
 app.get('/', async c => {
@@ -813,7 +950,7 @@ try {
 await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, timeout: 8000 });
 } catch(e) { return Response.json({ error: 'Could not reach your instance: ' + e.message }, { status: 400 }); }
 }
-const VALID_QUALITIES = ['HI_RES_LOSSLESS','HIRESLOSSLESS','HIMAX','HI96','LOSSLESS','HIGH','AAC320','LOW','AAC96'];
+const VALID_QUALITIES = ['HI_RES_LOSSLESS','HIRESLOSSLESS','HIMAX','HI96','LOSSLESS','HIGH','AAC320','LOW','AAC96','TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW'];
 const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
 const token = generateToken();
 const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality };
@@ -853,6 +990,23 @@ app.get('/instances', async c => {
   }));
   cSet('instances:health', results, 30); // cache 30s — prevents 12-req burst per poll
   return Response.json({ instances: results });
+});
+
+app.get('/qobuz-ping', async c => {
+  try {
+    const ts  = Math.floor(Date.now() / 1000);
+    const sig = md5('trackgetFileUrlformat_id6intentstreamtrack_id1' + ts + QOBUZ_SECRET);
+    const url = 'https://www.qobuz.com/api.json/0.2/track/getFileUrl'
+      + '?app_id=' + QOBUZ_APP_ID
+      + '&user_auth_token=' + QOBUZ_USER_TOKEN
+      + '&track_id=1&format_id=6&intent=stream'
+      + '&request_ts=' + ts + '&request_sig=' + sig;
+    const r = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(5000) });
+    // 400 = bad track ID but auth worked, 200 = full success
+    return Response.json({ ok: r.status === 200 || r.status === 400, status: r.status });
+  } catch(e) {
+    return Response.json({ ok: false, error: e.message });
+  }
 });
 
 app.get('/health', c => {
@@ -1011,12 +1165,17 @@ const PREF_TO_QOBUZ_KEY = {
   'HI96': 'HI96', 'LOSSLESS': 'LOSSLESS',
   'HIGH': 'AAC320', 'AAC320': 'AAC320',
   'LOW': 'AAC96',  'AAC96': 'AAC96',
+  // TIDAL-only tiers — skip Qobuz entirely
+  'TIDAL_HIMAX': 'AAC96', 'TIDAL_LOSSLESS': 'AAC96', 'TIDAL_HIGH': 'AAC96', 'TIDAL_LOW': 'AAC96',
 };
 const PREF_TO_TIDAL = {
   'HI_RES_LOSSLESS': 'HI_RES_LOSSLESS', 'HIRESLOSSLESS': 'HI_RES_LOSSLESS',
   'HIMAX': 'HI_RES_LOSSLESS', 'HI96': 'HI_RES_LOSSLESS',
   'LOSSLESS': 'LOSSLESS', 'HIGH': 'HIGH', 'AAC320': 'HIGH',
   'LOW': 'LOW', 'AAC96': 'LOW',
+  // TIDAL-only tiers — map directly to TIDAL quality
+  'TIDAL_HIMAX': 'HI_RES_LOSSLESS', 'TIDAL_LOSSLESS': 'LOSSLESS',
+  'TIDAL_HIGH': 'HIGH', 'TIDAL_LOW': 'LOW',
 };
 const ALL_QUALITIES  = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
 const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
