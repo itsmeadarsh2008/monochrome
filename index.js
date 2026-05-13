@@ -806,16 +806,7 @@ h += '</div>';
 h += '<div class="warn">Stream priority: <b>Qobuz Hi-Res 24-bit</b> &rarr; TIDAL Lossless/HiRes &rarr; lower quality fallback. Selecting a <b>TIDAL</b> tier skips Qobuz entirely.</div>';
 h += '</div>';
 
-// Qobuz Instance Health card
-h += '<div class="card">';
-h += '<h2>Qobuz API Status</h2>';
-h += '<p class="sub" style="margin-bottom:14px">Direct Qobuz API &mdash; your credentials are active.</p>';
-h += '<div style="display:flex;align-items:center;gap:8px;padding:10px 14px;background:#0a0a0a;border:1px solid #161616;border-radius:8px;font-size:13px">';
-h += '<div class="dot ok" id="qobuzDot"></div>';
-h += '<span style="color:#666;font-family:monospace;font-size:12px">www.qobuz.com/api.json/0.2</span>';
-h += '<span id="qobuzMs" style="margin-left:auto;font-size:11px;color:#444"></span>';
-h += '</div>';
-h += '</div>';
+
 
 // TIDAL Instance Health card
 h += '<div class="card">';
@@ -906,7 +897,10 @@ h += '    data.instances.forEach(function(inst){';
 h += '      var row=document.createElement("div");row.className="inst";';
 h += '      var dot=document.createElement("span");dot.className="dot "+(inst.ok?"ok":"err");';
 h += '      var urlSpan=document.createElement("span");urlSpan.className="inst-url";';
-h += '      urlSpan.textContent=inst.url.replace(/^https?:\\/\\//,"");';
+h += '      var raw=inst.url.replace(/^https?:\\/\\//,"");';
+h += '      var dotPos=raw.indexOf(".");';
+h += '      var masked=dotPos>0?raw.slice(0,dotPos+5)+"\u2022\u2022\u2022\u2022\u2022\u2022\u2022"+raw.slice(-4):raw;';
+h += '      urlSpan.textContent=masked;';
 h += '      row.appendChild(dot);row.appendChild(urlSpan);';
 h += '      if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}';
 h += '      list.appendChild(row);';
@@ -915,17 +909,9 @@ h += '  }).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size
 h += '}';
 
 // Qobuz ping
-h += 'function pingQobuz(){';
-h += '  var dot=document.getElementById("qobuzDot");';
-h += '  var ms=document.getElementById("qobuzMs");';
-h += '  var t=Date.now();';
-h += '  fetch("/qobuz-ping").then(function(r){return r.json();}).then(function(d){';
-h += '    dot.className="dot "+(d.ok?"ok":"err");';
-h += '    ms.textContent=d.ok?(Date.now()-t)+"ms":"error";';
-h += '  }).catch(function(){dot.className="dot err";ms.textContent="error";});';
-h += '}';
 
-h += 'checkHealth();pingQobuz();';
+
+h += 'checkHealth();';
 h += '</script>';
 h += '</body></html>';
 return h;
