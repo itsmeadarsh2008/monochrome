@@ -1055,7 +1055,7 @@ app.get('/u/:token/playlist/:id', async c => {
 // Legacy flat routes
 app.get('/manifest.json', c => c.json({
   id:'com.jacobyz211.qobuz-tidal-eclipse', name:'Qobuz + Tidal', version:'1.4.0',
-  description:'Qobuz FLAC streams with ISRC scoring & Tidal HiFi fallback',
+  description:'Qobuz FLAC streams with ISRC scoring & Tidal HiFi',
   icon:'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9c/Qobuz_logo.svg/320px-Qobuz_logo.svg.png',
   resources:['search','stream','catalog'], types:['track','album','artist','playlist'],
 }));
