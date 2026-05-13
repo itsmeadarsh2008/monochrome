@@ -1,1523 +1,1100 @@
+// Qobuz + Tidal — Eclipse Music Addon
+// Cloudflare Workers (Hono) — ISRC Scoring Engine v1.4 + Upstash Redis + Full Catalog
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import axios from 'axios';
-import crypto from 'crypto';
+import { Redis } from '@upstash/redis/cloudflare';
 
 const app = new Hono();
-
 app.use('*', cors());
 
-async function parseBody(c) {
-try { return await c.req.json(); } catch(e) { return {}; }
-}
+// ─── Constants ────────────────────────────────────────────────────────────────
+const UA           = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
+const TIMEOUT_MS   = 12000;
+const STREAM_TTL   = 200;
+const INSTANCE_TTL = 300;
+const DEEZER_API   = 'https://api.deezer.com';
 
-const HIFI_INSTANCES = [
-'https://hifi-api-pj08.onrender.com',
-'https://mono.kennyy.com.br/hifi-api',
-'https://api.iwakura.workers.dev',
-'https://tidal-api.binimum.org',
-'https://triton.squid.wtf',
-'https://ohio-1.monochrome.tf',
-'https://frankfurt-1.monochrome.tf',
-'https://eu-central.monochrome.tf',
-'https://monochrome-api.samidy.com',
-'https://hifi-two.spotisaver.net',
-'https://katze.qqdl.site',
-'https://hund.qqdl.site',
-'https://api.monochrome.tf',
-];
-let activeInstance = HIFI_INSTANCES[0];
-let instanceHealthy = false;
-const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
+// Qobuz credentials
+const APP_ID     = '312369995';
+const USER_TOKEN = 'XX7seyZt4OaHGPgksFUldL2Ig0cH6jqcKSAfOAiAGBzw1HosDl9vfQTGRQEo2zkkcwP9ADc3L20nYNaI0l7E4g';
+const SECRET     = 'e79f8b9be485692b0e5f9dd895826368';
+
+// ─── Qobuz Instance Pool ──────────────────────────────────────────────────────
 const QOBUZ_INSTANCES = [
-'https://qobuz-api1.onrender.com',
-'https://qobuz-api.stremio123.duckdns.org',
+  'https://qobuz-api1.onrender.com',
+  'https://trypt-hifi-dl-456461932686.us-west1.run.app',
+  'https://qobuz-api.stremio123.duckdns.org',
+  'https://qobuz.kennyy.com.br/api',
 ];
-let activeQobuzInstance = QOBUZ_INSTANCES[0];
 
-// ─── In-memory track meta cache (title+artist by TIDAL id) ───────────────────
-// Populated at search time, read at stream time. Survives within the same worker instance.
+// ─── HiFi (Tidal) Instance Pool ───────────────────────────────────────────────
+const DEFAULT_HIFI_INSTANCES = [
+  'https://hifi-api-pj08.onrender.com',
+  'https://mono.kennyy.com.br/hifi-api',
+  'https://tidal-api.binimum.org',
+  'https://triton.squid.wtf',
+  'https://ohio-1.monochrome.tf',
+  'https://frankfurt-1.monochrome.tf',
+  'https://vogel.qqdl.site',
+  'https://eu-central.monochrome.tf',
+  'https://us-west.monochrome.tf',
+  'https://hifi.geeked.wtf',
+  'https://monochrome-api.samidy.com',
+  'https://hifi-two.spotisaver.net',
+  'https://wolf.qqdl.site',
+  'https://katze.qqdl.site',
+  'https://hund.qqdl.site',
+  'https://api.monochrome.tf',
+];
+
+// ─── In-memory track meta cache ───────────────────────────────────────────────
 const TRACK_META_CACHE = new Map();
-
 function cacheTrackMeta(id, title, artist, isrc) {
-if (!id || !title) return;
-TRACK_META_CACHE.set(String(id), { title, artist: artist || 'Unknown', isrc: isrc || null });
-// cap size to avoid unbounded growth in long-lived instances
-if (TRACK_META_CACHE.size > 5000) {
-const firstKey = TRACK_META_CACHE.keys().next().value;
-TRACK_META_CACHE.delete(firstKey);
-}
+  if (!id || !title) return;
+  TRACK_META_CACHE.set(String(id), { title, artist: artist || 'Unknown', isrc: isrc || null });
+  if (TRACK_META_CACHE.size > 5000) TRACK_META_CACHE.delete(TRACK_META_CACHE.keys().next().value);
 }
 
-function getCachedMeta(id) {
-return TRACK_META_CACHE.get(String(id)) || null;
+// ─── Upstash Redis + in-memory fallback ───────────────────────────────────────
+const memCache = new Map();
+function getRedis(env) {
+  if (env?.UPSTASH_REDIS_REST_URL && env?.UPSTASH_REDIS_REST_TOKEN) return Redis.fromEnv(env);
+  return null;
+}
+async function rGet(redis, key) {
+  if (redis) { try { return await redis.get(key); } catch {} }
+  const e = memCache.get(key);
+  if (!e) return null;
+  if (Date.now() > e.exp) { memCache.delete(key); return null; }
+  return e.val;
+}
+async function rSet(redis, key, value, ttl) {
+  if (redis) { try { await redis.set(key, value, { ex: ttl }); return; } catch {} }
+  memCache.set(key, { val: value, exp: Date.now() + ttl * 1000 });
+  if (memCache.size > 500) memCache.delete(memCache.keys().next().value);
 }
 
-// ─── Unified in-memory TTL cache ─────────────────────────────────────────────
-const _cache = new Map();
-function cGet(key) {
-  const v = _cache.get(key);
-  if (!v) return null;
-  if (v.exp && v.exp < Date.now()) { _cache.delete(key); return null; }
-  return v.val;
+// ─── HTTP helper ──────────────────────────────────────────────────────────────
+async function httpGet(url, params, timeout) {
+  const u = new URL(url);
+  if (params) Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, String(v)));
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout || 10000);
+  try {
+    const r = await fetch(u.toString(), { headers: { 'User-Agent': UA, 'Accept': 'application/json' }, signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!r.ok) { try { await r.arrayBuffer(); } catch {} throw new Error('HTTP ' + r.status); }
+    return r.json();
+  } catch (e) { clearTimeout(timer); throw e; }
 }
-function cSet(key, val, ttlSec) {
-  _cache.set(key, { val, exp: ttlSec ? Date.now() + ttlSec * 1000 : null });
-  if (_cache.size > 2000) {
-    let del = Math.floor(_cache.size * 0.2);
-    for (const k of _cache.keys()) { if (del-- <= 0) break; _cache.delete(k); }
+
+// ─── Compact MD5 ──────────────────────────────────────────────────────────────
+function md5(str) {
+  function RL(v,n){return(v<<n)|(v>>>(32-n));}
+  function AU(x,y){const x8=(x&0x80000000),y8=(y&0x80000000),x4=(x&0x40000000),y4=(y&0x40000000),r=(x&0x3FFFFFFF)+(y&0x3FFFFFFF);if(x4&y4)return(r^0x80000000^x8^y8);if(x4|y4){if(r&0x40000000)return(r^0xC0000000^x8^y8);return(r^0x40000000^x8^y8);}return(r^x8^y8);}
+  function F(x,y,z){return(x&y)|((~x)&z);}function G(x,y,z){return(x&z)|(y&(~z));}function H(x,y,z){return x^y^z;}function I(x,y,z){return y^(x|(~z));}
+  function FF(a,b,c,d,x,s,ac){a=AU(a,AU(AU(F(b,c,d),x),ac));return AU(RL(a,s),b);}
+  function GG(a,b,c,d,x,s,ac){a=AU(a,AU(AU(G(b,c,d),x),ac));return AU(RL(a,s),b);}
+  function HH(a,b,c,d,x,s,ac){a=AU(a,AU(AU(H(b,c,d),x),ac));return AU(RL(a,s),b);}
+  function II(a,b,c,d,x,s,ac){a=AU(a,AU(AU(I(b,c,d),x),ac));return AU(RL(a,s),b);}
+  function CW(s){const ml=s.length,nw_t1=ml+8,nw_t2=(nw_t1-(nw_t1%64))/64,nw=(nw_t2+1)*16,wa=Array(nw-1);let bp=0,bc=0;while(bc<ml){const wc=(bc-(bc%4))/4,pos=(bc%4)*8;wa[wc]=(wa[wc]|(s.charCodeAt(bc)<<pos));bc++;}const wc2=(bc-(bc%4))/4;wa[wc2]=(wa[wc2]|(0x80<<((bc%4)*8)));wa[nw-2]=ml<<3;wa[nw-1]=ml>>>29;return wa;}
+  function WH(v){let r='',t='',byte,c;for(c=0;c<=3;c++){byte=(v>>>(c*8))&255;t='0'+byte.toString(16);r+=t.substr(t.length-2,2);}return r;}
+  const x=CW(str);let k,a=0x67452301,b=0xEFCDAB89,c2=0x98BADCFE,d=0x10325476,AA,BB,CC,DD;
+  const S11=7,S12=12,S13=17,S14=22,S21=5,S22=9,S23=14,S24=20,S31=4,S32=11,S33=16,S34=23,S41=6,S42=10,S43=15,S44=21;
+  for(k=0;k<x.length;k+=16){AA=a;BB=b;CC=c2;DD=d;a=FF(a,b,c2,d,x[k],S11,0xD76AA478);d=FF(d,a,b,c2,x[k+1],S12,0xE8C7B756);c2=FF(c2,d,a,b,x[k+2],S13,0x242070DB);b=FF(b,c2,d,a,x[k+3],S14,0xC1BDCEEE);a=FF(a,b,c2,d,x[k+4],S11,0xF57C0FAF);d=FF(d,a,b,c2,x[k+5],S12,0x4787C62A);c2=FF(c2,d,a,b,x[k+6],S13,0xA8304613);b=FF(b,c2,d,a,x[k+7],S14,0xFD469501);a=FF(a,b,c2,d,x[k+8],S11,0x698098D8);d=FF(d,a,b,c2,x[k+9],S12,0x8B44F7AF);c2=FF(c2,d,a,b,x[k+10],S13,0xFFFF5BB1);b=FF(b,c2,d,a,x[k+11],S14,0x895CD7BE);a=FF(a,b,c2,d,x[k+12],S11,0x6B901122);d=FF(d,a,b,c2,x[k+13],S12,0xFD987193);c2=FF(c2,d,a,b,x[k+14],S13,0xA679438E);b=FF(b,c2,d,a,x[k+15],S14,0x49B40821);a=GG(a,b,c2,d,x[k+1],S21,0xF61E2562);d=GG(d,a,b,c2,x[k+6],S22,0xC040B340);c2=GG(c2,d,a,b,x[k+11],S23,0x265E5A51);b=GG(b,c2,d,a,x[k],S24,0xE9B6C7AA);a=GG(a,b,c2,d,x[k+5],S21,0xD62F105D);d=GG(d,a,b,c2,x[k+10],S22,0x02441453);c2=GG(c2,d,a,b,x[k+15],S23,0xD8A1E681);b=GG(b,c2,d,a,x[k+4],S24,0xE7D3FBC8);a=GG(a,b,c2,d,x[k+9],S21,0x21E1CDE6);d=GG(d,a,b,c2,x[k+14],S22,0xC33707D6);c2=GG(c2,d,a,b,x[k+3],S23,0xF4D50D87);b=GG(b,c2,d,a,x[k+8],S24,0x455A14ED);a=GG(a,b,c2,d,x[k+13],S21,0xA9E3E905);d=GG(d,a,b,c2,x[k+2],S22,0xFCEFA3F8);c2=GG(c2,d,a,b,x[k+7],S23,0x676F02D9);b=GG(b,c2,d,a,x[k+12],S24,0x8D2A4C8A);a=HH(a,b,c2,d,x[k+5],S31,0xFFFA3942);d=HH(d,a,b,c2,x[k+8],S32,0x8771F681);c2=HH(c2,d,a,b,x[k+11],S33,0x6D9D6122);b=HH(b,c2,d,a,x[k+14],S34,0xFDE5380C);a=HH(a,b,c2,d,x[k+1],S31,0xA4BEEA44);d=HH(d,a,b,c2,x[k+4],S32,0x4BDECFA9);c2=HH(c2,d,a,b,x[k+7],S33,0xF6BB4B60);b=HH(b,c2,d,a,x[k+10],S34,0xBEBFBC70);a=HH(a,b,c2,d,x[k+13],S31,0x289B7EC6);d=HH(d,a,b,c2,x[k],S32,0xEAA127FA);c2=HH(c2,d,a,b,x[k+3],S33,0xD4EF3085);b=HH(b,c2,d,a,x[k+6],S34,0x04881D05);a=HH(a,b,c2,d,x[k+9],S31,0xD9D4D039);d=HH(d,a,b,c2,x[k+12],S32,0xE6DB99E5);c2=HH(c2,d,a,b,x[k+15],S33,0x1FA27CF8);b=HH(b,c2,d,a,x[k+2],S34,0xC4AC5665);a=II(a,b,c2,d,x[k],S41,0xF4292244);d=II(d,a,b,c2,x[k+7],S42,0x432AFF97);c2=II(c2,d,a,b,x[k+14],S43,0xAB9423A7);b=II(b,c2,d,a,x[k+5],S44,0xFC93A039);a=II(a,b,c2,d,x[k+12],S41,0x655B59C3);d=II(d,a,b,c2,x[k+3],S42,0x8F0CCC92);c2=II(c2,d,a,b,x[k+10],S43,0xFFEFF47D);b=II(b,c2,d,a,x[k+1],S44,0x85845DD1);a=II(a,b,c2,d,x[k+8],S41,0x6FA87E4F);d=II(d,a,b,c2,x[k+15],S42,0xFE2CE6E0);c2=II(c2,d,a,b,x[k+6],S43,0xA3014314);b=II(b,c2,d,a,x[k+13],S44,0x4E0811A1);a=II(a,b,c2,d,x[k+4],S41,0xF7537E82);d=II(d,a,b,c2,x[k+11],S42,0xBD3AF235);c2=II(c2,d,a,b,x[k+2],S43,0x2AD7D2BB);b=II(b,c2,d,a,x[k+9],S44,0xEB86D391);a=AU(a,AA);b=AU(b,BB);c2=AU(c2,CC);d=AU(d,DD);}
+  return (WH(a)+WH(b)+WH(c2)+WH(d)).toLowerCase();
+}
+
+// ─── Token store ──────────────────────────────────────────────────────────────
+const TOKEN_STORE = new Map();
+function generateToken() {
+  const chars = 'abcdefghijklmnopqrstuvwxyz0123456789';
+  let t = '';
+  const arr = new Uint8Array(28);
+  crypto.getRandomValues(arr);
+  for (const b of arr) t += chars[b % chars.length];
+  return t;
+}
+async function saveToken(redis, token, data) {
+  TOKEN_STORE.set(token, data);
+  if (redis) { try { await redis.set('qt:token:' + token, JSON.stringify(data), { ex: 2592000 }); } catch {} }
+}
+async function loadToken(redis, token) {
+  if (TOKEN_STORE.has(token)) return TOKEN_STORE.get(token);
+  if (redis) {
+    try {
+      const raw = await redis.get('qt:token:' + token);
+      if (raw) { const d = typeof raw === 'string' ? JSON.parse(raw) : raw; TOKEN_STORE.set(token, d); return d; }
+    } catch {}
   }
+  return null;
 }
 
-// ─── Inflight deduplication ───────────────────────────────────────────────────
-// Two simultaneous requests for the same stream share ONE outbound call.
-const _inflight = new Map();
-async function dedupeCall(key, fn) {
-  if (_inflight.has(key)) return _inflight.get(key);
-  const p = Promise.resolve().then(fn).finally(() => _inflight.delete(key));
-  _inflight.set(key, p);
-  return p;
-}
-
-// ─── Helpers ──────────────────────────────────────────────────────────────────
-function coverUrl(uuid, size) {
-if (!uuid) return undefined;
-var s = String(uuid);
-if (s.startsWith('http')) return s;
-size = size || 320;
-return 'https://resources.tidal.com/images/' + s.replace(/-/g, '/') + '/' + size + 'x' + size + '.jpg';
-}
-
-function trackDuration(t) { return (t && t.duration) ? Math.floor(t.duration) : undefined; }
-function trackArtist(t) {
-if (!t) return 'Unknown';
-if (t.artists && t.artists.length) return t.artists.map(function(a) { return a.name; }).join(', ');
-if (t.artist && t.artist.name) return t.artist.name;
-return 'Unknown';
-}
-
-function decodeManifest(manifest) {
-try {
-const raw = Buffer.from(manifest, 'base64').toString('utf8');
-if (raw.trimStart().startsWith('<')) {
-const urlMatch = raw.match(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/i)
-|| raw.match(/<SegmentURL[^>]+media="([^"]+)"/i);
-if (urlMatch && urlMatch[1]) {
-const url = urlMatch[1].trim()
-.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
-const codec = raw.match(/codecs="([^"]+)"/i)?.[1] || 'flac';
-return { url, codec, isDash: true };
-}
-return null;
-}
-const decoded = JSON.parse(raw);
-const url = (decoded.urls && decoded.urls.length > 0) ? decoded.urls[0] : (decoded.url || null);
-const codec = decoded.codecs || decoded.codec || decoded.mimeType || null;
-return { url, codec, isDash: false };
-} catch(e) { return null; }
-}
-
-function isPlaylistUUID(id) {
-return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(String(id));
-}
-
-function looksLikePlaylist(p) {
-if (!p || !p.title) return false;
-if (p.trackNumber !== undefined) return false;
-if (p.replayGain !== undefined) return false;
-if (p.peak !== undefined) return false;
-if (p.isrc !== undefined) return false;
-if (p.audioQuality !== undefined) return false;
-return !!(p.uuid || p.creator || p.squareImage || p.numberOfTracks !== undefined);
-}
-
-function artistRelevance(name, query) {
-var n = (name || '').toLowerCase().trim();
-var q = (query || '').toLowerCase().trim();
-if (n === q) return 4;
-if (n.startsWith(q) || q.startsWith(n)) return 3;
-if (n.includes(q) || q.includes(n)) return 2;
-return 0;
-}
-
-// ─── Qobuz client ─────────────────────────────────────────────────────────────
-// qobuzStream: race-with-priority — fires ALL (instance × format) combos at once,
-// resolves immediately when the highest-priority format responds.
-// Never waits for slow instances. Stream URLs cached 28 min (Qobuz URLs expire 30 min).
-async function qobuzStream(trackId, prefKey) {
-  // prefKey: 'HIMAX'|'HI96'|'LOSSLESS'|'AAC320'|'AAC96'|null
-  if (prefKey === 'AAC96') return null; // TIDAL-only tier — skip Qobuz
-  const cacheKey = 'qstream:' + trackId + ':' + (prefKey || 'auto');
-  const cached = cGet(cacheKey);
+// ─── Instance health — race to first winner ────────────────────────────────
+async function getWorkingHiFiInstance(instances, redis) {
+  const list     = (instances && instances.length) ? instances : DEFAULT_HIFI_INSTANCES;
+  const cacheKey = 'qt:hifi:working:v4';
+  const cached   = await rGet(redis, cacheKey);
   if (cached) return cached;
-
-  const PREF_FMT_ORDER = {
-    'HIMAX':    [27, 7, 6, 5],
-    'HI96':     [7, 27, 6, 5],
-    'LOSSLESS': [6, 7, 27, 5],
-    'AAC320':   [5],
-    'HI_RES_LOSSLESS': [27, 7, 6, 5],
-  };
-  const fmtOrder   = (prefKey && PREF_FMT_ORDER[prefKey]) || [27, 7, 6, 5];
-  const fmtQuality = { 27: 'hires-192', 7: 'hires-96', 6: 'lossless', 5: '320kbps' };
-  const fmtLabel   = { 27: 'flac',      7: 'flac',     6: 'flac',     5: 'mp3' };
-
-  // ─── Race-with-priority ────────────────────────────────────────────────────
-  // Fire every (instance × format) combo simultaneously.
-  // Resolve as soon as the top-priority available format wins.
-  // Never blocked by the slowest instance — returns on the first winner.
-  return new Promise((resolve) => {
-    let resolved = false;
-    let pending   = 0;
-    const best    = { idx: Infinity, val: null };
-
-    const tryResolve = () => {
-      if (resolved) return;
-      if (best.val) {
-        resolved = true;
-        const { url, fmt, inst } = best.val;
-        if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        const result = {
-          url, format: fmtLabel[fmt], quality: fmtQuality[fmt],
-          source: 'qobuz', expiresAt: Math.floor(Date.now() / 1000) + 1680
-        };
-        cSet(cacheKey, result, 1680); // cache 28 min
-        resolve(result);
-      } else if (pending === 0) {
-        resolve(null); // all combos failed
+  for (const inst of list) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2500);
+    try {
+      const r = await fetch(`${inst}/search/?s=test&limit=1`, { headers: { 'User-Agent': UA }, signal: ctrl.signal });
+      clearTimeout(timer);
+      try { await r.arrayBuffer(); } catch {}
+      if (r.ok) {
+        await rSet(redis, cacheKey, inst, INSTANCE_TTL);
+        return inst;
       }
-    };
-
-    for (const inst of QOBUZ_INSTANCES) {
-      for (let i = 0; i < fmtOrder.length; i++) {
-        const fmt = fmtOrder[i];
-        pending++;
-        axios.get(inst + '/stream/' + trackId, {
-          params: { format_id: fmt },
-          headers: { 'User-Agent': UA },
-          timeout: 8000  // reduced from 10000 — fail fast on slow instances
-        }).then(r => {
-          if (r.data && r.data.url) {
-            // Only upgrade best if this is a higher-priority (lower index) format
-            if (i < best.idx) { best.idx = i; best.val = { url: r.data.url, fmt, inst }; }
-            // Got top-priority format (idx 0) — no need to wait for anything else
-            if (best.idx === 0) { pending = 0; tryResolve(); }
-          }
-        }).catch(() => {}).finally(() => {
-          if (!resolved) { pending--; tryResolve(); }
-        });
-      }
-    }
-    if (pending === 0) resolve(null);
-  });
+    } catch { clearTimeout(timer); }
+  }
+  return DEFAULT_HIFI_INSTANCES[4];
 }
 
-// ─── Search scoring engine (ported from 8spine V2.0 Strict) ──────────────────
-// Scores each candidate track against the search query.
-// Returns { item, score } — caller picks item if score >= threshold.
-// Anti-cover/karaoke penalty (-500) prevents junk results swamping real tracks.
-// Title guillotine (-100) kills results with zero query-word overlap.
+async function getWorkingQobuzInstance(redis) {
+  const cacheKey = 'qt:qobuz:working:v4';
+  const cached   = await rGet(redis, cacheKey);
+  if (cached) return cached;
+  for (const inst of QOBUZ_INSTANCES) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 2500);
+    try {
+      const r = await fetch(`${inst}/search?q=test&limit=1`, { headers: { 'User-Agent': UA }, signal: ctrl.signal });
+      clearTimeout(timer);
+      try { await r.arrayBuffer(); } catch {}
+      if (r.ok) {
+        await rSet(redis, cacheKey, inst, INSTANCE_TTL);
+        return inst;
+      }
+    } catch { clearTimeout(timer); }
+  }
+  return QOBUZ_INSTANCES[0];
+}
+
+// ─── Qobuz proxy API (uses instances, not qobuz.com directly) ─────────────
+async function qobuzProxyGet(endpoint, params, redis) {
+  const inst = await getWorkingQobuzInstance(redis);
+  return httpGet((inst || QOBUZ_INSTANCES[0]) + endpoint, params || {}, TIMEOUT_MS);
+}
+async function qobuzProxyAny(endpoint, params, redis) {
+  for (const inst of QOBUZ_INSTANCES) {
+    const ctrl  = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 7000);
+    try {
+      const u = new URL(inst + endpoint);
+      if (params) Object.entries(params).forEach(([k, v]) => u.searchParams.set(k, String(v)));
+      const r = await fetch(u.toString(), { headers: { 'User-Agent': UA, 'Accept': 'application/json' }, signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!r.ok) { try { await r.arrayBuffer(); } catch {} throw new Error('HTTP ' + r.status); }
+      return await r.json();
+    } catch(e) { clearTimeout(timer); continue; }
+  }
+  throw new Error('All Qobuz instances failed for ' + endpoint);
+}
+
+// ─── HiFi helpers ─────────────────────────────────────────────────────────────
+async function fetchHifi(path, instances, redis) {
+  const inst = await getWorkingHiFiInstance(instances, redis);
+  if (!inst) throw new Error('No working HiFi instance found');
+  return httpGet(inst + path, null, TIMEOUT_MS);
+}
+async function fetchHifiAny(path, instances, redis) {
+  const list = (instances && instances.length) ? instances : DEFAULT_HIFI_INSTANCES;
+  for (const inst of list) {
+    try { return await httpGet(inst + path, null, 6000); } catch {}
+  }
+  throw new Error('All HiFi instances failed for: ' + path);
+}
+
+// ─── Text normalization ────────────────────────────────────────────────────────
 function normalizeStr(s) {
   return String(s || '').toLowerCase()
-    .replace(/[''`´]/g, "'").replace(/[""«»]/g, '"')
-    .replace(/\s+/g, ' ').trim();
+    .replace(/[àáâãäå]/g,'a').replace(/[èéêë]/g,'e').replace(/[ìíîï]/g,'i')
+    .replace(/[òóôõö]/g,'o').replace(/[ùúûü]/g,'u').replace(/[ý]/g,'y')
+    .replace(/[ñ]/g,'n').replace(/[ç]/g,'c')
+    .replace(/[^a-z0-9\s]/g,' ').replace(/\s+/g,' ').trim();
+}
+const FEAT_RE = /\s*(\(|\[)?\s*(feat\.?|ft\.?|featuring)\s+[^\)\]]*\s*(\)|\])?/gi;
+function removeFeat(s) { return String(s||'').replace(FEAT_RE,'').trim(); }
+function cleanTitle(t) { return t ? removeFeat(t) : 'Unknown'; }
+function formatQuery(q) {
+  q = q.replace(/['\u2018\u2019\u0060\u00B4]/g,"'").replace(/[\u201C\u201D\u00AB\u00BB]/g,'"');
+  q = removeFeat(q);
+  const parts = q.split('-');
+  if (parts.length > 1) return parts.map(p => removeFeat(p.trim())).join(' - ');
+  return removeFeat(q);
 }
 
-function removeFeat(s) {
-  if (!s) return '';
-  const m = String(s).search(/\s+[\(\[](feat|ft|with|vs)[\.\s]/i);
-  return (m > 0 ? s.substring(0, m) : s).trim();
-}
-
-function scoringFindBest(items, query) {
-  let bestItem  = null;
-  let bestScore = -1;
-
-  const qNorm     = normalizeStr(query);
+// ─── Scoring engine ────────────────────────────────────────────────────────────
+function findBestMatch(items, query) {
+  let bestItem = null, bestScore = -1;
+  const qNorm = normalizeStr(query);
   const hasHyphen = qNorm.includes('-');
-  let qTitleOnly  = hasHyphen ? qNorm.split('-')[1].trim() : qNorm;
+  let qTitleOnly = hasHyphen ? qNorm.split('-')[1].trim() : qNorm;
   if (hasHyphen && qNorm.split('-')[0].trim() === '') qTitleOnly = qNorm;
-
-  const qWords = qNorm.replace(/[^a-z0-9\s]/gi, ' ').split(/\s+/).filter(w => w.length > 1);
-
+  const qWords = qNorm.replace(/[^a-z0-9\s]/gi,' ').split(/\s+/).filter(w => w.length > 1);
   for (let i = 0; i < Math.min(items.length, 50); i++) {
-    const t       = items[i];
-    const tTitle  = normalizeStr(removeFeat(t.title || ''));
-    const tArtist = normalizeStr(
-      t.performer?.name || t.artist?.name || t.artists?.[0]?.name ||
-      (t.artists && t.artists.length ? t.artists[0].name : '') || ''
-    );
+    const t = items[i];
+    const tTitle  = normalizeStr(cleanTitle(t.title || ''));
+    const tArtist = normalizeStr(t.performer?.name || t.artist?.name || t.artists?.[0]?.name || '');
     let score = 0;
-
-    const targetStr  = (tTitle + ' ' + tArtist).replace(/[^a-z0-9\s]/gi, ' ');
-    const matchCount = qWords.filter(w => targetStr.includes(w)).length;
-    score += matchCount * 10;
-
+    score += qWords.filter(w => (tTitle+' '+tArtist).includes(w)).length * 10;
     let titleMatch = false, artistMatch = false;
-
     if (hasHyphen) {
-      const parts = qNorm.split('-');
-      const p1 = parts[0].trim(), p2 = parts[1].trim();
-      if (p1.length && (tTitle === p1 || tTitle.includes(p1) || p1.includes(tTitle))) titleMatch = true;
-      if (p2.length && (tTitle === p2 || tTitle.includes(p2) || p2.includes(tTitle))) titleMatch = true;
-      if (p1.length && (tArtist === p1 || tArtist.includes(p1) || p1.includes(tArtist))) artistMatch = true;
-      if (p2.length && (tArtist === p2 || tArtist.includes(p2) || p2.includes(tArtist))) artistMatch = true;
+      const [p1,p2] = qNorm.split('-').map(p=>p.trim());
+      if (p1&&(tTitle===p1||tTitle.includes(p1)||p1.includes(tTitle))) titleMatch=true;
+      if (p2&&(tTitle===p2||tTitle.includes(p2)||p2.includes(tTitle))) titleMatch=true;
+      if (p1&&(tArtist===p1||tArtist.includes(p1)||p1.includes(tArtist))) artistMatch=true;
+      if (p2&&(tArtist===p2||tArtist.includes(p2)||p2.includes(tArtist))) artistMatch=true;
     } else {
-      if (tTitle.length  && (qNorm === tTitle  || qNorm.includes(tTitle)  || tTitle.includes(qNorm)))  titleMatch  = true;
-      if (tArtist.length && (qNorm === tArtist || qNorm.includes(tArtist) || tArtist.includes(qNorm))) artistMatch = true;
+      if (tTitle&&(qNorm===tTitle||qNorm.includes(tTitle)||tTitle.includes(qNorm))) titleMatch=true;
+      if (tArtist&&(qNorm===tArtist||qNorm.includes(tArtist)||tArtist.includes(qNorm))) artistMatch=true;
     }
-
     if (titleMatch)  score += 40;
     if (artistMatch) score += 40;
     if (titleMatch && artistMatch) score += 100;
-
-    // Exact title bonus
-    if (tTitle === qTitleOnly || tTitle === qNorm) score += 60;
-
-    // Title guillotine — kills results with no query word in the title
-    const titleWordsMatch = qWords.filter(w => tTitle.includes(w)).length;
-    if (titleWordsMatch === 0 && tTitle !== qTitleOnly && !qNorm.includes(tTitle)) {
-      if (qNorm !== tArtist && !tArtist.includes(qNorm)) score -= 100;
+    if (tTitle===qTitleOnly||tTitle===qNorm) score += 60;
+    const twm = qWords.filter(w=>tTitle.includes(w)).length;
+    if (twm===0&&tTitle!==qTitleOnly&&!qNorm.includes(tTitle)) {
+      if (qNorm!==tArtist&&!tArtist.includes(qNorm)) score -= 100;
     }
-
-    // Anti-cover/karaoke spam
-    if (!/(cover|karaoke|tribute|instrumental|8-bit)/i.test(qNorm) &&
-         /(cover|karaoke|tribute|instrumental|8-bit)/i.test(t.title || '')) {
-      score -= 500;
-    }
-
+    if (!/\b(cover|karaoke|tribute|instrumental|8-bit)\b/i.test(qNorm) &&
+        /\b(cover|karaoke|tribute|instrumental|8-bit)\b/i.test(t.title||'')) score -= 500;
     if (score > bestScore) { bestScore = score; bestItem = t; }
   }
   return { item: bestItem, score: bestScore };
 }
 
-// ─── ISRC resolution: TIDAL + Deezer in parallel ─────────────────────────────
-// Replaces the old single-source qobuzFindByIsrc sequential loop.
-// Both engines run simultaneously — whichever scores higher wins.
-// ISRC confirmed match cached 24h; miss cached 30 min.
-const DEEZER_API = 'https://api.deezer.com';
-const ISRC_MIN_SCORE = 100; // minimum scoring engine threshold for a valid match
-
-async function getIsrcFromTidal(query, instanceUrl) {
+// ─── ISRC resolution ──────────────────────────────────────────────────────────
+async function getIsrcFromTidal(query, hifiInstances, redis) {
   try {
-    const data = await hifiGetForTokenSafe(instanceUrl, '/search', { s: query, limit: 20 });
-    let items = data?.tracks?.items || data?.items || data?.data?.items ||
-                data?.data?.tracks?.items || (Array.isArray(data) ? data : []);
-    if (!items.length) return null;
-    const match = scoringFindBest(items, query);
-    if (!match.item || match.score < ISRC_MIN_SCORE) return null;
-    const track = match.item;
-    let isrc = track.isrc;
-    if (!isrc) {
-      const info = await hifiGetForTokenSafe(instanceUrl, '/info', { id: track.id });
-      isrc = info?.isrc || info?.data?.isrc || null;
+    const data  = await fetchHifi('/search/?s=' + encodeURIComponent(query) + '&limit=30', hifiInstances, redis);
+    const items = data?.data?.items || data?.data?.tracks?.items || data?.tracks?.items || data?.data || [];
+    const arr   = Array.isArray(items) ? items : (Array.isArray(data) ? data : []);
+    const match = findBestMatch(arr, query);
+    if (match.item && match.score >= 50) {
+      let isrc = match.item.isrc;
+      if (!isrc) { try { const info = await fetchHifi('/info/?id='+encodeURIComponent(match.item.id), hifiInstances, redis); isrc = (info?.data||info||{}).isrc; } catch {} }
+      return { isrc, track: match.item, source: 'tidal', score: match.score };
     }
-    console.log('[isrc] TIDAL hit score=' + match.score + ' isrc=' + isrc + ' for: ' + query);
-    return { isrc, track, source: 'tidal', score: match.score };
-  } catch(e) { return null; }
+    return null;
+  } catch { return null; }
 }
-
 async function getIsrcFromDeezer(query) {
   try {
-    const r = await axios.get(DEEZER_API + '/search/track', {
-      params: { q: query },
-      headers: { 'User-Agent': UA },
-      timeout: 8000
-    });
-    const items = r.data?.data || [];
-    if (!items.length) return null;
-    const match = scoringFindBest(items, query);
-    if (!match.item || match.score < ISRC_MIN_SCORE) return null;
-    const track = match.item;
-    let isrc = track.isrc;
-    if (!isrc) {
-      try {
-        const r2 = await axios.get(DEEZER_API + '/track/' + track.id, {
-          headers: { 'User-Agent': UA }, timeout: 5000
-        });
-        isrc = r2.data?.isrc || null;
-      } catch(e) {}
+    const data = await httpGet(DEEZER_API + '/search/track', { q: query, limit: 25 }, TIMEOUT_MS);
+    if (!data?.data?.length) return null;
+    const match = findBestMatch(data.data, query);
+    if (match.item && match.score >= 50) {
+      let isrc = match.item.isrc;
+      if (!isrc) { try { isrc = (await httpGet(DEEZER_API+'/track/'+match.item.id,null,5000)).isrc; } catch {} }
+      return { isrc, track: match.item, source: 'deezer', score: match.score };
     }
-    console.log('[isrc] Deezer hit score=' + match.score + ' isrc=' + isrc + ' for: ' + query);
-    return { isrc, track, source: 'deezer', score: match.score };
-  } catch(e) { return null; }
+    return null;
+  } catch { return null; }
 }
 
-// resolveIsrc: race TIDAL and Deezer in parallel, pick the higher-scoring winner.
-// Returns { isrc, track, source, score } or null.
-async function resolveIsrc(title, artist, instanceUrl) {
-  const query = (artist ? artist + ' ' : '') + removeFeat(title || '');
-  const cacheKey = 'isrc2:' + query.toLowerCase();
-  const cached = cGet(cacheKey);
-  if (cached === 'MISS') return null;
-  if (cached) return cached;
-
-  const [tidalResult, deezerResult] = await Promise.all([
-    getIsrcFromTidal(query, instanceUrl),
-    getIsrcFromDeezer(query)
-  ]);
-
-  let winner = null;
-  if (tidalResult && deezerResult) {
-    winner = tidalResult.score >= deezerResult.score ? tidalResult : deezerResult;
-    console.log('[isrc] Winner: ' + winner.source.toUpperCase() +
-      ' (' + winner.score + ' vs ' + (winner === tidalResult ? deezerResult.score : tidalResult.score) + ')');
-  } else {
-    winner = tidalResult || deezerResult;
+// ─── Quality map ──────────────────────────────────────────────────────────────
+const QUALITY_FORMAT_MAP = { MP3: 5, CD: 6, HIRES_96: 7, HIRES: 27 };
+function qobuzQualityLabel(formatId, item) {
+  if (formatId === 5)  return '320kbps MP3';
+  if (formatId === 6)  return '16-bit / 44.1 kHz FLAC';
+  if (formatId === 7)  return '24-bit / 96 kHz FLAC';
+  if (formatId === 27) {
+    const bits = item?.bit_depth || item?.maximum_bit_depth || 24;
+    const rate = item?.sampling_rate || item?.maximum_sampling_rate || 192;
+    return bits + '-bit / ' + rate + ' kHz FLAC';
   }
-
-  if (winner) {
-    cSet(cacheKey, winner, 86400); // cache 24h
-    return winner;
-  }
-  cSet(cacheKey, 'MISS', 1800); // miss cached 30 min
-  return null;
+  return '16-bit / 44.1 kHz FLAC';
+}
+function tidalQualityLabel(q) {
+  if (q==='HIGH') return '320kbps AAC (Tidal)';
+  if (q==='LOW')  return '96kbps AAC (Tidal)';
+  return q + ' (Tidal)';
 }
 
-// qobuzFindByIsrc: looks up a Qobuz track by confirmed ISRC.
-// Only accepts result if Qobuz's own .isrc field matches exactly.
-// Hit cached 24h, miss cached 30 min.
-async function qobuzFindByIsrc(isrc) {
-  if (!isrc) return null;
-  const normIsrc = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const wantIsrc = normIsrc(isrc);
-  if (!wantIsrc) return null;
-
-  const cacheKey = 'qisrc:' + wantIsrc;
-  const cached = cGet(cacheKey);
-  if (cached === 'MISS') return null;
-  if (cached) return cached;
-
-  for (const inst of QOBUZ_INSTANCES) {
-    try {
-      const r = await axios.get(inst + '/search', {
-        params: { q: isrc, limit: 5 },
-        headers: { 'User-Agent': UA },
-        timeout: 8000
-      });
-      const items = r.data?.tracks?.items || [];
-      const match = items.find(t => t.isrc && normIsrc(t.isrc) === wantIsrc);
-      if (match && match.id) {
-        if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        cSet(cacheKey, match, 86400);
-        console.log('[qobuz] isrc HIT', isrc, '->', match.id, match.title);
-        return match;
-      }
-    } catch(e) { continue; }
-  }
-  cSet(cacheKey, 'MISS', 1800);
-  return null;
+// ─── Mappers ──────────────────────────────────────────────────────────────────
+function mapQobuzTrack(t, userQuality) {
+  if (!t?.id) return null;
+  const formatId = QUALITY_FORMAT_MAP[String(userQuality).toUpperCase()] || 27;
+  return {
+    id:           String(t.id),
+    title:        cleanTitle(t.title),
+    artist:       t.performer?.name || t.artist?.name || t.album?.artist?.name || 'Unknown Artist',
+    album:        t.album?.title || '',
+    albumId:      t.album?.id ? String(t.album.id) : null,
+    artworkURL:   t.album?.image?.large || t.album?.image?.thumbnail || t.album?.cover || null,
+    duration:     t.duration || 0,
+    trackNumber:  t.track_number || 0,
+    discNumber:   t.media_number || t.volume_number || 1,
+    audioQuality: qobuzQualityLabel(formatId, t),
+    isrc:         t.isrc || undefined,
+    format:       formatId === 5 ? 'mp3' : 'flac',
+  };
+}
+function coverUrl(uuid, size) {
+  if (!uuid) return null;
+  const s = String(uuid);
+  if (s.startsWith('http')) return s;
+  return 'https://resources.tidal.com/images/' + s.replace(/-/g,'/') + '/' + (size||320) + 'x' + (size||320) + '.jpg';
+}
+function trackArtist(t) {
+  if (!t) return 'Unknown';
+  if (t.artists?.length) return t.artists.map(a=>a.name).join(', ');
+  return t.artist?.name || t.performer?.name || 'Unknown';
+}
+function mapHifiTrack(t, tidalQuality) {
+  if (!t?.id) return null;
+  return {
+    id:           'hifi:' + t.id,
+    title:        cleanTitle(t.title),
+    artist:       trackArtist(t),
+    album:        t.album?.title || '',
+    albumId:      t.album?.id ? 'hifi:' + t.album.id : null,
+    artworkURL:   coverUrl(t.album?.cover, 1280),
+    duration:     t.duration || 0,
+    trackNumber:  t.trackNumber || 0,
+    discNumber:   t.volumeNumber || 1,
+    audioQuality: tidalQualityLabel(tidalQuality),
+    format:       'aac',
+  };
+}
+function mapQobuzAlbum(a) {
+  return {
+    id:         String(a.id),
+    title:      a.title || 'Unknown',
+    artist:     a.artist?.name || 'Unknown Artist',
+    artworkURL: a.image?.large || a.image?.thumbnail || null,
+    year:       a.release_date_original?.substring(0,4) || a.release_date?.substring(0,4) || null,
+    trackCount: a.tracks_count || 0,
+  };
 }
 
-// qobuzFindBestTrack: upgraded 4-tier lookup.
-// Tier 1: resolve ISRC via parallel TIDAL+Deezer engines → Qobuz ISRC lookup (exact match).
-// Tier 2: Qobuz title+artist search using scoring engine (was simple includes check).
-// Tier 3: Qobuz raw text search (last resort fallback).
-// All tiers cached to avoid redundant outbound calls.
-async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
-  // ── Tier 1: confirmed ISRC fast path ──────────────────────────────────────
-  // First try the bare ISRC if we already have it from TIDAL metadata
-  if (isrc) {
-    const byIsrc = await qobuzFindByIsrc(isrc);
-    if (byIsrc) return byIsrc;
-    console.log('[qobuz] bare ISRC miss for', isrc, '— trying parallel resolution');
-  }
+// ─── Search Tracks — returns full list (up to limit) ─────────────────────────
+async function searchTracks(query, limit, context) {
+  const cleanedQuery  = formatQuery(query);
+  const userQuality   = context?.settings?.quality?.value      || 'HIRES';
+  const tidalQuality  = context?.settings?.tidalQuality?.value || 'HIGH';
+  const hifiInstances = context?.settings?.hifiInstances?.value || DEFAULT_HIFI_INSTANCES;
+  const redis         = context?.redis;
+  const maxResults    = limit || 20;
 
-  // Run TIDAL+Deezer parallel resolver to get a confirmed ISRC
-  if (title) {
-    const resolved = await resolveIsrc(title, artist, instanceUrl);
-    if (resolved && resolved.isrc) {
-      const byResolvedIsrc = await qobuzFindByIsrc(resolved.isrc);
-      if (byResolvedIsrc) return byResolvedIsrc;
-      console.log('[qobuz] resolved ISRC', resolved.isrc, 'not in Qobuz vault — falling to title search');
-    }
-  }
-
-  // ── Tier 2: scoring-engine title+artist search on Qobuz ───────────────────
-  if (!title) return null;
-  const cacheKey = 'qmatch2:' + (title || '').toLowerCase() + ':' + (artist || '').toLowerCase();
-  const cached = cGet(cacheKey);
-  if (cached === 'MISS') return null;
-  if (cached) return cached;
-
-  const q = (artist ? artist + ' ' : '') + removeFeat(title);
-  for (const inst of QOBUZ_INSTANCES) {
-    try {
-      const r = await axios.get(inst + '/search', {
-        params: { q, limit: 15 },
-        headers: { 'User-Agent': UA },
-        timeout: 10000
-      });
-      const items = r.data?.tracks?.items || [];
-      if (!items.length) continue;
-      const match = scoringFindBest(items, (artist ? artist + ' ' : '') + title);
-      if (match.item && match.score >= 40) { // lower threshold for direct Qobuz search
-        if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        cSet(cacheKey, match.item, 3600);
-        console.log('[qobuz] title search HIT score=' + match.score, match.item.title);
-        return match.item;
-      }
-    } catch(e) { continue; }
-  }
-
-  cSet(cacheKey, 'MISS', 1800);
-  return null;
-}
-
-
-// ─── Hi-Fi API client ─────────────────────────────────────────────────────────
-// Races ALL instances in parallel (Promise.any) — first success wins.
-// Eliminates the sequential 15s-per-instance fallback that caused retry storms.
-async function hifiGet(path, params) {
-  const instances = instanceHealthy
-    ? [activeInstance].concat(HIFI_INSTANCES.filter(i => i !== activeInstance))
-    : HIFI_INSTANCES.slice();
-
+  // Phase 1 — broad Qobuz search (fastest, most results)
+  let qobuzTracks = [];
   try {
-    return await Promise.any(instances.map(inst =>
-      axios.get(inst + path, {
-        params,
-        headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-        timeout: 8000
-      }).then(r => {
-        if (r.status === 200 && r.data) {
-          if (inst !== activeInstance) { activeInstance = inst; instanceHealthy = true; }
-          return r.data;
-        }
-        throw new Error('bad response from ' + inst);
-      })
-    ));
-  } catch(e) {
-    throw new Error('All Hi-Fi instances failed');
+    const res = await qobuzProxyGet('/search', { q: cleanedQuery, limit: maxResults }, redis);
+    const items = res?.tracks?.items || res?.data?.tracks?.items || [];
+    qobuzTracks = items.map(t => mapQobuzTrack(t, userQuality)).filter(Boolean);
+  } catch {}
+
+  // Phase 2 — ISRC enrichment in parallel
+  const [tidalMaster, deezerMaster] = await Promise.all([
+    getIsrcFromTidal(cleanedQuery, hifiInstances, redis),
+    getIsrcFromDeezer(cleanedQuery),
+  ]);
+  let bestMaster = null;
+  if (tidalMaster && deezerMaster) {
+    bestMaster = tidalMaster.score >= deezerMaster.score ? tidalMaster : deezerMaster;
+  } else {
+    bestMaster = tidalMaster || deezerMaster;
   }
-}
-
-async function hifiGetSafe(path, params) {
-  try { return await hifiGet(path, params); } catch(e) { return null; }
-}
-
-async function hifiGetForToken(instanceUrl, path, params) {
-  if (instanceUrl) {
+  const masterIsrc = bestMaster?.isrc || null;
+  let isrcTrack = null;
+  if (masterIsrc) {
     try {
-      const r = await axios.get(instanceUrl + path, {
-        params,
-        headers: { 'User-Agent': UA, 'Accept': 'application/json' },
-        timeout: 8000
-      });
-      if (r.status === 200 && r.data) return r.data;
-      throw new Error('Non-200 from custom instance: ' + r.status);
-    } catch(e) {
-      throw new Error('Custom instance failed: ' + instanceUrl + ': ' + e.message);
+      const res = await qobuzProxyGet('/search', { q: masterIsrc, limit: 1 }, redis);
+      const items = res?.tracks?.items || res?.data?.tracks?.items || [];
+      if (items.length > 0) isrcTrack = mapQobuzTrack(items[0], userQuality);
+    } catch {}
+  }
+
+  // Build final list: ISRC best match first, then rest deduplicated
+  const finalTracks = [];
+  if (isrcTrack) {
+    finalTracks.push(isrcTrack);
+    for (const t of qobuzTracks) {
+      if (finalTracks.length >= maxResults) break;
+      if (t.id !== isrcTrack.id) finalTracks.push(t);
+    }
+  } else {
+    finalTracks.push(...qobuzTracks.slice(0, maxResults));
+  }
+
+  // Phase 3 — HiFi fallback only if Qobuz returned nothing at all
+  if (qobuzTracks.length === 0 && finalTracks.length === 0 && bestMaster) {
+    if (bestMaster.source === 'tidal') {
+      const t = mapHifiTrack(bestMaster.track, tidalQuality);
+      if (t) { t.audioQuality = tidalQualityLabel(tidalQuality) + ' · Fallback'; finalTracks.push(t); }
+    } else {
+      try {
+        const hd = await fetchHifi('/search/?s=' + encodeURIComponent(cleanTitle(bestMaster.track.title)+' '+(bestMaster.track.artist?.name||'')) + '&limit=20', hifiInstances, redis);
+        const items = hd?.data?.items || hd?.data?.tracks?.items || hd?.data || [];
+        (Array.isArray(items)?items:[]).slice(0,maxResults).forEach(item => { const t=mapHifiTrack(item,tidalQuality); if(t) { t.audioQuality = tidalQualityLabel(tidalQuality) + ' · Fallback'; finalTracks.push(t); } });
+      } catch {}
     }
   }
-  return hifiGet(path, params);
+
+  // Phase 4 — raw HiFi search as last resort
+  if (finalTracks.length === 0) {
+    try {
+      const hd = await fetchHifi('/search/?s=' + encodeURIComponent(cleanedQuery) + '&limit=' + maxResults, hifiInstances, redis);
+      const items = hd?.data?.items || hd?.data?.tracks?.items || hd?.data || [];
+      (Array.isArray(items)?items:[]).slice(0,maxResults).forEach(item => { const t=mapHifiTrack(item,tidalQuality); if(t) { t.audioQuality = tidalQualityLabel(tidalQuality) + ' · Fallback'; finalTracks.push(t); } });
+    } catch {}
+  }
+
+  if (finalTracks.length > 0) return { tracks: finalTracks, total: finalTracks.length };
+  throw new Error('Track not found.');
 }
 
-async function hifiGetForTokenSafe(instanceUrl, path, params) {
-  try { return await hifiGetForToken(instanceUrl, path, params); } catch(e) { return null; }
+// ─── Search Albums ────────────────────────────────────────────────────────────
+async function searchAlbums(query, limit, context) {
+  const redis   = context?.redis;
+  const results = [];
+  try {
+    const res = await qobuzProxyGet('/search', { q: query, limit: limit || 10 }, redis);
+    const items = res?.albums?.items || res?.data?.albums?.items || [];
+    results.push(...items.map(mapQobuzAlbum));
+  } catch {}
+  try {
+    const hd = await fetchHifi('/search/?s=' + encodeURIComponent(query) + '&limit=10', context?.settings?.hifiInstances?.value || DEFAULT_HIFI_INSTANCES, redis);
+    const albums = hd?.data?.albums?.items || hd?.albums?.items || [];
+    if (Array.isArray(albums)) {
+      for (const a of albums) {
+        if (!a?.id) continue;
+        results.push({ id:'hifi:'+String(a.id), title:a.title||'Unknown', artist:a.artist?.name||'Unknown', artworkURL:coverUrl(a.cover,1280), year:a.releaseDate?String(a.releaseDate).slice(0,4):undefined, trackCount:a.numberOfTracks||0 });
+      }
+    }
+  } catch {}
+  return { albums: results.slice(0, limit || 15), total: results.length };
 }
 
-// ─── Upstash Redis REST API ───────────────────────────────────────────────────
-const UPSTASH_URL = typeof UPSTASH_REDIS_REST_URL !== 'undefined' ? UPSTASH_REDIS_REST_URL : null;
-const UPSTASH_TOKEN = typeof UPSTASH_REDIS_REST_TOKEN !== 'undefined' ? UPSTASH_REDIS_REST_TOKEN : null;
-
-async function upstashCmd(...args) {
-if (!UPSTASH_URL || !UPSTASH_TOKEN) return null;
-try {
-const res = await fetch(UPSTASH_URL, {
-method: 'POST',
-headers: { 'Authorization': 'Bearer ' + UPSTASH_TOKEN, 'Content-Type': 'application/json' },
-body: JSON.stringify(args)
-});
-const json = await res.json();
-return json.result ?? null;
-} catch(e) { return null; }
+// ─── Search Artists ───────────────────────────────────────────────────────────
+async function searchArtists(query, limit, context) {
+  const redis   = context?.redis;
+  const results = [];
+  try {
+    const res = await qobuzProxyGet('/search', { q: query, limit: limit || 8 }, redis);
+    const items = res?.artists?.items || res?.data?.artists?.items || [];
+    results.push(...items.map(a => ({ id:String(a.id), name:a.name||'Unknown', artworkURL:a.picture||a.image?.large||null })));
+  } catch {}
+  try {
+    const hd = await fetchHifi('/search/?s=' + encodeURIComponent(query) + '&limit=10', context?.settings?.hifiInstances?.value || DEFAULT_HIFI_INSTANCES, redis);
+    const artists = hd?.data?.artists?.items || hd?.artists?.items || [];
+    if (Array.isArray(artists)) {
+      for (const a of artists) {
+        if (!a?.id) continue;
+        results.push({ id:'hifi:'+String(a.id), name:a.name||'Unknown', artworkURL:coverUrl(a.picture,480) });
+      }
+    }
+  } catch {}
+  return { artists: results.slice(0, limit || 10), total: results.length };
 }
 
-// Save title+artist+isrc to Redis keyed by TIDAL track id (TTL 24h)
-async function redisCacheTrackMeta(tid, title, artist, isrc) {
-if (!tid || !title) return;
-await upstashCmd('SET', 'mc:tmeta:' + tid, JSON.stringify({ title, artist: artist || 'Unknown', isrc: isrc || null }), 'EX', 86400);
+// ─── Search Playlists ─────────────────────────────────────────────────────────
+async function searchPlaylists(query, limit, context) {
+  try {
+    const res   = await qobuzProxyGet('/search', { q: query, limit: limit || 8 }, context?.redis);
+    const items = res?.playlists?.items || res?.data?.playlists?.items || [];
+    return {
+      playlists: items.map(p => ({
+        id:         String(p.id),
+        title:      p.name || p.title || 'Playlist',
+        creator:    p.owner?.name || undefined,
+        artworkURL: p.images300?.[0] || p.image_rectangle_mini?.[0] || p.image_rectangle?.[0] || null,
+        trackCount: p.tracks_count || 0,
+      })),
+      total: items.length,
+    };
+  } catch { return { playlists: [], total: 0 }; }
 }
 
-// Load title+artist+isrc from Redis by TIDAL track id
-async function redisLoadTrackMeta(tid) {
-const raw = await upstashCmd('GET', 'mc:tmeta:' + tid);
-if (!raw) return null;
-try { return JSON.parse(raw); } catch(e) { return null; }
+// ─── Get Album ────────────────────────────────────────────────────────────────
+async function getAlbum(albumId, context) {
+  const redis = context?.redis;
+  const userQ = context?.settings?.quality?.value || 'HIRES';
+
+  if (!albumId.startsWith('hifi:')) {
+    let res = null;
+    const tries = [
+      ['/album/' + albumId, null],
+      ['/album/get', { album_id: albumId, limit: 100 }],
+    ];
+    for (const [ep, params] of tries) {
+      try {
+        res = await qobuzProxyAny(ep, params, redis);
+        if (res && (res.id || res.title)) break;
+      } catch {}
+    }
+    if (!res || (!res.id && !res.title)) throw new Error('Album not found on Qobuz');
+    const tracks = (res.tracks?.items || [])
+      .map(t => { if (!t.album) t.album = { id: albumId, title: res.title, artist: res.artist, image: res.image }; return mapQobuzTrack(t, userQ); })
+      .filter(Boolean)
+      .sort((a,b) => a.discNumber !== b.discNumber ? a.discNumber - b.discNumber : a.trackNumber - b.trackNumber);
+    return {
+      id:         String(albumId),
+      title:      res.title || 'Unknown',
+      artist:     res.artist?.name || (typeof res.artist === 'string' ? res.artist : 'Unknown'),
+      artworkURL: res.image?.large || res.image?.thumbnail || null,
+      year:       res.release_date_original?.substring(0,4) || res.release_date?.substring(0,4) || null,
+      trackCount: tracks.length,
+      tracks,
+    };
+  }
+
+  // HiFi album
+  const realId    = albumId.replace('hifi:', '');
+  const tidalQ    = context?.settings?.tidalQuality?.value || 'HIGH';
+  const instances = context?.settings?.hifiInstances?.value || DEFAULT_HIFI_INSTANCES;
+  let data = null;
+  const settled = await Promise.allSettled([
+    fetchHifiAny('/album/?id=' + encodeURIComponent(realId) + '&limit=100', instances, redis),
+    fetchHifiAny('/album/' + encodeURIComponent(realId) + '?limit=100', instances, redis),
+    fetchHifiAny('/albums/' + encodeURIComponent(realId) + '/items', instances, redis),
+  ]);
+  for (const r of settled) { if (r.status==='fulfilled' && r.value) { data=r.value; break; } }
+  if (!data) throw new Error('Album not found on any HiFi instance');
+
+  const album    = data?.data?.album || data?.data || data?.album || data;
+  let rawItems   = album?.items || album?.tracks?.items || album?.tracks || data?.items || data?.data?.items || [];
+  if (!Array.isArray(rawItems)) rawItems = [];
+  const artistName = album?.artist?.name || album?.artists?.map?.(a=>a.name).join(', ') || 'Unknown';
+  const cover      = album?.cover || album?.image || album?.artwork;
+  const tracks     = rawItems.map((item, i) => {
+    const t = item?.item || item;
+    if (!t?.id) return null;
+    cacheTrackMeta(t.id, cleanTitle(t.title), trackArtist(t)||artistName, t.isrc||null);
+    return { id:'hifi:'+String(t.id), title:cleanTitle(t.title), artist:trackArtist(t)||artistName, duration:t.duration||0, trackNumber:t.trackNumber||i+1, discNumber:t.volumeNumber||1, artworkURL:coverUrl(cover,1280), audioQuality:tidalQualityLabel(tidalQ), format:'aac' };
+  }).filter(Boolean);
+  return {
+    id:         albumId,
+    title:      album?.title || 'Unknown',
+    artist:     artistName,
+    artworkURL: coverUrl(cover, 1280),
+    year:       album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined,
+    trackCount: tracks.length,
+    tracks,
+  };
 }
 
-async function redisSave(token, entry) {
-await upstashCmd('SET', 'mc:token:' + token, JSON.stringify({
-createdAt: entry.createdAt,
-lastUsed: entry.lastUsed,
-reqCount: entry.reqCount || 0,
-instanceUrl: entry.instanceUrl || null,
-preferredQuality: entry.preferredQuality || null
-}), 'EX', 2592000);
+// ─── Get Artist ───────────────────────────────────────────────────────────────
+async function getArtist(artistId, context) {
+  const redis = context?.redis;
+  const userQ = context?.settings?.quality?.value || 'HIRES';
+
+  if (!artistId.startsWith('hifi:')) {
+    let a = {}, alb = {};
+    const infoTries = [
+      ['/artist/' + artistId, null],
+      ['/artist/get', { artist_id: artistId }],
+    ];
+    for (const [ep, params] of infoTries) {
+      try {
+        a = await qobuzProxyAny(ep, params, redis);
+        if (a && (a.id || a.name)) break;
+      } catch {}
+    }
+    const albumTries = [
+      ['/artist/' + artistId + '/albums', null],
+      ['/artist/get', { artist_id: artistId, extra: 'albums' }],
+    ];
+    for (const [ep, params] of albumTries) {
+      try {
+        alb = await qobuzProxyAny(ep, params, redis);
+        if (alb) break;
+      } catch {}
+    }
+    const albumItems = a?.albums?.items || alb?.albums?.items || alb?.items || [];
+    let trackItems = a?.tracks?.items || [];
+    if (!trackItems.length) {
+      try {
+        const tr = await qobuzProxyGet('/search', { q: a.name || artistId, limit: 15 }, redis);
+        trackItems = tr?.tracks?.items || tr?.data?.tracks?.items || [];
+      } catch {}
+    }
+    return {
+      id:        String(artistId),
+      name:      a.name || 'Unknown',
+      artworkURL: a.picture || a.image?.large || null,
+      bio:       a.biography?.content || null,
+      albums:    albumItems.map(mapQobuzAlbum),
+      topTracks: trackItems.slice(0,15).map(t=>mapQobuzTrack(t,userQ)).filter(Boolean),
+    };
+  }
+
+  // HiFi artist
+  const realId    = artistId.replace('hifi:', '');
+  const tidalQ    = context?.settings?.tidalQuality?.value || 'HIGH';
+  const instances = context?.settings?.hifiInstances?.value || DEFAULT_HIFI_INSTANCES;
+  const [infoRes, albumsRes, topRes, albumsRes2] = await Promise.allSettled([
+    fetchHifiAny('/artist/?id=' + realId, instances, redis),
+    fetchHifiAny('/artist/albums/?id=' + realId + '&limit=50', instances, redis),
+    fetchHifiAny('/artist/toptracks/?id=' + realId + '&limit=20', instances, redis),
+    fetchHifiAny('/artist/' + realId + '/albums?limit=50', instances, redis),
+  ]);
+  const safeD = r => { if (r.status!=='fulfilled') return {}; const v=r.value; return v?.data?.data||v?.data||v||{}; };
+  const infoD    = safeD(infoRes);
+  const albumsD  = safeD(albumsRes);
+  const topD     = safeD(topRes);
+  const albumsD2 = safeD(albumsRes2);
+  const artistInfo = infoD?.artist?.id ? infoD.artist : (infoD?.id ? infoD : {});
+  const artistName = artistInfo.name || 'Unknown';
+  const _albumMap = {};
+  for (const a of [...(albumsD?.items || albumsD?.albums?.items || albumsD?.albums || []),
+                    ...(albumsD2?.items || albumsD2?.albums?.items || albumsD2?.albums || [])]) {
+    if (a?.id) _albumMap[String(a.id)] = a;
+  }
+  const albumItems = Object.values(_albumMap);
+  let trackItems = topD?.items || topD?.tracks?.items || topD?.tracks || [];
+  if (!trackItems.length && artistName !== 'Unknown') {
+    try {
+      const sr = await fetchHifiAny('/search/?s=' + encodeURIComponent(artistName) + '&limit=30', instances, redis);
+      const sItems = sr?.data?.items || sr?.data?.tracks?.items || sr?.items || [];
+      const want = artistName.toLowerCase();
+      trackItems = (Array.isArray(sItems) ? sItems : []).filter(t => {
+        if (!t?.id) return false;
+        const arts = t.artists || (t.artist ? [t.artist] : []);
+        return arts.some(a => (a.name||'').toLowerCase().includes(want) || want.includes((a.name||'').toLowerCase()));
+      }).slice(0, 20);
+    } catch {}
+  }
+  const albums = (Array.isArray(albumItems)?albumItems:[]).map(al => ({
+    id:'hifi:'+String(al.id), title:al.title||'Unknown', artist:artistName,
+    artworkURL:coverUrl(al.cover,1280), trackCount:al.numberOfTracks,
+    year:al.releaseDate?String(al.releaseDate).slice(0,4):undefined,
+  }));
+  const topTracks = (Array.isArray(trackItems)?trackItems:[]).map(t => {
+    if (!t?.id) return null;
+    cacheTrackMeta(t.id, cleanTitle(t.title), trackArtist(t)||artistName, t.isrc||null);
+    return { id:'hifi:'+String(t.id), title:cleanTitle(t.title), artist:trackArtist(t)||artistName, artworkURL:coverUrl(t.album?.cover,1280), duration:t.duration||0, audioQuality:tidalQualityLabel(tidalQ), format:'aac' };
+  }).filter(Boolean);
+  return {
+    id:        artistId,
+    name:      artistName,
+    artworkURL: coverUrl(artistInfo.picture, 480),
+    bio:       null,
+    albums,
+    topTracks,
+  };
 }
 
-async function redisLoad(token) {
-const raw = await upstashCmd('GET', 'mc:token:' + token);
-if (!raw) return null;
-try {
-const p = JSON.parse(raw);
-return {
-createdAt: p.createdAt || Date.now(),
-lastUsed: p.lastUsed || Date.now(),
-reqCount: p.reqCount || 0,
-instanceUrl: p.instanceUrl || null,
-preferredQuality: p.preferredQuality || null
-};
-} catch(e) { return null; }
+// ─── Get Playlist ─────────────────────────────────────────────────────────────
+async function getPlaylist(playlistId, context) {
+  const redis = context?.redis;
+  const userQ = context?.settings?.quality?.value || 'HIRES';
+  let res = null;
+  const tries = [
+    ['/playlist/' + playlistId, null],
+    ['/playlist/get', { playlist_id: playlistId, limit: 100 }],
+  ];
+  for (const [ep, params] of tries) {
+    try {
+      res = await qobuzProxyAny(ep, params, redis);
+      if (res && (res.id || res.name || res.title)) break;
+    } catch {}
+  }
+  if (!res?.id && !res?.name && !res?.title) throw new Error('Playlist not found on Qobuz');
+  const tracks = (res?.tracks?.items || []).map(t => mapQobuzTrack(t, userQ)).filter(Boolean);
+  return {
+    id:         String(playlistId),
+    title:      res.name || res.title || 'Playlist',
+    creator:    res.owner?.name || undefined,
+    artworkURL: res.images300?.[0] || res.image_rectangle_mini?.[0] || null,
+    trackCount: res.tracks_count || tracks.length,
+    tracks,
+  };
 }
 
-// ─── Token auth ───────────────────────────────────────────────────────────────
-const TOKEN_CACHE = new Map();
-const IP_CREATES = new Map();
-const MAX_TOKENS_PER_IP = 10, RATE_MAX = 80, RATE_WINDOW_MS = 60000;
+// ─── Stream ───────────────────────────────────────────────────────────────────
+async function getTrackStreamUrl(trackId, preferredQuality, context) {
+  if (!trackId) throw new Error('Invalid track ID');
+  const qualitySetting = context?.settings?.quality?.value || preferredQuality || 'HIRES';
+  const tidalQuality   = context?.settings?.tidalQuality?.value || 'HIGH';
+  const hifiInstances  = context?.settings?.hifiInstances?.value || DEFAULT_HIFI_INSTANCES;
+  const env   = context?.env;
+  const redis = context?.redis;
+  const formatId = QUALITY_FORMAT_MAP[String(qualitySetting).toUpperCase()] || 27;
 
-function generateToken() { return crypto.randomBytes(14).toString('hex'); }
+  if (trackId.startsWith('hifi:')) {
+    const realId = trackId.replace('hifi:', '');
+    const inst   = await getWorkingHiFiInstance(hifiInstances, redis);
+    if (!inst) throw new Error('No working HiFi instance');
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+    try {
+      const r    = await fetch(`${inst}/track/?id=${encodeURIComponent(realId)}&quality=${tidalQuality}`, { headers: { 'User-Agent': UA }, signal: ctrl.signal });
+      clearTimeout(timer);
+      const data = await r.json();
+      const b64  = data?.data?.manifest || data?.manifest;
+      if (!b64) throw new Error('Manifest missing');
+      const manifest  = JSON.parse(atob(b64));
+      const streamUrl = manifest?.urls?.[0];
+      if (!streamUrl) throw new Error('No URL in manifest');
+      return { url: streamUrl, format: 'aac', quality: tidalQualityLabel(tidalQuality) };
+    } catch (e) { clearTimeout(timer); throw new Error('HiFi track not playable: ' + e.message); }
+  }
 
-function getOrCreateIpBucket(ip) {
-var now = Date.now();
-var b = IP_CREATES.get(ip);
-if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + 86400000 }; IP_CREATES.set(ip, b); }
-return b;
+  // Qobuz native stream
+  const appId     = env?.QOBUZ_APP_ID     || APP_ID;
+  const userToken = env?.QOBUZ_USER_TOKEN || USER_TOKEN;
+  const secret    = env?.QOBUZ_SECRET     || SECRET;
+
+  const streamKey = `qt:stream:${trackId}:${formatId}`;
+  const cached    = await rGet(redis, streamKey);
+  if (cached) { const r = typeof cached === 'string' ? JSON.parse(cached) : cached; if (r?.streamUrl) return r; }
+
+  const ts  = Math.floor(Date.now() / 1000);
+  const sig = md5('trackgetFileUrlformat_id' + formatId + 'intentstreamtrack_id' + trackId + ts + secret);
+  const url = `https://www.qobuz.com/api.json/0.2/track/getFileUrl?app_id=${appId}&user_auth_token=${userToken}&track_id=${trackId}&format_id=${formatId}&intent=stream&request_ts=${ts}&request_sig=${sig}`;
+  const r   = await fetch(url);
+  if (!r.ok) throw new Error('Qobuz stream HTTP ' + r.status);
+  const data = await r.json();
+  if (!data?.url) throw new Error('URL stream missing for track ' + trackId);
+  const result = {
+    url: data.url,
+    format: formatId === 5 ? 'mp3' : 'flac',
+    quality: qobuzQualityLabel(formatId, data),
+    expiresAt: ts + 3600,
+  };
+  await rSet(redis, streamKey, result, STREAM_TTL);
+  return result;
 }
 
-async function getTokenEntry(token) {
-if (TOKEN_CACHE.has(token)) return TOKEN_CACHE.get(token);
-var saved = await redisLoad(token);
-if (saved) {
-var entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, instanceUrl: saved.instanceUrl || null, preferredQuality: saved.preferredQuality || null, rateWin: [] };
-TOKEN_CACHE.set(token, entry);
-return entry;
-}
-if (/^[a-f0-9]{28}$/.test(token)) {
-var fresh = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl: null, preferredQuality: null };
-TOKEN_CACHE.set(token, fresh);
-return fresh;
-}
-return null;
-}
+// ─── Config page HTML ─────────────────────────────────────────────────────────
+function buildConfigPage(baseUrl, redisConnected) {
+  const maskUrl = u => {
+    const pre = 'https://';
+    if (u.startsWith(pre)) { const rest = u.slice(pre.length); return pre + rest.slice(0,8) + '\u2022'.repeat(Math.max(4, rest.length-8)); }
+    return u.slice(0,12) + '\u2022'.repeat(6);
+  };
+  const HIFI_MASKED  = DEFAULT_HIFI_INSTANCES.map(maskUrl);
+  const QOBUZ_MASKED = QOBUZ_INSTANCES.map(maskUrl);
 
-function checkRateLimit(entry) {
-var now = Date.now();
-entry.rateWin = (entry.rateWin || []).filter(function(t) { return now - t < RATE_WINDOW_MS; });
-if (entry.rateWin.length >= RATE_MAX) return false;
-entry.rateWin.push(now); entry.lastUsed = now; entry.reqCount = (entry.reqCount || 0) + 1; return true;
-}
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Qobuz + Tidal \u2014 Eclipse Addon</title>
+  <style>
+    *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+    body{background:#080808;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px 64px;-webkit-font-smoothing:antialiased}
+    .card{background:#111;border:1px solid #1e1e1e;border-radius:18px;padding:36px;max-width:540px;width:100%;box-shadow:0 24px 64px rgba(0,0,0,.6);margin-bottom:20px}
+    h1{font-size:22px;font-weight:700;margin-bottom:6px;color:#fff}
+    h2{font-size:16px;font-weight:700;margin-bottom:14px;color:#fff}
+    p.sub{font-size:14px;color:#666;margin-bottom:20px;line-height:1.6}
+    .tip{background:#0a0a0a;border:1px solid #1e1e1e;border-radius:10px;padding:12px 14px;margin-bottom:20px;font-size:12px;color:#888;line-height:1.7}
+    .tip b{color:#ccc}
+    .pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}
+    .pill{border-radius:20px;font-size:11px;font-weight:600;padding:4px 10px;background:#181818;color:#aaa;border:1px solid #2a2a2a}
+    .pill.hi{background:#0d1520;color:#4a9eff;border-color:#1a3050}
+    .lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#444;margin-bottom:8px;margin-top:16px}
+    .hint{font-size:12px;color:#3a3a3a;margin-bottom:12px;line-height:1.7}
+    .ql-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}
+    .ql-btn{flex:1;cursor:pointer;border:1px solid #2a2a2a;border-radius:10px;background:#0a0a0a;color:#555;font-size:12px;font-weight:700;padding:10px 6px;text-align:center;transition:all .15s;letter-spacing:.04em;min-width:80px}
+    .ql-btn:hover{border-color:#444;color:#aaa}
+    .ql-btn.sel{background:#0d1520;border-color:#4a9eff;color:#4a9eff}
+    button{cursor:pointer;border:none;border-radius:10px;font-size:15px;font-weight:700;padding:13px;width:100%;margin-top:6px;margin-bottom:12px;transition:background .15s}
+    .bw{background:#fff;color:#000}.bw:hover{background:#e0e0e0}.bw:disabled{background:#1e1e1e;color:#333;cursor:not-allowed}
+    .bg{background:#141414;color:#e0e0e0;border:1px solid #2a2a2a}.bg:hover{background:#1e1e1e}
+    .bd{background:#0f0f0f;color:#777;border:1px solid #1a1a1a;font-size:13px;padding:10px}.bd:hover{background:#1a1a1a;color:#fff}
+    .box{background:#0a0a0a;border:1px solid #1a1a1a;border-radius:12px;padding:18px;margin-bottom:14px}
+    .blbl{font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}
+    .burl{font-size:12px;color:#fff;word-break:break-all;font-family:"SF Mono","Fira Code","Courier New",monospace;margin-bottom:14px;line-height:1.5}
+    hr{border:none;border-top:1px solid #161616;margin:24px 0}
+    .steps{display:flex;flex-direction:column;gap:12px}
+    .step{display:flex;gap:12px;align-items:flex-start}
+    .sn{background:#161616;border:1px solid #222;border-radius:50%;width:26px;height:26px;min-width:26px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#555}
+    .st{font-size:13px;color:#555;line-height:1.6}.st b{color:#999}
+    .inst-list{display:flex;flex-direction:column;gap:6px;margin-top:10px}
+    .inst{display:flex;align-items:center;gap:8px;font-size:12px;padding:8px 12px;background:#0a0a0a;border:1px solid #161616;border-radius:8px}
+    .dot{width:7px;height:7px;border-radius:50%;background:#333;flex-shrink:0}.dot.ok{background:#4a9a4a}.dot.err{background:#c04040}
+    .inst-url{flex:1;color:#666;font-family:"SF Mono","Fira Code","Courier New",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}
+    footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-height:1.8}
+    .redis-ok{color:#4a9a4a;font-size:11px;margin-top:4px}
+    .redis-mem{color:#555;font-size:11px;margin-top:4px}
+    .gen-count{font-size:11px;color:#444;text-align:center;margin-bottom:4px}
+    .q-badge{display:inline-block;margin-top:8px;padding:3px 10px;background:#0d1520;color:#4a9eff;border:1px solid #1a3050;border-radius:6px;font-size:11px;font-weight:700}
+  </style>
+</head>
+<body>
+  <svg width="52" height="52" viewBox="0 0 52 52" fill="none" style="margin-bottom:22px">
+    <circle cx="26" cy="26" r="26" fill="#fff"/>
+    <rect x="10" y="20" width="4" height="12" rx="2" fill="#000"/>
+    <rect x="17" y="14" width="4" height="24" rx="2" fill="#000"/>
+    <rect x="24" y="18" width="4" height="16" rx="2" fill="#000"/>
+    <rect x="31" y="11" width="4" height="30" rx="2" fill="#000"/>
+    <rect x="38" y="17" width="4" height="18" rx="2" fill="#000"/>
+  </svg>
 
-function getBaseUrl(req) { return (req.headers['x-forwarded-proto'] || req.protocol) + '://' + req.get('host'); }
+  <div class="card">
+    <h1>Qobuz + Tidal for Eclipse</h1>
+    <p class="sub">Parallel ISRC scoring engine via Tidal &amp; Deezer. Qobuz native streams up to 24-bit/192kHz. HiFi proxy fallback across ${DEFAULT_HIFI_INSTANCES.length} instances.</p>
+    <div class="tip"><b>Select quality first.</b> Each click generates a new unique URL with that quality baked in &mdash; paste into Eclipse to install.</div>
+    <div class="pills">
+      <span class="pill">Tracks &middot; Albums &middot; Artists &middot; Playlists</span>
+      <span class="pill hi">FLAC / Hi-Res</span>
+      <span class="pill hi">Qobuz 24-bit</span>
+      <span class="pill hi">Tidal Fallback</span>
+    </div>
+    ${redisConnected ? '<div class="redis-ok">&#10003; Redis connected &mdash; persistent caching active</div>' : '<div class="redis-mem">&#9679; In-memory cache (set UPSTASH vars for Redis)</div>'}
 
-// ─── withToken ────────────────────────────────────────────────────────────────
-async function withToken(c, handler) {
-const rawParam = c.req.param('token');
-const { token, embeddedInstance } = parseTokenParam(rawParam);
-const entry = await getTokenEntry(token);
-if (!entry) return Response.json({ error: 'Invalid token.' }, { status: 404 });
-if (!checkRateLimit(entry)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
-if (embeddedInstance) entry.instanceUrl = embeddedInstance;
-if (entry.reqCount % 20 === 0) await redisSave(token, entry);
-return handler(entry);
-}
+    <div class="lbl">Preferred Quality</div>
+    <div class="ql-row">
+      <div class="ql-btn" id="ql-HIRES" onclick="selectQuality('HIRES')">Hi-Res Max<br><span style="font-size:10px;opacity:.6">24-bit/192kHz</span></div>
+      <div class="ql-btn" id="ql-HIRES_96" onclick="selectQuality('HIRES_96')">Hi-Res 96<br><span style="font-size:10px;opacity:.6">24-bit/96kHz</span></div>
+      <div class="ql-btn" id="ql-CD" onclick="selectQuality('CD')">CD Quality<br><span style="font-size:10px;opacity:.6">16-bit/44.1kHz</span></div>
+      <div class="ql-btn" id="ql-MP3" onclick="selectQuality('MP3')">320 kbps<br><span style="font-size:10px;opacity:.6">MP3</span></div>
+    </div>
+    <div class="hint" id="qlHint">No preference selected &mdash; defaults to Hi-Res Max.</div>
 
-function parseTokenParam(rawParam) {
-const tilde = rawParam.indexOf('~');
-if (tilde === -1) return { token: rawParam, embeddedInstance: null };
-const token = rawParam.slice(0, tilde);
-try {
-const embeddedInstance = Buffer.from(rawParam.slice(tilde + 1), 'base64url').toString('utf8');
-return { token, embeddedInstance };
-} catch(e) { return { token, embeddedInstance: null }; }
-}
+    <button class="bw" id="genBtn" onclick="generate()">Generate Addon URL</button>
+    <div class="gen-count" id="genCount" style="display:none"></div>
+    <div class="box" id="genBox" style="display:none">
+      <div class="blbl">Your addon URL &mdash; paste into Eclipse</div>
+      <div class="burl" id="genUrl"></div>
+      <div id="qBadge"></div>
+      <button class="bd" style="margin-top:12px" id="copyBtn" onclick="copyUrl()">Copy URL</button>
+    </div>
 
-// ─── Config page ──────────────────────────────────────────────────────────────
-function buildConfigPage(baseUrl) {
-var h = '';
-h += '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">';
-h += '<meta name="viewport" content="width=device-width,initial-scale=1">';
-h += '<title>Claudochrome - TIDAL Addon</title>';
-h += '<style>*{box-sizing:border-box;margin:0;padding:0}';
-h += 'body{background:#080808;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px 64px}';
-h += '.card{background:#111;border:1px solid #1e1e1e;border-radius:18px;padding:36px;max-width:540px;width:100%;box-shadow:0 24px 64px rgba(0,0,0,.6);margin-bottom:20px}';
-h += 'h1{font-size:22px;font-weight:700;margin-bottom:6px;color:#fff}h2{font-size:16px;font-weight:700;margin-bottom:14px;color:#fff}';
-h += 'p.sub{font-size:14px;color:#666;margin-bottom:20px;line-height:1.6}';
-h += '.tip{background:#0a0a0a;border:1px solid #1e1e1e;border-radius:10px;padding:12px 14px;margin-bottom:20px;font-size:12px;color:#888;line-height:1.7}.tip b{color:#ccc}';
-h += '.pills{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:24px}';
-h += '.pill{border-radius:20px;font-size:11px;font-weight:600;padding:4px 10px;background:#181818;color:#aaa;border:1px solid #2a2a2a}';
-h += '.pill.hi{background:#0d1520;color:#4a9eff;border-color:#1a3050}';
-h += '.lbl{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:.07em;color:#444;margin-bottom:8px;margin-top:16px}';
-h += 'input{width:100%;background:#0a0a0a;border:1px solid #1e1e1e;border-radius:10px;color:#e0e0e0;font-size:14px;padding:12px 14px;margin-bottom:6px;outline:none;transition:border-color .15s}';
-h += 'input:focus{border-color:#fff}input::placeholder{color:#2e2e2e}';
-h += '.hint{font-size:12px;color:#3a3a3a;margin-bottom:12px;line-height:1.7}';
-h += 'button{cursor:pointer;border:none;border-radius:10px;font-size:15px;font-weight:700;padding:13px;width:100%;margin-top:6px;margin-bottom:12px;transition:background .15s}';
-h += '.bw{background:#fff;color:#000}.bw:hover{background:#e0e0e0}.bw:disabled{background:#1e1e1e;color:#333;cursor:not-allowed}';
-h += '.bg{background:#141414;color:#e0e0e0;border:1px solid #2a2a2a}.bg:hover{background:#1e1e1e}.bg:disabled{background:#0f0f0f;color:#333;cursor:not-allowed}';
-h += '.bd{background:#0f0f0f;color:#777;border:1px solid #1a1a1a;font-size:13px;padding:10px}.bd:hover{background:#1a1a1a;color:#fff}';
-h += '.box{display:none;background:#0a0a0a;border:1px solid #1a1a1a;border-radius:12px;padding:18px;margin-bottom:14px}';
-h += '.blbl{font-size:10px;color:#444;text-transform:uppercase;letter-spacing:.07em;margin-bottom:8px}';
-h += '.burl{font-size:12px;color:#fff;word-break:break-all;font-family:"SF Mono","Fira Code",monospace;margin-bottom:14px;line-height:1.5}';
-h += 'hr{border:none;border-top:1px solid #161616;margin:24px 0}';
-h += '.steps{display:flex;flex-direction:column;gap:12px}.step{display:flex;gap:12px;align-items:flex-start}';
-h += '.sn{background:#161616;border:1px solid #222;border-radius:50%;width:26px;height:26px;min-width:26px;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#555}';
-h += '.st{font-size:13px;color:#555;line-height:1.6}.st b{color:#999}';
-h += '.warn{background:#0d0d0d;border:1px solid #1e1e1e;border-radius:10px;padding:14px;margin-top:20px;font-size:12px;color:#555;line-height:1.7}';
-h += '.inst-list{display:flex;flex-direction:column;gap:6px;margin-top:10px}';
-h += '.inst{display:flex;align-items:center;gap:8px;font-size:12px;padding:8px 12px;background:#0a0a0a;border:1px solid #161616;border-radius:8px}';
-h += '.dot{width:7px;height:7px;border-radius:50%;background:#333;flex-shrink:0}.dot.ok{background:#4a9a4a}.dot.err{background:#c04040}';
-h += '.inst-url{flex:1;color:#666;font-family:"SF Mono","Fira Code",monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}';
-h += '.inst-ms{color:#444;margin-left:auto;font-size:11px}';
-h += '.badge{display:none;background:#0d1a0d;border:1px solid #1a3a1a;border-radius:8px;padding:8px 12px;font-size:12px;color:#4a9a4a;margin-bottom:10px}';
-h += '.ql-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:6px}';
-h += '.ql-btn{flex:1;cursor:pointer;border:1px solid #2a2a2a;border-radius:10px;background:#0a0a0a;color:#555;font-size:12px;font-weight:700;padding:10px 6px;text-align:center;transition:all .15s;letter-spacing:.04em}';
-h += '.ql-btn:hover{border-color:#444;color:#aaa}';
-h += '.ql-btn.sel{background:#0d1520;border-color:#4a9eff;color:#4a9eff}';
-h += 'footer{margin-top:32px;font-size:12px;color:#2a2a2a;text-align:center;line-height:1.8}';
-h += '</style></head><body>';
-h += '<svg width="52" height="52" viewBox="0 0 52 52" fill="none" style="margin-bottom:22px"><circle cx="26" cy="26" r="26" fill="#fff"/><rect x="10" y="20" width="4" height="12" rx="2" fill="#000"/><rect x="17" y="14" width="4" height="24" rx="2" fill="#000"/><rect x="24" y="18" width="4" height="16" rx="2" fill="#000"/><rect x="31" y="11" width="4" height="30" rx="2" fill="#000"/><rect x="38" y="17" width="4" height="18" rx="2" fill="#000"/></svg>';
-h += '<div class="card">';
-h += '<h1>Claudochrome for Eclipse</h1>';
-h += '<p class="sub">Full TIDAL catalog &mdash; lossless FLAC, HiRes, AAC 320 &mdash; no account, no subscription. Streams: Qobuz Hi-Res &rarr; TIDAL &rarr; fallback.</p>';
-h += '<div class="tip"><b>Save your URL.</b> Paste it below to refresh without reinstalling.</div>';
-h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC / HiRes</span><span class="pill hi">AAC 320</span><span class="pill hi">Qobuz 24-bit</span></div>';
-h += '<div class="lbl">Custom Hi&#8209;Fi Instance <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
-h += '<input type="text" id="customInstance" placeholder="https://your-instance.example.com">';
-h += '<div class="hint">Leave blank to use the shared pool. Paste your own self-hosted Hi-Fi API URL to lock this token exclusively to your instance.</div>';
-h += '<div class="lbl">Preferred Audio Quality <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
-h += '<div style="font-size:10px;color:#555;margin-bottom:5px;text-transform:uppercase;letter-spacing:.06em">Qobuz Quality</div>';
-h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-HIMAX" onclick="selectQuality(\'HIMAX\')">Hi-Res 192<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / up to 192kHz</span></div>';
-h += '<div class="ql-btn" id="ql-HI96" onclick="selectQuality(\'HI96\')">Hi-Res 96<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / up to 96kHz</span></div>';
-h += '<div class="ql-btn" id="ql-LOSSLESS" onclick="selectQuality(\'LOSSLESS\')">Lossless<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">16-bit / 44.1kHz</span></div>';
-h += '<div class="ql-btn" id="ql-AAC320" onclick="selectQuality(\'AAC320\')">320 kbps<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">Qobuz AAC 320</span></div>';
-h += '</div>';
-h += '<div style="font-size:10px;color:#555;margin-bottom:5px;margin-top:10px;text-transform:uppercase;letter-spacing:.06em">TIDAL Quality</div>';
-h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-HI_RES_LOSSLESS" onclick="selectQuality(\'HI_RES_LOSSLESS\')">Hi-Res Max<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">24-bit / up to 192kHz</span></div>';
-h += '<div class="ql-btn" id="ql-LOSSLESS_TIDAL" onclick="selectQuality(\'LOSSLESS\')">High<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">16-bit / 44.1kHz</span></div>';
-h += '<div class="ql-btn" id="ql-HIGH" onclick="selectQuality(\'HIGH\')">Low (320)<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">320 kbps</span></div>';
-h += '<div class="ql-btn" id="ql-LOW" onclick="selectQuality(\'LOW\')">Low (96)<br><span style="font-size:10px;font-weight:400;color:inherit;opacity:.6">96 kbps</span></div>';
-h += '</div>';
-h += '<div class="hint" id="qlHint">No preference &mdash; addon auto-selects: Qobuz Hi-Res &rarr; TIDAL Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
-h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
-h += '<div class="box" id="genBox"><div class="badge" id="genBadge">&#10003; Locked to your custom instance</div><div class="blbl">Your addon URL &mdash; paste into Eclipse</div><div class="burl" id="genUrl"></div><button class="bd" id="copyGenBtn" onclick="copyGen()">Copy URL</button></div>';
-h += '<hr>';
-h += '<div class="lbl">Refresh existing URL</div>';
-h += '<input type="text" id="existingUrl" placeholder="Paste your existing addon URL here">';
-h += '<div class="hint">Keeps the same URL active &mdash; nothing to reinstall.</div>';
-h += '<button class="bg" id="refBtn" onclick="doRefresh()">Refresh Existing URL</button>';
-h += '<div class="box" id="refBox"><div class="blbl">Refreshed &mdash; same URL still works in Eclipse</div><div class="burl" id="refUrl"></div><button class="bd" id="copyRefBtn" onclick="copyRef()">Copy URL</button></div>';
-h += '<hr>';
-h += '<div class="steps">';
-h += '<div class="step"><div class="sn">1</div><div class="st">Generate and copy your URL above</div></div>';
-h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>';
-h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap Install</div></div>';
-h += '<div class="step"><div class="sn">4</div><div class="st">Search TIDAL\'s full catalog &mdash; Qobuz Hi-Res played first automatically</div></div>';
-h += '</div>';
-h += '<div class="warn">Stream priority: <b>Qobuz Hi-Res 24-bit</b> &rarr; TIDAL Lossless/HiRes &rarr; lower quality fallback. Searches always use TIDAL catalog.</div>';
-h += '</div>';
-h += '<div class="card">';
-h += '<h2>Instance Health</h2>';
-h += '<p class="sub" style="margin-bottom:14px">Live status of all Hi-Fi API v2.7 instances.</p>';
-h += '<div class="inst-list" id="instList"><div style="color:#333;font-size:13px">Checking...</div></div>';
-h += '<button class="bg" style="margin-top:14px" onclick="checkHealth()">Refresh Status</button>';
-h += '</div>';
-h += '<footer>Claudochrome Eclipse Addon v2.3.0 &bull; TIDAL search + Qobuz Hi-Res streams</footer>';
-h += '<script>';
-h += 'var gu,ru,selQ=null;';
-h += 'var QLABELS={"HIMAX":"Hi-Res 192 · 24-bit/192kHz (Qobuz)","HI96":"Hi-Res 96 · 24-bit/96kHz (Qobuz)","LOSSLESS":"Lossless · 16-bit/44.1kHz FLAC","AAC320":"320 kbps AAC (Qobuz)","HI_RES_LOSSLESS":"TIDAL Hi-Res Max · 24-bit/192kHz","LOSSLESS_TIDAL":"TIDAL High · 16-bit/44.1kHz","HIGH":"TIDAL Low · 320 kbps","LOW":"TIDAL Low · 96 kbps"};';
-h += 'function selectQuality(q){if(selQ===q)selQ=null;else selQ=q;["HIMAX","HI96","LOSSLESS","AAC320","HI_RES_LOSSLESS","LOSSLESS_TIDAL","HIGH","LOW"].forEach(function(k){var el=document.getElementById("ql-"+k);if(el)el.classList.toggle("sel",selQ===k);});document.getElementById("qlHint").textContent=selQ?"Preferred: "+QLABELS[selQ]+" \u2014 fallback to lower if unavailable.":"\u00a0No preference \u2014 auto-selects: Qobuz Hi-Res \u2192 TIDAL Lossless \u2192 AAC 320 \u2192 AAC 96.";}';
-h += 'function generate(){var btn=document.getElementById("genBtn");btn.disabled=true;btn.textContent="Generating...";var ci=document.getElementById("customInstance").value.trim();while(ci.length&&ci[ci.length-1]=="/")ci=ci.slice(0,-1);var body={};if(ci)body.instanceUrl=ci;if(selQ)body.preferredQuality=selQ;fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Generate My Addon URL";return;}gu=d.manifestUrl;document.getElementById("genUrl").textContent=gu;document.getElementById("genBadge").style.display=d.usingCustomInstance?"block":"none";document.getElementById("genBox").style.display="block";btn.disabled=false;btn.textContent="Regenerate URL";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});}';
-h += 'function copyGen(){if(!gu)return;try{var _ta=document.createElement("textarea");_ta.value=gu;_ta.style.position="fixed";_ta.style.opacity="0";document.body.appendChild(_ta);_ta.select();document.execCommand("copy");document.body.removeChild(_ta);}catch(_e){try{navigator.clipboard.writeText(gu);}catch(_e2){}}var b=document.getElementById("copyGenBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);}';
-h += 'function doRefresh(){var btn=document.getElementById("refBtn");var eu=document.getElementById("existingUrl").value.trim();if(!eu){alert("Paste your existing addon URL first.");return;}btn.disabled=true;btn.textContent="Refreshing...";fetch("/refresh",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({existingUrl:eu})}).then(function(r){return r.json();}).then(function(d){if(d.error){alert(d.error);btn.disabled=false;btn.textContent="Refresh Existing URL";return;}ru=d.manifestUrl;document.getElementById("refUrl").textContent=ru;document.getElementById("refBox").style.display="block";btn.disabled=false;btn.textContent="Refresh Again";}).catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Refresh Existing URL";});}';
-h += 'function copyRef(){if(!ru)return;try{var _ta=document.createElement("textarea");_ta.value=ru;_ta.style.position="fixed";_ta.style.opacity="0";document.body.appendChild(_ta);_ta.select();document.execCommand("copy");document.body.removeChild(_ta);}catch(_e){try{navigator.clipboard.writeText(ru);}catch(_e2){}}var b=document.getElementById("copyRefBtn");b.textContent="Copied!";setTimeout(function(){b.textContent="Copy URL";},1500);}';
-h += 'function checkHealth(){var list=document.getElementById("instList");list.innerHTML=\'<div style="color:#333;font-size:13px">Checking...</div>\';fetch("/instances").then(function(r){return r.json();}).then(function(data){list.innerHTML="";data.instances.forEach(function(inst){var row=document.createElement("div");row.className="inst";var dot=document.createElement("span");dot.className=inst.ok?"dot ok":"dot err";var urlSpan=document.createElement("span");urlSpan.className="inst-url";function maskUrl(u){var pre="https://";if(u.startsWith(pre)){var rest=u.slice(pre.length);return pre+rest.slice(0,6)+"\u2022".repeat(Math.max(0,rest.length-6));}return u.slice(0,14)+"\u2022".repeat(Math.max(0,u.length-14));}urlSpan.textContent=maskUrl(inst.url);row.appendChild(dot);row.appendChild(urlSpan);if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}list.appendChild(row);});}).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Could not reach server</div>\';});}';
-h += 'checkHealth();';
-h += '</script></body></html>';
-return h;
+    <hr>
+    <div class="steps">
+      <div class="step"><div class="sn">1</div><div class="st">Select a quality tier above, then click Generate</div></div>
+      <div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>
+      <div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap Install</div></div>
+      <div class="step"><div class="sn">4</div><div class="st">Search Qobuz catalog &mdash; Tidal fallback kicks in automatically</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Instance Health</h2>
+    <p class="sub" style="margin-bottom:14px">Live status of HiFi &amp; Qobuz instances. URLs are partially masked for privacy.</p>
+    <div class="inst-list" id="instList"><div style="color:#333;font-size:13px">Checking&#8230;</div></div>
+    <button class="bg" style="margin-top:14px" onclick="checkHealth()">Refresh Status</button>
+  </div>
+
+  <footer>Qobuz + Tidal Eclipse Addon &bull; ISRC Scoring Engine &bull; v1.4.0</footer>
+
+  <script>
+    var genUrlVal=null,genCount=0,selQ=null;
+    const HIFI_MASKED=${JSON.stringify(HIFI_MASKED)};
+    const QOBUZ_MASKED=${JSON.stringify(QOBUZ_MASKED)};
+    const HIFI_REAL=${JSON.stringify(DEFAULT_HIFI_INSTANCES)};
+    const QOBUZ_REAL=${JSON.stringify(QOBUZ_INSTANCES)};
+    const QLABELS={'HIRES':'Hi-Res Max \u00b7 24-bit/192kHz','HIRES_96':'Hi-Res 96 \u00b7 24-bit/96kHz','CD':'CD Quality \u00b7 16-bit/44.1kHz','MP3':'320 kbps MP3'};
+    function selectQuality(q){
+      if(selQ===q)selQ=null;else selQ=q;
+      ['HIRES','HIRES_96','CD','MP3'].forEach(function(k){var el=document.getElementById('ql-'+k);if(el)el.classList.toggle('sel',selQ===k);});
+      document.getElementById('qlHint').textContent=selQ?'Selected: '+QLABELS[selQ]+' \u2014 baked into your URL.':'No preference selected \u2014 defaults to Hi-Res Max.';
+    }
+    function generate(){
+      var btn=document.getElementById('genBtn');
+      btn.disabled=true;btn.textContent='Generating\u2026';
+      fetch('/generate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(selQ?{quality:selQ}:{})})
+        .then(function(r){return r.json();}).then(function(d){
+          if(d.error){alert(d.error);btn.disabled=false;btn.textContent='Generate Addon URL';return;}
+          genUrlVal=d.manifestUrl;genCount++;
+          document.getElementById('genUrl').textContent=genUrlVal;
+          document.getElementById('genBox').style.display='block';
+          document.getElementById('genCount').style.display='block';
+          document.getElementById('genCount').textContent='Generated '+genCount+' URL'+(genCount!==1?'s':'')+' this session';
+          document.getElementById('qBadge').innerHTML='<span class="q-badge">'+(selQ?QLABELS[selQ]:'Hi-Res Max \u00b7 24-bit/192kHz')+'</span>';
+          document.getElementById('copyBtn').textContent='Copy URL';
+          btn.disabled=false;btn.textContent='Generate Another URL';
+        }).catch(function(e){alert('Error: '+e.message);btn.disabled=false;btn.textContent='Generate Addon URL';});
+    }
+    function copyUrl(){
+      if(!genUrlVal)return;
+      try{var ta=document.createElement('textarea');ta.value=genUrlVal;ta.style.position='fixed';ta.style.opacity='0';document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);}
+      catch(_){try{navigator.clipboard.writeText(genUrlVal);}catch(_2){}}
+      var b=document.getElementById('copyBtn');b.textContent='Copied!';setTimeout(function(){b.textContent='Copy URL';},1500);
+    }
+    function checkHealth(){
+      var list=document.getElementById('instList');
+      list.innerHTML='<div style="color:#333;font-size:13px">Checking\u2026</div>';
+      var allInst=HIFI_REAL.concat(QOBUZ_REAL);
+      var allMask=HIFI_MASKED.concat(QOBUZ_MASKED);
+      Promise.all(allInst.map(function(inst){
+        return fetch(inst+'/search/?s=test&limit=1',{signal:AbortSignal.timeout(4000)})
+          .then(function(r){return{ok:r.ok};}).catch(function(){return{ok:false};});
+      })).then(function(results){
+        list.innerHTML='';
+        results.forEach(function(res,i){
+          var row=document.createElement('div');row.className='inst';
+          var dot=document.createElement('span');dot.className='dot'+(res.ok?' ok':' err');
+          var urlSpan=document.createElement('span');urlSpan.className='inst-url';urlSpan.textContent=allMask[i];
+          row.appendChild(dot);row.appendChild(urlSpan);list.appendChild(row);
+        });
+      });
+    }
+    checkHealth();
+  <\/script>
+</body>
+</html>`;
 }
 
 // ─── Routes ───────────────────────────────────────────────────────────────────
+
 app.get('/', async c => {
-const baseUrl = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
-return new Response(buildConfigPage(baseUrl), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+  const redis = getRedis(c.env);
+  return new Response(buildConfigPage(
+    (c.req.header('x-forwarded-proto')||'https')+'://'+c.req.header('host'),
+    redis !== null
+  ), { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
 });
 
 app.post('/generate', async c => {
-const body = await parseBody(c);
-const ip = (c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown').split(',')[0].trim();
-const bucket = getOrCreateIpBucket(ip);
-if (bucket.count >= MAX_TOKENS_PER_IP) return Response.json({ error: 'Too many tokens from this IP today.' }, { status: 429 });
-let instanceUrl = (body && body.instanceUrl) ? String(body.instanceUrl).trim().replace(/\/$/, '') : null;
-if (instanceUrl) {
-if (!/^https?:\/\//.test(instanceUrl)) return Response.json({ error: 'Instance URL must start with http or https' }, { status: 400 });
-try {
-await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, timeout: 8000 });
-} catch(e) { return Response.json({ error: 'Could not reach your instance: ' + e.message }, { status: 400 }); }
-}
-const VALID_QUALITIES = ['HI_RES_LOSSLESS','HIRESLOSSLESS','HIMAX','HI96','LOSSLESS','HIGH','AAC320','LOW','AAC96'];
-const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
-const token = generateToken();
-const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality };
-TOKEN_CACHE.set(token, entry);
-await redisSave(token, entry);
-bucket.count++;
-const baseUrl = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
-const tokenSegment = instanceUrl ? token + '~' + Buffer.from(instanceUrl).toString('base64url') : token;
-return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json', usingCustomInstance: !!instanceUrl, preferredQuality });
-});
-
-app.post('/refresh', async c => {
-const body = await parseBody(c);
-const raw = (body && body.existingUrl) ? String(body.existingUrl).trim() : '';
-const segMatch = raw.match(/\/u\/([^/]+)\/manifest\.json/);
-const rawSegment = segMatch ? segMatch[1] : raw;
-const { token: parsedToken } = parseTokenParam(rawSegment);
-const token = parsedToken;
-if (!token || !/^[a-f0-9]{28}$/.test(token)) return Response.json({ error: 'Paste your full addon URL.' }, { status: 400 });
-const entry = await getTokenEntry(token);
-if (!entry) return Response.json({ error: 'URL not found. Generate a new one.' }, { status: 404 });
-const baseUrl = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
-const instanceUrl = entry.instanceUrl;
-const tokenSegment = instanceUrl ? token + '~' + Buffer.from(instanceUrl).toString('base64url') : token;
-return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json', refreshed: true });
-});
-
-app.get('/instances', async c => {
-  const cached = cGet('instances:health');
-  if (cached) return Response.json({ instances: cached, cached: true });
-  const results = await Promise.all(HIFI_INSTANCES.map(async inst => {
-    const start = Date.now();
-    try {
-      await axios.get(inst + '/search', { params: { s: 'test', limit: 1 }, timeout: 6000 });
-      return { url: inst, ok: true, ms: Date.now() - start };
-    } catch(e) { return { url: inst, ok: false, ms: null }; }
-  }));
-  cSet('instances:health', results, 30); // cache 30s — prevents 12-req burst per poll
-  return Response.json({ instances: results });
-});
-
-app.get('/health', c => {
-return Response.json({ status: 'ok', version: '2.4.1', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, cachedTracks: TRACK_META_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+  const redis = getRedis(c.env);
+  let body = {};
+  try { body = await c.req.json(); } catch {}
+  const quality = body?.quality || 'HIRES';
+  const token   = generateToken();
+  await saveToken(redis, token, { quality, createdAt: Date.now() });
+  const base = (c.req.header('x-forwarded-proto')||'https')+'://'+c.req.header('host');
+  return c.json({ token, quality, manifestUrl: base + '/u/' + token + '/manifest.json' });
 });
 
 app.get('/u/:token/manifest.json', async c => {
-return withToken(c, entry => {
-const rawParam = c.req.param('token');
-const { token } = parseTokenParam(rawParam);
-return Response.json({
-id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
-name: 'Claudochrome',
-version: '2.3.0',
-description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
-icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
-resources: ['search', 'stream', 'catalog'],
-types: ['track', 'album', 'artist', 'playlist']
-});
-});
-});
-
-// ─── Search — TIDAL + cache track meta for stream ─────────────────────────────
-app.get('/u/:token/search', async c => {
-return withToken(c, async entry => {
-const q = String(c.req.query('q') || c.req.query('query') || c.req.query('s') || '').trim();
-const limit = Math.min(parseInt(c.req.query('limit') || '20', 10) || 20, 50);
-const inst = entry.instanceUrl;
-if (!q) return Response.json({ tracks: [], albums: [], artists: [], playlists: [] });
-
-const cacheKey = 'mc:search:' + (inst || 'pool') + ':' + q.toLowerCase() + ':' + limit;
-  // In-memory cache check (fast path — avoids Upstash round-trip)
-  const memCached = cGet(cacheKey);
-  if (memCached) return Response.json(memCached);
-  const cached = await upstashCmd('GET', cacheKey);
-if (cached) {
-try {
-const parsed = JSON.parse(cached);
-// Re-populate in-memory meta cache from cached search results
-if (parsed.tracks) parsed.tracks.forEach(t => { if (t && t.id && t.title) cacheTrackMeta(t.id, t.title, t.artist); });
-return Response.json(parsed);
-} catch(e) {}
-}
-
-try {
-// Fire track search + playlist search in parallel.
-// Track search: GET /search/?s=query  (returns tracks, albums, artists)
-// Playlist search: GET /search/?p=query  (TIDAL top-hits PLAYLISTS via HiFi proxy)
-const [mainResult, plResult] = await Promise.allSettled([
-  hifiGetForToken(inst, '/search', { s: q, limit, offset: 0 }),
-  hifiGetForTokenSafe(inst, '/search', { p: q, limit: 10, offset: 0 }),
-]);
-const data  = mainResult.status === 'fulfilled' ? (mainResult.value || null) : null;
-// Items array (tracks) at data.data.items OR data.items
-const items = data?.data?.items || data?.items || [];
-
-const albumMap = {}, artistMap = {}, artistHits = {}, tracks = [];
-for (let i = 0; i < items.length; i++) {
-const t = items[i];
-if (!t || !t.id) continue;
-if (t.album && t.album.id) {
-const abid = String(t.album.id);
-if (!albumMap[abid]) albumMap[abid] = { id: abid, title: t.album.title || 'Unknown', artist: trackArtist(t), artworkURL: coverUrl(t.album.cover, 1080), trackCount: t.album.numberOfTracks, year: t.album.releaseDate ? String(t.album.releaseDate).slice(0, 4) : undefined };
-}
-(t.artists || (t.artist ? [t.artist] : [])).forEach(a => {
-if (!a || !a.id) return;
-const arid = String(a.id);
-if (!artistMap[arid]) artistMap[arid] = { id: arid, name: a.name || 'Unknown', artworkURL: coverUrl(a.picture, 320) };
-artistHits[arid] = (artistHits[arid] || 0) + 1;
-});
-if (t.streamReady === false || t.allowStreaming === false) continue;
-const tTitle = t.title || 'Unknown';
-const tArtist = trackArtist(t);
-cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
-tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: 'flac' });
-}
-
-const artistList = Object.keys(artistMap)
-.sort((a, b) => (artistRelevance(artistMap[b].name, q) * 100 + (artistHits[b] || 0)) - (artistRelevance(artistMap[a].name, q) * 100 + (artistHits[a] || 0)))
-.slice(0, 5).map(k => artistMap[k]);
-
-// ── Playlists from dedicated p= search + fallback embedded field ─────────────
-// The HiFi proxy calls TIDAL's top-hits?types=PLAYLISTS endpoint via GET /search/?p=query.
-// Response shape: { data: { playlists: { items: [...] } } }
-// Each playlist has: uuid, title, squareImage, image, creator, numberOfTracks
-const plData = plResult.status === 'fulfilled' ? (plResult.value || null) : null;
-const plFromSearch = plData?.data?.playlists?.items || plData?.data?.playlists
-  || plData?.playlists?.items || plData?.playlists || plData?.data?.items || plData?.items || [];
-// Also check if the main search response has a playlists field (some instances embed them)
-const plEmbedded = data?.data?.playlists?.items || data?.data?.playlists
-  || data?.playlists?.items || data?.playlists || [];
-
-const seenPlIds = new Set();
-const plItems = [];
-for (const p of [...(Array.isArray(plFromSearch) ? plFromSearch : []),
-                  ...(Array.isArray(plEmbedded)   ? plEmbedded   : [])]) {
-  if (!p) continue;
-  const pid = String(p.uuid || p.id || '');
-  // Only real TIDAL playlists — UUID format, never numeric track IDs
-  if (!pid || !isPlaylistUUID(pid) || seenPlIds.has(pid)) continue;
-  seenPlIds.add(pid);
-  plItems.push({
-    id: pid,
-    title: p.title || 'Playlist',
-    creator: p.creator?.name || (p.type === 'EDITORIAL' ? 'TIDAL' : undefined),
-    artworkURL: coverUrl(p.squareImage || p.image || p.cover, 1080),
-    trackCount: p.numberOfTracks || p.trackCount,
-  });
-  if (plItems.length >= 10) break;
-}
-
-const result = { tracks, albums: Object.values(albumMap).slice(0, 8), artists: artistList, playlists: plItems };
-  cSet(cacheKey, result, 300); // also cache in-memory for instant repeat hits
-  upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 300);
-return Response.json(result);
-} catch(e) {
-return Response.json({ error: 'Search failed: ' + e.message, tracks: [], albums: [], artists: [], playlists: [] }, { status: 502 });
-}
-});
-});
-
-// ─── Stream: Qobuz Hi-Res first, TIDAL fallback ────────────────────────────────
-app.get('/u/:token/stream/:id', async c => {
-return withToken(c, async entry => {
-const tid = c.req.param('id');
-const inst = entry.instanceUrl;
-const pref = entry.preferredQuality;
-
-return dedupeCall('stream:' + tid + ':' + (inst || 'pool'), async () => {
-
-// Step 1: title+artist from Eclipse query params (some clients send these)
-let qTitle = String(c.req.query('title') || '').trim();
-let qArtist = String(c.req.query('artist') || '').trim();
-
-// Step 2: look up from in-memory cache (populated at search time)
-let qIsrc = String(c.req.query('isrc') || '').trim() || null;
-if (!qTitle) {
-const mem = getCachedMeta(tid);
-if (mem) { qTitle = mem.title; qArtist = mem.artist; if (!qIsrc) qIsrc = mem.isrc || null; console.log('meta: hit in-memory cache for', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : ''); }
-}
-
-// Step 3: look up from Redis (survives across worker instances / restarts)
-if (!qTitle) {
-const redisMeta = await redisLoadTrackMeta(tid);
-if (redisMeta) { qTitle = redisMeta.title; qArtist = redisMeta.artist; if (!qIsrc) qIsrc = redisMeta.isrc || null; console.log('meta: hit Redis cache for', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : ''); }
-}
-
-if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid, '- skipping Qobuz');
-
-// Step 4: Qobuz Hi-Res — ISRC exact match first, title+artist fuzzy fallback
-if (qTitle || qIsrc) {
-try {
-const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
-if (qTrack && qTrack.id) {
-// Map stored pref key to Qobuz tier
-        const PREF_TO_QOBUZ_KEY = {
-          'HI_RES_LOSSLESS': 'HIMAX', 'HIRESLOSSLESS': 'HIMAX', 'HIMAX': 'HIMAX',
-          'HI96': 'HI96',
-          'LOSSLESS': 'LOSSLESS',
-          'HIGH': 'AAC320', 'AAC320': 'AAC320',
-          'LOW': 'AAC96',  'AAC96': 'AAC96',
-        };
-        const qobuzPrefKey = pref ? (PREF_TO_QOBUZ_KEY[pref] || null) : null;
-        const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
-if (qStream) {
-console.log('qobuz: HIT', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '->', qTrack.id, qStream.quality);
-return Response.json(qStream);
-}
-}
-console.log('qobuz: no match for', qIsrc ? 'ISRC:' + qIsrc : qTitle + ' by ' + qArtist, '- TIDAL fallback');
-} catch(e) {
-console.warn('qobuz: error', e.message);
-}
-}
-
-// Step 5: TIDAL fallback
-// Map any pref key to TIDAL's native quality tier
-    const PREF_TO_TIDAL = {
-      'HI_RES_LOSSLESS': 'HI_RES_LOSSLESS', 'HIRESLOSSLESS': 'HI_RES_LOSSLESS',
-      'HIMAX': 'HI_RES_LOSSLESS', 'HI96': 'HI_RES_LOSSLESS',
-      'LOSSLESS': 'LOSSLESS',
-      'HIGH': 'HIGH', 'AAC320': 'HIGH',
-      'LOW': 'LOW',   'AAC96': 'LOW',
-    };
-    const ALL_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
-    const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
-    const tidalStartTier = pref ? (PREF_TO_TIDAL[pref] || 'LOSSLESS') : null;
-    const qualities = tidalStartTier
-      ? [tidalStartTier, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(tidalStartTier))]
-      : AUTO_QUALITIES;
-
-for (let qi = 0; qi < qualities.length; qi++) {
-const ql = qualities[qi];
-try {
-const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
-const payload = data && data.data ? data.data : data;
-if (payload && payload.manifest) {
-const decoded = decodeManifest(payload.manifest);
-if (decoded && decoded.url) {
-const codec = (decoded.codec || '').toLowerCase();
-const isFlac = decoded.isDash || codec.includes('flac') || codec.includes('audio/flac');
-const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
-return Response.json({ url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
-}
-}
-if (payload && payload.url) {
-const looksLikeFlac = (payload.url || '').match(/\.flac(\?|$)/i);
-const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
-const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
-return Response.json({ url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) });
-}
-} catch(e) {
-if (qi === qualities.length - 1) return Response.json({ error: 'Could not get stream URL for track ' + tid + ': ' + e.message }, { status: 502 });
-}
-}
-
-return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
-}); // end dedupeCall
-
-});
-});
-
-// ─── Album ────────────────────────────────────────────────────────────────────
-app.get('/u/:token/album/:id', async c => {
-return withToken(c, async entry => {
-const aid = c.req.param('id');
-const inst = entry.instanceUrl;
-try {
-  const data = await hifiGetForToken(inst, '/album', { id: aid, limit: 100, offset: 0 });
-  // Unwrap all known HiFi API response shapes
-  const album = data?.data?.id ? data.data
-    : data?.data?.album?.id ? data.data.album
-    : data?.album?.id ? data.album
-    : data?.id ? data
-    : data?.data ? data.data
-    : data;
-  // Collect track items — handle every nesting shape the API might return
-  let rawItems = album?.items
-    || album?.tracks?.items
-    || album?.tracks
-    || data?.items
-    || data?.tracks?.items
-    || [];
-  if (!Array.isArray(rawItems)) rawItems = [];
-  const artistName = album?.artist?.name
-    || album?.artists?.map(a => a.name).join(', ')
-    || 'Unknown';
-  const cover = album?.cover || album?.image || album?.artwork;
-  const tracks = rawItems.map((item, i) => {
-    const t = item?.item || item;
-    // Don't hard-filter on streamReady — TIDAL sometimes incorrectly marks playable tracks false
-    if (!t || !t.id) return null;
-    const tTitle = t.title || 'Unknown';
-    const tArtist = trackArtist(t) || artistName;
-    cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-    redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
-    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover, 1080) };
-  }).filter(Boolean);
-  return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: coverUrl(cover, 1080), year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
-} catch(e) {
-  return Response.json({ error: 'Album fetch failed: ' + e.message }, { status: 502 });
-}
-});
-});
-
-// ─── Artist ───────────────────────────────────────────────────────────────────
-app.get('/u/:token/artist/:id', async c => {
-  return withToken(c, async entry => {
-    const aid = parseInt(c.req.param('id'), 10);
-    const inst = entry.instanceUrl;
-    if (isNaN(aid)) return Response.json({ error: 'Invalid artist ID' }, { status: 400 });
-
-    // Pick the active base URL (custom instance or pool)
-    const base = inst || activeInstance;
-
-    try {
-      // ── Step 1: Fire ALL known endpoints in parallel ─────────────────────────
-      // Different HiFi instances expose different endpoint shapes/paths.
-      // We fire them all at once and merge — zero extra latency vs. sequential.
-      const [
-        infoRes,       // GET /artist/?id=   — basic artist info
-        discRes,       // GET /artist/?f=&skip_tracks=false  — full discography (albums+tracks)
-        disc2Res,      // GET /artist/discography/?id=  — alternate discography endpoint
-        topRes,        // GET /artist/toptracks/?id=
-        albRes,        // GET /artist/albums/?id=  — no filter (returns whatever default is)
-        albAlbumsRes,  // GET /artist/albums/?id=&filter=ALBUMS
-        albEpsRes,     // GET /artist/albums/?id=&filter=EPSSINGLES
-        albCompRes,    // GET /artist/albums/?id=&filter=COMPILATIONS
-        albAltRes,     // GET /artist/albums/?artistId=  — some instances use artistId param
-        searchRes,     // GET /search/?s=artistName  — fallback
-      ] = await Promise.allSettled([
-        axios.get(base + '/artist/',         { params: { id: aid },                                    headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
-        axios.get(base + '/artist/',         { params: { f: aid, skip_tracks: false },                 headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
-        axios.get(base + '/artist/discography/', { params: { id: aid, limit: 100 },                   headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
-        axios.get(base + '/artist/toptracks/', { params: { id: aid, limit: 30 },                      headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
-        axios.get(base + '/artist/albums/',  { params: { id: aid, limit: 100, offset: 0 },            headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
-        axios.get(base + '/artist/albums/',  { params: { id: aid, filter: 'ALBUMS',       limit: 100 }, headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
-        axios.get(base + '/artist/albums/',  { params: { id: aid, filter: 'EPSSINGLES',   limit: 100 }, headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
-        axios.get(base + '/artist/albums/',  { params: { id: aid, filter: 'COMPILATIONS', limit: 100 }, headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
-        axios.get(base + '/artist/albums/',  { params: { artistId: aid, limit: 100 },                 headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 }),
-        // search result deferred — we need artistName first, filled below if needed
-        Promise.resolve(null),
-      ]);
-
-      // ── Step 2: Extract artist info ──────────────────────────────────────────
-      const extractData = r => {
-        if (!r || r.status !== 'fulfilled' || !r.value) return {};
-        return r.value.data?.data || r.value.data || {};
-      };
-
-      let artistInfo = {};
-      const infoD = extractData(infoRes);
-      if      (infoD.artist?.id)   artistInfo = infoD.artist;
-      else if (infoD.id && infoD.name) artistInfo = infoD;
-      // Fallback: disc response often has artist embedded
-      if (!artistInfo.name) {
-        const discD = extractData(discRes);
-        if      (discD.artist?.id)    artistInfo = discD.artist;
-        else if (discD.id && discD.name) artistInfo = discD;
-      }
-      if (!artistInfo.name) {
-        const disc2D = extractData(disc2Res);
-        if      (disc2D.artist?.id)     artistInfo = disc2D.artist;
-        else if (disc2D.id && disc2D.name) artistInfo = disc2D;
-      }
-
-      const artistName = artistInfo.name || 'Unknown';
-      const coverData  = infoD.cover;
-      const artworkURL = coverData
-        ? (coverData[750] || coverData[480] || coverData[320])
-        : coverUrl(artistInfo.picture, 480);
-
-      // ── Step 3: Merge albums from every source ────────────────────────────────
-      const albumMap = {};
-      const addAlbums = arr => {
-        for (const a of (Array.isArray(arr) ? arr : [])) {
-          if (!a?.id) continue;
-          albumMap[String(a.id)] = albumMap[String(a.id)] || a;
-        }
-      };
-      const extractAlbums = r => {
-        const d = extractData(r);
-        if (Array.isArray(d))               return d;
-        if (Array.isArray(d.albums))        return d.albums;
-        if (Array.isArray(d.albums?.items)) return d.albums.items;
-        if (Array.isArray(d.items))         return d.items;
-        return [];
-      };
-      const extractTracks = r => {
-        const d = extractData(r);
-        if (Array.isArray(d.tracks))        return d.tracks;
-        if (Array.isArray(d.tracks?.items)) return d.tracks.items;
-        if (Array.isArray(d.items))         return d.items;
-        if (Array.isArray(d))               return d;
-        return [];
-      };
-
-      // Albums from discography endpoints
-      addAlbums(extractAlbums(discRes));
-      addAlbums(extractAlbums(disc2Res));
-      addAlbums(extractAlbums(infoRes));
-
-      // Albums from per-type album endpoints
-      for (const r of [albRes, albAlbumsRes, albEpsRes, albCompRes, albAltRes]) {
-        addAlbums(extractAlbums(r));
-      }
-
-      // If any per-type page came back full (100), fetch page 2
-      const albumTypeParams = [
-        { filter: undefined },
-        { filter: 'ALBUMS' },
-        { filter: 'EPSSINGLES' },
-        { filter: 'COMPILATIONS' },
-      ];
-      const page2Fetches = [];
-      const typeResults  = [albRes, albAlbumsRes, albEpsRes, albCompRes];
-      for (let i = 0; i < typeResults.length; i++) {
-        const r = typeResults[i];
-        if (r.status !== 'fulfilled') continue;
-        const page1 = extractAlbums(r);
-        if (page1.length >= 100) {
-          const p = { id: aid, limit: 100, offset: 100 };
-          if (albumTypeParams[i].filter) p.filter = albumTypeParams[i].filter;
-          page2Fetches.push(
-            axios.get(base + '/artist/albums/', { params: p, headers: { 'User-Agent': UA, Accept: 'application/json' }, timeout: 12000 })
-              .then(r2 => { addAlbums(extractAlbums({ status: 'fulfilled', value: r2 })); })
-              .catch(() => {})
-          );
-        }
-      }
-      if (page2Fetches.length) await Promise.allSettled(page2Fetches);
-
-      // ── Step 4: Search fallback if albums still empty ────────────────────────
-      const trackMap = {};
-      const addTracks = arr => {
-        for (const t of (Array.isArray(arr) ? arr : [])) {
-          if (!t?.id) continue;
-          trackMap[String(t.id)] = trackMap[String(t.id)] || t;
-        }
-      };
-
-      // Tracks from discography
-      addTracks(extractTracks(discRes));
-      addTracks(extractTracks(disc2Res));
-      // Tracks from toptracks
-      addTracks(extractTracks(topRes));
-
-      // Search fallback — always run to supplement tracks; albums only if still empty
-      try {
-        const sr = await axios.get(base + '/search/', {
-          params: { s: artistName, limit: 50 },
-          headers: { 'User-Agent': UA, Accept: 'application/json' },
-          timeout: 12000,
-        });
-        const sItems = sr.data?.data?.items || sr.data?.items || [];
-        const want   = artistName.toLowerCase();
-        const isMain = t => {
-          const arts = t.artists || (t.artist ? [t.artist] : []);
-          if (!arts.length) return false;
-          const mains = arts.filter(a => !a.type || a.type === 'MAIN');
-          return (mains.length ? mains : [arts[0]]).some(a => {
-            const n = (a.name || '').toLowerCase();
-            return n === want || n.includes(want) || want.includes(n);
-          });
-        };
-        for (const t of sItems) {
-          if (!t?.id) continue;
-          const ar = trackArtist(t).toLowerCase();
-          if (ar.includes(want) || want.includes(ar)) addTracks([t]);
-          if (t.album?.id && isMain(t)) {
-            const alId = String(t.album.id);
-            albumMap[alId] = albumMap[alId] || {
-              id: t.album.id, title: t.album.title, cover: t.album.cover,
-              releaseDate: t.album.releaseDate, numberOfTracks: t.album.numberOfTracks,
-            };
-          }
-        }
-      } catch(_) {}
-
-      // ── Step 5: Build topTracks ───────────────────────────────────────────────
-      const seenTrackIds = new Set();
-      const topTracks = Object.values(trackMap)
-        .filter(t => {
-          if (!t?.id || t.allowStreaming === false) return false;
-          const k = String(t.id);
-          if (seenTrackIds.has(k)) return false;
-          seenTrackIds.add(k);
-          return true;
-        })
-        .sort((a, b) => (b.popularity || 0) - (a.popularity || 0))
-        .slice(0, 20)
-        .map(t => {
-          const tTitle  = t.title || 'Unknown';
-          const tArtist = trackArtist(t) || artistName;
-          cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-          redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
-          return {
-            id: String(t.id), title: tTitle, artist: tArtist,
-            duration: trackDuration(t),
-            artworkURL: coverUrl(t.album?.cover || t.album?.image || t.album?.artwork, 1080),
-          };
-        });
-
-      // ── Step 6: Build albums ──────────────────────────────────────────────────
-      const albums = Object.values(albumMap)
-        .sort((a, b) => {
-          const ya = a.releaseDate ? parseInt(String(a.releaseDate).slice(0, 4), 10) : 0;
-          const yb = b.releaseDate ? parseInt(String(b.releaseDate).slice(0, 4), 10) : 0;
-          if (yb !== ya) return yb - ya;
-          return (b.releaseDate || '').localeCompare(a.releaseDate || '');
-        })
-        .map(al => ({
-          id: String(al.id), title: al.title || 'Unknown', artist: artistName,
-          artworkURL: coverUrl(al.cover || al.image || al.artwork, 1080),
-          trackCount: al.numberOfTracks,
-          year: al.releaseDate ? String(al.releaseDate).slice(0, 4) : undefined,
-        }));
-
-      return Response.json({
-        id: String(artistInfo.id || aid), name: artistName,
-        artworkURL, bio: null, topTracks, albums,
-      });
-    } catch(e) {
-      return Response.json({ error: 'Artist fetch failed: ' + e.message }, { status: 502 });
-    }
-  });
-});
-
-// ─── Playlist ─────────────────────────────────────────────────────────────────
-app.get('/u/:token/playlist/:id', async c => {
-return withToken(c, async entry => {
-const pid = c.req.param('id');
-const inst = entry.instanceUrl;
-if (!isPlaylistUUID(pid)) return Response.json({ error: 'Invalid playlist ID. TIDAL playlist IDs must be UUIDs.' }, { status: 404 });
-try {
-const data = await hifiGetForToken(inst, '/playlist', { id: pid, limit: 100, offset: 0 });
-let pl = null, rawItems = [];
-if (data.playlist?.uuid || data.playlist?.id) { pl = data.playlist; rawItems = data.items || data.playlist.items || []; }
-else if (data.data?.playlist) { pl = data.data.playlist; rawItems = data.data.items || data.items || []; }
-else if (data.uuid || data.title) { pl = data; rawItems = data.items || []; }
-else if (data.data?.uuid || data.data?.title) { pl = data.data; rawItems = data.data.items || data.items || []; }
-else { pl = data; rawItems = data.items || []; }
-const tracks = rawItems.map(item => {
-const t = item.item || item;
-if (!t || !t.id || t.streamReady === false) return null;
-const tTitle = t.title || 'Unknown';
-const tArtist = trackArtist(t);
-cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
-return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover, 1080) };
-}).filter(Boolean);
-return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, artworkURL: (pl?.squareImage || pl?.image) ? coverUrl(pl.squareImage || pl.image, 1080) : undefined, trackCount: pl?.numberOfTracks || tracks.length, tracks });
-} catch(e) {
-return Response.json({ error: 'Playlist fetch failed: ' + e.message }, { status: 502 });
-}
-});
-});
-
-
-// ─── Claudochrome 8SPINE Module Code ─────────────────────────────────────────
-// Loaded by 8SPINE via: const createModule = new Function(code); createModule();
-// Must end with a top-level `return { id, ... }` — no IIFE wrapper.
-// __BASE_URL__ replaced at serve-time with the actual deployment URL.
-// All vars are prefixed _spine* to avoid any naming collision with Eclipse routes.
-const CLAUDOCHROME_SPINE_MODULE_CODE = `
-var _spineBaseUrl = '__BASE_URL__';
-var _spineToken = null;
-
-// Eager pre-fetch: fires the moment 8SPINE loads this module.
-// Token is ready before the user taps search — eliminates cold-start delay.
-var _spineTokenPromise = fetch(_spineBaseUrl + '/generate', {
-  method: 'POST',
-  headers: { 'Content-Type': 'application/json' },
-  body: JSON.stringify({})
-}).then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-  .then(function(d) { _spineToken = d.token || null; return _spineToken; })
-  .catch(function() { return null; });
-
-function _spineEnsureToken() {
-  if (_spineToken) return Promise.resolve(_spineToken);
-  return _spineTokenPromise;
-}
-
-function _spineFetch(path, params) {
-  var qs = '';
-  if (params) {
-    var keys = Object.keys(params);
-    if (keys.length) {
-      qs = '?' + keys.map(function(k) {
-        return encodeURIComponent(k) + '=' + encodeURIComponent(params[k]);
-      }).join('&');
-    }
-  }
-  return fetch(_spineBaseUrl + path + qs, { headers: { 'Accept': 'application/json' } })
-    .then(function(r) { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); });
-}
-
-async function _spineSearchTracks(query, limit) {
-  var lim = limit || 20;
-  var token = await _spineEnsureToken();
-  if (!token) return { tracks: [], total: 0 };
-  return _spineFetch('/u/' + token + '/search', { q: query, limit: lim })
-    .then(function(data) {
-      var tracks = (data.tracks || []).map(function(t) {
-        return {
-          id: token + '__' + t.id,
-          title: t.title || 'Unknown',
-          artist: t.artist || 'Unknown',
-          album: t.album || '',
-          duration: t.duration || 0,
-          albumCover: t.artworkURL || ''
-        };
-      });
-      return { tracks: tracks, total: tracks.length };
-    }).catch(function() { return { tracks: [], total: 0 }; });
-}
-
-async function _spineGetTrackStreamUrl(trackId, quality) {
-  var sep = trackId.indexOf('__');
-  if (sep === -1) return { streamUrl: null, track: { id: trackId, audioQuality: 'HIGH' } };
-  var token = trackId.slice(0, sep);
-  var tidalId = trackId.slice(sep + 2);
-  return _spineFetch('/u/' + token + '/stream/' + encodeURIComponent(tidalId), {})
-    .then(function(data) {
-      var aq = (data.quality === 'hires' || data.quality === 'lossless') ? 'LOSSLESS' : 'HIGH';
-      return { streamUrl: data.url || data.streamUrl || null, track: { id: trackId, audioQuality: aq } };
-    }).catch(function() {
-      return { streamUrl: null, track: { id: trackId, audioQuality: 'HIGH' } };
-    });
-}
-
-async function _spineGetAlbum(albumId) {
-  var token = await _spineEnsureToken();
-  if (!token) return { album: null, tracks: [] };
-  var sep = albumId.indexOf('__');
-  var tok = sep !== -1 ? albumId.slice(0, sep) : token;
-  var aid = sep !== -1 ? albumId.slice(sep + 2) : albumId;
-  return _spineFetch('/u/' + tok + '/album/' + encodeURIComponent(aid), {})
-    .then(function(data) {
-      var tracks = (data.tracks || []).map(function(t) {
-        return {
-          id: tok + '__' + t.id,
-          title: t.title || 'Unknown',
-          artist: t.artist || data.artist || 'Unknown',
-          album: data.title || '',
-          duration: t.duration || 0,
-          albumCover: t.artworkURL || data.artworkURL || ''
-        };
-      });
-      return {
-        album: { id: albumId, title: data.title || 'Unknown', artist: data.artist || 'Unknown', cover: data.artworkURL || '', year: data.year || '' },
-        tracks: tracks
-      };
-    }).catch(function() { return { album: null, tracks: [] }; });
-}
-
-async function _spineGetArtist(artistId) {
-  var token = await _spineEnsureToken();
-  if (!token) return { artist: null, tracks: [], albums: [] };
-  var sep = artistId.indexOf('__');
-  var tok = sep !== -1 ? artistId.slice(0, sep) : token;
-  var aid = sep !== -1 ? artistId.slice(sep + 2) : artistId;
-  return _spineFetch('/u/' + tok + '/artist/' + encodeURIComponent(aid), {})
-    .then(function(data) {
-      var topTracks = (data.topTracks || []).map(function(t) {
-        return { id: tok + '__' + t.id, title: t.title || 'Unknown', artist: t.artist || data.name || 'Unknown', album: '', duration: t.duration || 0, albumCover: t.artworkURL || data.artworkURL || '' };
-      });
-      var albums = (data.albums || []).map(function(a) {
-        return { id: tok + '__' + a.id, title: a.title || 'Unknown', artist: a.artist || data.name || 'Unknown', cover: a.artworkURL || '', year: a.year || '' };
-      });
-      return {
-        artist: { id: artistId, name: data.name || 'Unknown', cover: data.artworkURL || '', bio: data.bio || null },
-        tracks: topTracks,
-        albums: albums
-      };
-    }).catch(function() { return { artist: null, tracks: [], albums: [] }; });
-}
-
-// ─── Module export — top-level return required by 8SPINE Module Manager ───────
-return {
-  id: 'claudochrome-tidal',
-  name: 'Claudochrome',
-  version: '2.3.0',
-  labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
-  searchTracks: _spineSearchTracks,
-  getTrackStreamUrl: _spineGetTrackStreamUrl,
-  getAlbum: _spineGetAlbum,
-  getArtist: _spineGetArtist
-};
-`;
-
-// ─── Helper: inject runtime base URL into module code ────────────────────────
-function buildClaudochromeSpineJs(baseUrl) {
-  return CLAUDOCHROME_SPINE_MODULE_CODE.replace(/__BASE_URL__/g, baseUrl);
-}
-
-// ─── 8SPINE: module info ──────────────────────────────────────────────────────
-app.get('/8spine', async c => {
-  const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
+  const token  = c.req.param('token');
+  const redis  = getRedis(c.env);
+  let stored   = await loadToken(redis, token);
+  if (!stored) { stored = { quality: 'HIRES', createdAt: Date.now() }; await saveToken(redis, token, stored); }
   return c.json({
-    id: 'claudochrome-tidal',
-    name: 'Claudochrome',
-    author: 'Ricky',
-    version: '2.3.0',
-    description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
-    download: base + '/8spine.js'
+    id:          'com.jacobyz211.qobuz-tidal-eclipse.' + token.slice(0,8),
+    name:        'Qobuz + Tidal',
+    version:     '1.4.0',
+    description: 'Qobuz FLAC streams with ISRC scoring & Tidal HiFi fallback. Tracks, Albums, Artists, Playlists.',
+    icon:        'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9c/Qobuz_logo.svg/320px-Qobuz_logo.svg.png',
+    resources:   ['search', 'stream', 'catalog'],
+    types:       ['track', 'album', 'artist', 'playlist'],
+    settings: {
+      quality: {
+        type: 'selector', label: 'Qobuz Audio Quality',
+        options: [
+          { label: 'MP3 320kbps',                value: 'MP3'      },
+          { label: 'CD \u2014 FLAC 16-bit/44.1kHz',   value: 'CD'       },
+          { label: 'Hi-Res \u2014 24-bit/96kHz',      value: 'HIRES_96' },
+          { label: 'Hi-Res Max \u2014 24-bit/192kHz', value: 'HIRES'    },
+        ],
+        defaultValue: stored.quality || 'HIRES',
+      },
+      tidalQuality: {
+        type: 'selector', label: 'Tidal Proxy Quality',
+        options: [
+          { label: 'High (AAC 320kbps)', value: 'HIGH' },
+          { label: 'Low',                value: 'LOW'  },
+        ],
+        defaultValue: 'HIGH',
+      },
+    },
   });
 });
 
-// ─── 8SPINE: serve module JS ──────────────────────────────────────────────────
-app.get('/8spine.js', async c => {
-  const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
-  return new Response(buildClaudochromeSpineJs(base), {
-    headers: { 'Content-Type': 'application/javascript; charset=utf-8' }
+app.get('/u/:token/search', async c => {
+  const token  = c.req.param('token');
+  const q      = (c.req.query('q') || '').trim();
+  if (!q) return c.json({ tracks: [], albums: [], artists: [], playlists: [] });
+  const redis   = getRedis(c.env);
+  const stored  = await loadToken(redis, token) || { quality: 'HIRES' };
+  const context = { env: c.env, redis, settings: { quality: { value: stored.quality }, tidalQuality: { value: 'HIGH' } } };
+  const [tr, al, ar, pl] = await Promise.allSettled([
+    searchTracks(q,    20, context),
+    searchAlbums(q,    10, context),
+    searchArtists(q,    8, context),
+    searchPlaylists(q,  6, context),
+  ]);
+  return c.json({
+    tracks:    tr.status==='fulfilled' ? tr.value.tracks    : [],
+    albums:    al.status==='fulfilled' ? al.value.albums    : [],
+    artists:   ar.status==='fulfilled' ? ar.value.artists   : [],
+    playlists: pl.status==='fulfilled' ? pl.value.playlists : [],
   });
 });
 
-// ─── 8SPINE: source list — merges Claudochrome + any extra source URLs ────────
-// Add more 8spine-source.json URLs to EXTRA_SPINE_SOURCES to include them.
-const EXTRA_SPINE_SOURCES = [
-  'https://all-in-one.rickyaddons.dpdns.org/8spine-source.json'
-];
-
-app.get('/8spine-source.json', async c => {
-  const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
-
-  const ourEntry = {
-    id: 'claudochrome-tidal',
-    name: 'Claudochrome',
-    author: 'Ricky',
-    version: '2.3.0',
-    description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
-    labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
-    download: base + '/8spine.js'
-  };
-
-  const merged = { 'category:music': [ourEntry] };
-
-  const results = await Promise.all(
-    EXTRA_SPINE_SOURCES.map(url =>
-      fetch(url, { headers: { 'Accept': 'application/json' } })
-        .then(r => { if (!r.ok) throw new Error('HTTP ' + r.status); return r.json(); })
-        .catch(() => null)
-    )
-  );
-
-  for (const ext of results) {
-    if (!ext || typeof ext !== 'object') continue;
-    for (const cat of Object.keys(ext)) {
-      const items = ext[cat];
-      if (!Array.isArray(items)) continue;
-      if (!merged[cat]) merged[cat] = [];
-      for (const item of items) {
-        if (!merged[cat].find(e => e.id === item.id)) merged[cat].push(item);
-      }
-    }
-  }
-
-  return c.json(merged);
+app.get('/u/:token/stream/:id', async c => {
+  const token  = c.req.param('token');
+  const redis  = getRedis(c.env);
+  const stored = await loadToken(redis, token) || { quality: 'HIRES' };
+  try {
+    const result = await getTrackStreamUrl(c.req.param('id'), stored.quality, { env:c.env, redis, settings:{ quality:{value:stored.quality}, tidalQuality:{value:'HIGH'} } });
+    return c.json(result);
+  } catch (e) { return c.json({ error: e.message }, 500); }
 });
 
+app.get('/u/:token/album/:id', async c => {
+  const token  = c.req.param('token');
+  const redis  = getRedis(c.env);
+  const stored = await loadToken(redis, token) || { quality: 'HIRES' };
+  try {
+    const data = await getAlbum(c.req.param('id'), { env:c.env, redis, settings:{ quality:{value:stored.quality}, tidalQuality:{value:'HIGH'} } });
+    return c.json(data);
+  } catch (e) { return c.json({ error: e.message }, 500); }
+});
+
+app.get('/u/:token/artist/:id', async c => {
+  const token  = c.req.param('token');
+  const redis  = getRedis(c.env);
+  const stored = await loadToken(redis, token) || { quality: 'HIRES' };
+  try {
+    const data = await getArtist(c.req.param('id'), { env:c.env, redis, settings:{ quality:{value:stored.quality}, tidalQuality:{value:'HIGH'} } });
+    return c.json(data);
+  } catch (e) { return c.json({ error: e.message }, 500); }
+});
+
+app.get('/u/:token/playlist/:id', async c => {
+  const token  = c.req.param('token');
+  const redis  = getRedis(c.env);
+  const stored = await loadToken(redis, token) || { quality: 'HIRES' };
+  try {
+    const data = await getPlaylist(c.req.param('id'), { env:c.env, redis, settings:{ quality:{value:stored.quality} } });
+    return c.json(data);
+  } catch (e) { return c.json({ error: e.message }, 500); }
+});
+
+// Legacy flat routes
+app.get('/manifest.json', c => c.json({
+  id:'com.jacobyz211.qobuz-tidal-eclipse', name:'Qobuz + Tidal', version:'1.4.0',
+  description:'Qobuz FLAC streams with ISRC scoring & Tidal HiFi fallback',
+  icon:'https://upload.wikimedia.org/wikipedia/commons/thumb/9/9c/Qobuz_logo.svg/320px-Qobuz_logo.svg.png',
+  resources:['search','stream','catalog'], types:['track','album','artist','playlist'],
+}));
+
+app.get('/search', async c => {
+  const q = (c.req.query('q')||'').trim();
+  if (!q) return c.json({ tracks:[], albums:[], artists:[], playlists:[] });
+  const redis = getRedis(c.env);
+  const context = { env:c.env, redis };
+  const [tr,al,ar,pl] = await Promise.allSettled([searchTracks(q,20,context),searchAlbums(q,10,context),searchArtists(q,8,context),searchPlaylists(q,6,context)]);
+  return c.json({ tracks:tr.status==='fulfilled'?tr.value.tracks:[], albums:al.status==='fulfilled'?al.value.albums:[], artists:ar.status==='fulfilled'?ar.value.artists:[], playlists:pl.status==='fulfilled'?pl.value.playlists:[] });
+});
+
+app.get('/stream/:id', async c => {
+  const redis = getRedis(c.env);
+  try { return c.json(await getTrackStreamUrl(c.req.param('id'), c.req.query('quality')||'HIRES', { env:c.env, redis })); }
+  catch (e) { return c.json({ error: e.message }, 500); }
+});
+app.get('/album/:id', async c => {
+  const redis = getRedis(c.env);
+  try { return c.json(await getAlbum(c.req.param('id'), { env:c.env, redis })); }
+  catch (e) { return c.json({ error: e.message }, 500); }
+});
+app.get('/artist/:id', async c => {
+  const redis = getRedis(c.env);
+  try { return c.json(await getArtist(c.req.param('id'), { env:c.env, redis })); }
+  catch (e) { return c.json({ error: e.message }, 500); }
+});
+app.get('/playlist/:id', async c => {
+  const redis = getRedis(c.env);
+  try { return c.json(await getPlaylist(c.req.param('id'), { env:c.env, redis })); }
+  catch (e) { return c.json({ error: e.message }, 500); }
+});
+
+app.get('/health', async c => {
+  const redis    = getRedis(c.env);
+  const qobuzInst = await getWorkingQobuzInstance(redis).catch(()=>null);
+  const hifiInst  = await getWorkingHiFiInstance(DEFAULT_HIFI_INSTANCES, redis).catch(()=>null);
+  return c.json({ status:(!!qobuzInst||!!hifiInst)?'ok':'degraded', qobuz:!!qobuzInst, hifi:!!hifiInst, redis:redis!==null, version:'1.4.0' });
+});
 
 export default app;
