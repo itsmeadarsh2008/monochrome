@@ -609,7 +609,8 @@ createdAt: entry.createdAt,
 lastUsed: entry.lastUsed,
 reqCount: entry.reqCount || 0,
 instanceUrl: entry.instanceUrl || null,
-preferredQuality: entry.preferredQuality || null
+preferredQuality: entry.preferredQuality || null,
+addonName: entry.addonName || null,
 }), 'EX', 2592000);
 }
 
@@ -623,7 +624,8 @@ createdAt: p.createdAt || Date.now(),
 lastUsed: p.lastUsed || Date.now(),
 reqCount: p.reqCount || 0,
 instanceUrl: p.instanceUrl || null,
-preferredQuality: p.preferredQuality || null
+preferredQuality: p.preferredQuality || null,
+addonName: p.addonName || null,
 };
 } catch(e) { return null; }
 }
@@ -646,12 +648,12 @@ async function getTokenEntry(token) {
 if (TOKEN_CACHE.has(token)) return TOKEN_CACHE.get(token);
 var saved = await redisLoad(token);
 if (saved) {
-var entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, instanceUrl: saved.instanceUrl || null, preferredQuality: saved.preferredQuality || null, rateWin: [] };
+var entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, instanceUrl: saved.instanceUrl || null, preferredQuality: saved.preferredQuality || null, addonName: saved.addonName || null, rateWin: [] };
 TOKEN_CACHE.set(token, entry);
 return entry;
 }
 if (/^[a-f0-9]{28}$/.test(token)) {
-var fresh = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl: null, preferredQuality: null };
+var fresh = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl: null, preferredQuality: null, addonName: null };
 TOKEN_CACHE.set(token, fresh);
 return fresh;
 }
@@ -680,13 +682,12 @@ return handler(entry);
 }
 
 function parseTokenParam(rawParam) {
-const tilde = rawParam.indexOf('~');
-if (tilde === -1) return { token: rawParam, embeddedInstance: null };
-const token = rawParam.slice(0, tilde);
-try {
-const embeddedInstance = Buffer.from(rawParam.slice(tilde + 1), 'base64url').toString('utf8');
-return { token, embeddedInstance };
-} catch(e) { return { token, embeddedInstance: null }; }
+const parts = rawParam.split('~');
+const token = parts[0];
+let embeddedInstance = null, embeddedName = null;
+try { if (parts[1]) embeddedInstance = Buffer.from(parts[1], 'base64url').toString('utf8'); } catch(e) {}
+try { if (parts[2]) embeddedName = decodeURIComponent(Buffer.from(parts[2], 'base64url').toString('utf8')).slice(0, 40); } catch(e) {}
+return { token, embeddedInstance, embeddedName };
 }
 
 // ─── Config page ──────────────────────────────────────────────────────────────
@@ -780,6 +781,9 @@ h += '</div>';
 
 h += '<div class="hint" id="qlHint" style="margin-top:8px">No preference &mdash; auto-selects: Qobuz Hi-Res &rarr; TIDAL Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
 
+h += '<div class="lbl">Addon Name <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
+h += '<input type="text" id="customAddonName" placeholder="Claudochrome" maxlength="40">';
+h += '<div class="hint">Customize the name shown in Eclipse\'s connections list. Leave blank to keep the previous name.</div>';
 h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
 
 // Generate result box — styled like QTE screenshot
@@ -867,9 +871,11 @@ h += 'function generate(){';
 h += '  var btn=document.getElementById("genBtn");';
 h += '  btn.disabled=true;btn.textContent="Generating...";';
 h += '  var ci=document.getElementById("customInstance").value.trim();';
+h += '  var an=document.getElementById("customAddonName").value.trim();';
 h += '  while(ci.length&&ci[ci.length-1]==="/")ci=ci.slice(0,-1);';
 h += '  var body={};';
 h += '  if(ci)body.instanceUrl=ci;';
+h += '  if(an)body.addonName=an;';
 h += '  if(selQ)body.preferredQuality=selQ;';
 h += '  fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})';
 h += '  .then(function(r){return r.json();})';
@@ -940,13 +946,18 @@ await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, time
 const VALID_QUALITIES = ['HI_RES_LOSSLESS','HIRESLOSSLESS','HIMAX','HI96','LOSSLESS','HIGH','AAC320','LOW','AAC96','TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW'];
 const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
 const token = generateToken();
-const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality };
+const addonName = (body && body.addonName && String(body.addonName).trim()) ? String(body.addonName).trim().slice(0, 40) : null;
+const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality, addonName };
 TOKEN_CACHE.set(token, entry);
 await redisSave(token, entry);
 bucket.count++;
 const baseUrl = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
-const tokenSegment = instanceUrl ? token + '~' + Buffer.from(instanceUrl).toString('base64url') : token;
-return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json', usingCustomInstance: !!instanceUrl, preferredQuality });
+let tokenSegment = instanceUrl ? token + '~' + Buffer.from(instanceUrl).toString('base64url') : token;
+if (addonName) {
+  if (!instanceUrl) tokenSegment += '~';
+  tokenSegment += '~' + Buffer.from(encodeURIComponent(addonName)).toString('base64url');
+}
+return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json', usingCustomInstance: !!instanceUrl, preferredQuality, addonName });
 });
 
 app.post('/refresh', async c => {
@@ -1006,7 +1017,7 @@ const rawParam = c.req.param('token');
 const { token } = parseTokenParam(rawParam);
 return Response.json({
 id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
-name: 'Claudochrome',
+name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudochrome'; })(),
 version: '2.3.0',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
@@ -1061,7 +1072,7 @@ if (!albumMap[abid]) albumMap[abid] = { id: abid, title: t.album.title || 'Unkno
 (t.artists || (t.artist ? [t.artist] : [])).forEach(a => {
 if (!a || !a.id) return;
 const arid = String(a.id);
-if (!artistMap[arid]) artistMap[arid] = { id: arid, name: a.name || 'Unknown', artworkURL: coverUrl(a.picture, 320) };
+if (!artistMap[arid]) artistMap[arid] = { id: arid, name: a.name || 'Unknown', artworkURL: coverUrl(a.picture, 320), ...(a.genres && a.genres.length ? { genres: a.genres.map(g => g.name || g).filter(Boolean) } : {}) };
 artistHits[arid] = (artistHits[arid] || 0) + 1;
 });
 if (t.streamReady === false || t.allowStreaming === false) continue;
@@ -1071,7 +1082,8 @@ cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
 redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
 // Background Qobuz pre-warm — no await, result cached so stream is instant
 qobuzFindBestTrack(tTitle, tArtist, t.isrc || null, inst).catch(() => {});
-tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: 'flac' });
+const _cachedStream = cGet('tstream:' + String(t.id) + ':' + (entry.preferredQuality || 'auto'));
+tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: _cachedStream ? (_cachedStream.format || 'flac') : 'flac', ...(_cachedStream ? { streamURL: _cachedStream.url } : {}) });
 }
 
 const artistList = Object.keys(artistMap)
@@ -1233,8 +1245,14 @@ const tidalPromise = (async () => {
 // Race: return Qobuz if it wins with a result, otherwise TIDAL, otherwise error.
 const [qResult, tResult] = await Promise.all([qobuzPromise, tidalPromise]);
 
-if (qResult) return Response.json(qResult);
-if (tResult) return Response.json(tResult);
+if (qResult) {
+  cSet('tstream:' + tid + ':' + (pref || 'auto'), qResult, 1680);
+  return Response.json(qResult);
+}
+if (tResult) {
+  cSet('tstream:' + tid + ':' + (pref || 'auto'), tResult, 1680);
+  return Response.json(tResult);
+}
 return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
 }); // end dedupeCall
 
@@ -1497,9 +1515,13 @@ app.get('/u/:token/artist/:id', async c => {
           year: al.releaseDate ? String(al.releaseDate).slice(0, 4) : undefined,
         }));
 
+      const artistGenres = (artistInfo.genres && artistInfo.genres.length)
+        ? artistInfo.genres.map(g => g.name || g).filter(Boolean)
+        : undefined;
       return Response.json({
         id: String(artistInfo.id || aid), name: artistName,
         artworkURL, bio: null, topTracks, albums,
+        ...(artistGenres ? { genres: artistGenres } : {}),
       });
     } catch(e) {
       return Response.json({ error: 'Artist fetch failed: ' + e.message }, { status: 502 });
