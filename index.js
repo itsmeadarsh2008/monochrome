@@ -947,14 +947,15 @@ await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, time
 const VALID_QUALITIES = ['HI_RES_LOSSLESS','HIRESLOSSLESS','HIMAX','HI96','LOSSLESS','HIGH','AAC320','LOW','AAC96','TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW'];
 const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
 const token = generateToken();
-const addonName = body?.addonName ? String(body.addonName).trim().slice(0, 40) || null : null;
+const addonName = (body && body.addonName && String(body.addonName).trim()) ? String(body.addonName).trim().slice(0, 40) : null;
 const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality, addonName };
 TOKEN_CACHE.set(token, entry);
 await redisSave(token, entry);
 bucket.count++;
 const baseUrl = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
 const tokenSegment = instanceUrl ? token + '~' + Buffer.from(instanceUrl).toString('base64url') : token;
-return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json', usingCustomInstance: !!instanceUrl, preferredQuality });
+const nameParam = addonName ? ('?name=' + encodeURIComponent(addonName)) : '';
+return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json' + nameParam, usingCustomInstance: !!instanceUrl, preferredQuality, addonName });
 });
 
 app.post('/refresh', async c => {
@@ -1014,7 +1015,7 @@ const rawParam = c.req.param('token');
 const { token } = parseTokenParam(rawParam);
 return Response.json({
 id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
-name: entry.addonName || 'Claudochrome',
+name: (c.req.query('name') ? decodeURIComponent(c.req.query('name')).slice(0, 40) : null) || entry.addonName || 'Claudochrome',
 version: '2.3.0',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
