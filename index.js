@@ -418,6 +418,17 @@ async function resolveIsrc(title, artist, instanceUrl) {
   }
 
   if (winner) {
+    // Sanity: winner track title must share at least one word with the searched title
+    // prevents "Dead Butterflies" (artist) matching the song "Dead Butterflies" by another artist
+    const _norm = s => String(s||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').trim();
+    const _qWords = _norm(removeFeat(title||'')).split(/\s+/).filter(w => w.length > 1);
+    const _wTitle = _norm(winner.track?.title || winner.track?.name || '');
+    const _overlap = _qWords.filter(w => _wTitle.includes(w)).length;
+    if (_qWords.length > 0 && _overlap === 0) {
+      console.log('[isrc] title mismatch rejected: query="' + title + '" winner="' + (winner.track?.title||'?') + '" — caching MISS');
+      cSet(cacheKey, 'MISS', 1800);
+      return null;
+    }
     cSet(cacheKey, winner, 86400); // cache 24h
     return winner;
   }
@@ -1020,7 +1031,7 @@ id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
 name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudochrome'; })(),
 version: '2.3.0',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
-icon: 'https://monochrome.tf/assets/appicon.png',
+icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
 resources: ['search', 'stream', 'catalog'],
 types: ['track', 'album', 'artist', 'playlist']
 });
@@ -1044,7 +1055,7 @@ if (cached) {
 try {
 const parsed = JSON.parse(cached);
 // Re-populate in-memory meta cache from cached search results
-if (parsed.tracks) parsed.tracks.forEach(t => { if (t && t.id && t.title) cacheTrackMeta(t.id, t.title, t.artist); });
+if (parsed.tracks) parsed.tracks.forEach(t => { if (t && t.id && t.title && !TRACK_META_CACHE.has(String(t.id))) cacheTrackMeta(t.id, t.title, t.artist); });
 return Response.json(parsed);
 } catch(e) {}
 }
@@ -1150,10 +1161,18 @@ const mem = getCachedMeta(tid);
 if (mem) { qTitle = mem.title; qArtist = mem.artist; if (!qIsrc) qIsrc = mem.isrc || null; console.log('meta: hit in-memory cache for', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : ''); }
 }
 
-// Step 3: look up from Redis (survives across worker instances / restarts)
-if (!qTitle) {
+// Step 3: look up from Redis — if Redis disagrees with in-memory title, prefer Redis
+// (in-memory cache can be poisoned by other searches on the same worker isolate)
 const redisMeta = await redisLoadTrackMeta(tid);
-if (redisMeta) { qTitle = redisMeta.title; qArtist = redisMeta.artist; if (!qIsrc) qIsrc = redisMeta.isrc || null; console.log('meta: hit Redis cache for', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : ''); }
+if (redisMeta) {
+  if (!qTitle) {
+    qTitle = redisMeta.title; qArtist = redisMeta.artist; if (!qIsrc) qIsrc = redisMeta.isrc || null;
+    console.log('meta: hit Redis cache for', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : '');
+  } else if (redisMeta.title && redisMeta.title.toLowerCase() !== qTitle.toLowerCase()) {
+    // Redis has different title — Redis is more trustworthy (written from fresh search), prefer it
+    console.log('meta: Redis/memory disagree for', tid, '— memory="' + qTitle + '" redis="' + redisMeta.title + '" — using Redis');
+    qTitle = redisMeta.title; qArtist = redisMeta.artist; if (redisMeta.isrc) qIsrc = redisMeta.isrc;
+  }
 }
 
 if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid, '- skipping Qobuz');
@@ -1225,6 +1244,18 @@ const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
   try {
     const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
     if (!qTrack || !qTrack.id) return null;
+    // Title sanity check: if we have a known title and the Qobuz track title shares
+    // zero words with it, reject the match — prevents wrong-song streams.
+    if (qTitle && qTrack.title) {
+      const norm = s => String(s||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').trim();
+      const wantWords = norm(qTitle).split(/\s+/).filter(w => w.length > 1);
+      const gotWords  = norm(qTrack.title).split(/\s+/).filter(w => w.length > 1);
+      const overlap   = wantWords.filter(w => gotWords.includes(w)).length;
+      if (wantWords.length > 0 && overlap === 0) {
+        console.warn('[stream] qobuz title mismatch: wanted "' + qTitle + '" got "' + qTrack.title + '" — skipping');
+        return null;
+      }
+    }
     const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
     if (qStream) {
       console.log('[stream] qobuz HIT', qTrack.id, qStream.quality);
