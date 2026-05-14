@@ -609,7 +609,8 @@ createdAt: entry.createdAt,
 lastUsed: entry.lastUsed,
 reqCount: entry.reqCount || 0,
 instanceUrl: entry.instanceUrl || null,
-preferredQuality: entry.preferredQuality || null
+preferredQuality: entry.preferredQuality || null,
+addonName: entry.addonName || null,
 }), 'EX', 2592000);
 }
 
@@ -623,7 +624,8 @@ createdAt: p.createdAt || Date.now(),
 lastUsed: p.lastUsed || Date.now(),
 reqCount: p.reqCount || 0,
 instanceUrl: p.instanceUrl || null,
-preferredQuality: p.preferredQuality || null
+preferredQuality: p.preferredQuality || null,
+addonName: p.addonName || null,
 };
 } catch(e) { return null; }
 }
@@ -646,12 +648,12 @@ async function getTokenEntry(token) {
 if (TOKEN_CACHE.has(token)) return TOKEN_CACHE.get(token);
 var saved = await redisLoad(token);
 if (saved) {
-var entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, instanceUrl: saved.instanceUrl || null, preferredQuality: saved.preferredQuality || null, rateWin: [] };
+var entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, instanceUrl: saved.instanceUrl || null, preferredQuality: saved.preferredQuality || null, addonName: saved.addonName || null, rateWin: [] };
 TOKEN_CACHE.set(token, entry);
 return entry;
 }
 if (/^[a-f0-9]{28}$/.test(token)) {
-var fresh = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl: null, preferredQuality: null };
+var fresh = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl: null, preferredQuality: null, addonName: null };
 TOKEN_CACHE.set(token, fresh);
 return fresh;
 }
@@ -780,6 +782,9 @@ h += '</div>';
 
 h += '<div class="hint" id="qlHint" style="margin-top:8px">No preference &mdash; auto-selects: Qobuz Hi-Res &rarr; TIDAL Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
 
+h += '<div class="lbl">Addon Name <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
+h += '<input type="text" id="customAddonName" placeholder="Claudochrome" maxlength="40">';
+h += '<div class="hint">Customize the name shown in Eclipse\'s connections list. Leave blank to keep the previous name.</div>';
 h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
 
 // Generate result box — styled like QTE screenshot
@@ -867,9 +872,11 @@ h += 'function generate(){';
 h += '  var btn=document.getElementById("genBtn");';
 h += '  btn.disabled=true;btn.textContent="Generating...";';
 h += '  var ci=document.getElementById("customInstance").value.trim();';
+h += '  var an=document.getElementById("customAddonName").value.trim();';
 h += '  while(ci.length&&ci[ci.length-1]==="/")ci=ci.slice(0,-1);';
 h += '  var body={};';
 h += '  if(ci)body.instanceUrl=ci;';
+h += '  if(an)body.addonName=an;';
 h += '  if(selQ)body.preferredQuality=selQ;';
 h += '  fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})';
 h += '  .then(function(r){return r.json();})';
@@ -940,7 +947,8 @@ await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, time
 const VALID_QUALITIES = ['HI_RES_LOSSLESS','HIRESLOSSLESS','HIMAX','HI96','LOSSLESS','HIGH','AAC320','LOW','AAC96','TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW'];
 const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
 const token = generateToken();
-const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality };
+const addonName = body?.addonName ? String(body.addonName).trim().slice(0, 40) || null : null;
+const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality, addonName };
 TOKEN_CACHE.set(token, entry);
 await redisSave(token, entry);
 bucket.count++;
@@ -1006,7 +1014,7 @@ const rawParam = c.req.param('token');
 const { token } = parseTokenParam(rawParam);
 return Response.json({
 id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
-name: 'Claudochrome',
+name: entry.addonName || 'Claudochrome',
 version: '2.3.0',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
