@@ -162,12 +162,18 @@ function md5(str) {
 
 // qobuzQualityLabel — mirrors QTE exactly
 function qobuzQualityLabel(formatId, data) {
-  const sr  = data?.sampling_rate || 0;
-  const bd  = data?.bit_depth      || 0;
-  if (formatId === 27) return 'hires-192';
-  if (formatId === 7)  return 'hires-96';
-  if (formatId === 6)  return 'lossless';
-  if (formatId === 5)  return '320kbps';
+  const sr = data?.sampling_rate || 0;
+  const bd = data?.bit_depth      || 0;
+  // Use actual sample rate + bit depth from Qobuz API when available — this is what Eclipse displays
+  if (bd > 0 && sr > 0) {
+    const srLabel = sr >= 1000 ? (sr / 1000).toFixed(0) + ' kHz' : sr + ' kHz';
+    return bd + '-bit / ' + srLabel;
+  }
+  // Fallback to format tier labels when API doesn't return sr/bd
+  if (formatId === 27) return '24-bit / 192 kHz';
+  if (formatId === 7)  return '24-bit / 96 kHz';
+  if (formatId === 6)  return '16-bit / 44.1 kHz FLAC';
+  if (formatId === 5)  return '320 kbps AAC';
   return 'unknown';
 }
 
@@ -195,7 +201,7 @@ async function qobuzStream(trackId, prefKey) {
     'HIRESLOSSLESS':   [27, 7, 6, 5],
   };
   const fmtOrder = (prefKey && PREF_FMT_ORDER[prefKey]) || [27, 7, 6, 5];
-  const fmtLabel = { 27: 'flac', 7: 'flac', 6: 'flac', 5: 'mp3' };
+  const fmtLabel = { 27: 'flac', 7: 'flac', 6: 'flac', 5: 'aac' };
 
   // Try each format in priority order — exactly like QTE's loop
   for (const fmt of fmtOrder) {
@@ -1029,7 +1035,7 @@ const { token } = parseTokenParam(rawParam);
 return Response.json({
 id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
 name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudochrome'; })(),
-version: '2.4.3',
+version: '2.4.4',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
 resources: ['search', 'stream', 'catalog'],
@@ -1108,7 +1114,8 @@ redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
     }
   } catch(e) {}
 })();
-tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: 'flac' });
+const tFormat = (t.audioQuality === 'HIGH' || t.audioQuality === 'LOW') ? 'aac' : 'flac';
+tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: tFormat });
 }
 
 const artistList = Object.keys(artistMap)
@@ -1762,7 +1769,7 @@ async function _spineGetArtist(artistId) {
 return {
   id: 'claudochrome-tidal',
   name: 'Claudochrome',
-  version: '2.4.3',
+  version: '2.4.4',
   labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
   searchTracks: _spineSearchTracks,
   getTrackStreamUrl: _spineGetTrackStreamUrl,
@@ -1783,7 +1790,7 @@ app.get('/8spine', async c => {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
     author: 'Ricky',
-    version: '2.4.3',
+    version: '2.4.4',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
     download: base + '/8spine.js'
   });
@@ -1810,7 +1817,7 @@ app.get('/8spine-source.json', async c => {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
     author: 'Ricky',
-    version: '2.4.3',
+    version: '2.4.4',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
     labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
     download: base + '/8spine.js'
