@@ -54,6 +54,21 @@ function getCachedMeta(id) {
 return TRACK_META_CACHE.get(String(id)) || null;
 }
 
+// Qobuz Track ID cache: TIDAL track id -> Qobuz track object
+// Populated at search pre-warm, read in stream route to skip qobuzFindBestTrack entirely.
+const QOBUZ_TRACK_ID_CACHE = new Map();
+function cacheQobuzTrackId(tidalId, qobuzTrack) {
+  if (!tidalId || !qobuzTrack || !qobuzTrack.id) return;
+  QOBUZ_TRACK_ID_CACHE.set(String(tidalId), qobuzTrack);
+  if (QOBUZ_TRACK_ID_CACHE.size > 5000) {
+    const firstKey = QOBUZ_TRACK_ID_CACHE.keys().next().value;
+    QOBUZ_TRACK_ID_CACHE.delete(firstKey);
+  }
+}
+function getCachedQobuzTrack(tidalId) {
+  return QOBUZ_TRACK_ID_CACHE.get(String(tidalId)) || null;
+}
+
 // ─── Unified in-memory TTL cache ─────────────────────────────────────────────
 const _cache = new Map();
 function cGet(key) {
@@ -1072,7 +1087,7 @@ app.get('/qobuz-ping', async c => {
 });
 
 app.get('/health', c => {
-return Response.json({ status: 'ok', version: '2.4.1', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, cachedTracks: TRACK_META_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+return Response.json({ status: 'ok', version: '2.4.6', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, cachedTracks: TRACK_META_CACHE.size, cachedQobuzIds: QOBUZ_TRACK_ID_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
 });
 
 app.get('/u/:token/manifest.json', async c => {
@@ -1082,7 +1097,7 @@ const { token } = parseTokenParam(rawParam);
 return Response.json({
 id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
 name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudochrome'; })(),
-version: '2.4.5',
+version: '2.4.6',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
 resources: ['search', 'stream', 'catalog'],
@@ -1150,8 +1165,9 @@ redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
   try {
     const qTrack = await qobuzFindBestTrack(tTitle, tArtist, t.isrc || null, inst);
     if (qTrack && qTrack.id) {
+      cacheQobuzTrackId(t.id, qTrack); // NEW: cache mapping for instant stream lookup
       // Pre-warm all common quality tiers so any pref selection is instant
-      const preWarmKeys = [null, 'HIMAX', 'LOSSLESS'];
+      const preWarmKeys = [null, 'HIMAX', 'HI96', 'LOSSLESS'];
       for (const key of preWarmKeys) {
         const cKey = 'qstream:' + qTrack.id + ':' + (key || 'auto');
         if (!cGet(cKey)) {
@@ -1336,8 +1352,15 @@ const skipQobuz = isTidalOnlyPref || (!qTitle && !qIsrc);
 // Qobuz promise — full find+stream pipeline
 const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
   try {
-    // Smart path: compare ISRC and title-search candidates, then prefer the best-quality edition
-    const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
+    // Fast path: check TIDAL->Qobuz track ID cache (populated at search/pre-warm time).
+    // Cache hit = skip the entire qobuzFindBestTrack pipeline entirely.
+    let qTrack = getCachedQobuzTrack(tid);
+    if (qTrack) {
+      console.log('[stream] qobuz id-cache HIT tid=' + tid + ' -> qobuzId=' + qTrack.id);
+    } else {
+      qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
+      if (qTrack && qTrack.id) cacheQobuzTrackId(tid, qTrack);
+    }
     if (!qTrack || !qTrack.id) return null;
     // Title sanity check: if we have a known title and the Qobuz track title shares
     // zero words with it, reject the match — prevents wrong-song streams.
@@ -1809,7 +1832,7 @@ async function _spineGetArtist(artistId) {
 return {
   id: 'claudochrome-tidal',
   name: 'Claudochrome',
-  version: '2.4.5',
+  version: '2.4.6',
   labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
   searchTracks: _spineSearchTracks,
   getTrackStreamUrl: _spineGetTrackStreamUrl,
@@ -1830,7 +1853,7 @@ app.get('/8spine', async c => {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
     author: 'Ricky',
-    version: '2.4.5',
+    version: '2.4.6',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
     download: base + '/8spine.js'
   });
@@ -1857,7 +1880,7 @@ app.get('/8spine-source.json', async c => {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
     author: 'Ricky',
-    version: '2.4.5',
+    version: '2.4.6',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
     labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
     download: base + '/8spine.js'
