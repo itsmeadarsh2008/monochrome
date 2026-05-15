@@ -177,6 +177,44 @@ function qobuzQualityLabel(formatId, data) {
   return 'unknown';
 }
 
+function qobuzTrackQualityScore(t) {
+  if (!t) return -1;
+  const bd = Number(t.bit_depth || 0);
+  const sr = Number(t.maximum_sampling_rate || t.sampling_rate || 0);
+  const hires = !!(t.hires || t.hires_streamable || bd > 16 || sr > 48);
+  const purchasable = t.streamable !== false && t.displayable !== false;
+  let score = 0;
+  if (purchasable) score += 1000;
+  if (hires) score += 500;
+  score += bd * 20;
+  score += sr;
+  if (t.version) score -= 10;
+  return score;
+}
+
+function qobuzPickBestEdition(items, wantTitle, wantArtist, wantIsrc) {
+  const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+  const titleNeedle = norm(removeFeat(wantTitle || ''));
+  const artistNeedle = norm(wantArtist || '');
+  const isrcNeedle = String(wantIsrc || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  let best = null, bestScore = -1e9;
+  for (const t of (items || [])) {
+    if (!t || !t.id) continue;
+    const tTitle = norm(removeFeat(t.title || ''));
+    const tArtist = norm(trackArtist(t));
+    const tIsrc = String(t.isrc || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+    let score = qobuzTrackQualityScore(t);
+    if (isrcNeedle && tIsrc === isrcNeedle) score += 10000;
+    if (titleNeedle && tTitle === titleNeedle) score += 1000;
+    else if (titleNeedle && tTitle.includes(titleNeedle)) score += 400;
+    if (artistNeedle && tArtist.includes(artistNeedle)) score += 500;
+    if (titleNeedle && tTitle && !tTitle.includes(titleNeedle) && !titleNeedle.includes(tTitle)) score -= 1500;
+    if (artistNeedle && tArtist && !tArtist.includes(artistNeedle) && !artistNeedle.includes(tArtist)) score -= 500;
+    if (score > bestScore) { best = t; bestScore = score; }
+  }
+  return best;
+}
+
 // ─── Qobuz client — direct signed API call (replaces proxy racing) ────────────
 // Mirrors QTE's getTrackStreamUrl Qobuz path exactly:
 //   ts   = Math.floor(Date.now() / 1000)
@@ -445,7 +483,7 @@ async function resolveIsrc(title, artist, instanceUrl) {
 // qobuzFindByIsrc: looks up a Qobuz track by confirmed ISRC via direct Qobuz API.
 // Uses /track/search?query=ISRC — no proxy hop, no sequential fallback.
 // Hit cached 24h, miss cached 30 min.
-async function qobuzFindByIsrc(isrc) {
+async function qobuzFindByIsrc(isrc, wantTitle = null, wantArtist = null) {
   if (!isrc) return null;
   const normIsrc = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
   const wantIsrc = normIsrc(isrc);
@@ -462,22 +500,22 @@ async function qobuzFindByIsrc(isrc) {
         + '?app_id='          + QOBUZ_APP_ID
         + '&user_auth_token=' + QOBUZ_USER_TOKEN
         + '&query='           + encodeURIComponent(wantIsrc)
-        + '&limit=5',
+        + '&limit=20',
       { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(6000) }
     );
     if (r.ok) {
       const data = await r.json();
-      const items = data?.tracks?.items || [];
-      const match = items.find(t => t.isrc && normIsrc(t.isrc) === wantIsrc);
+      const items = (data?.tracks?.items || []).filter(t => t && t.isrc && normIsrc(t.isrc) === wantIsrc);
+      const match = qobuzPickBestEdition(items, wantTitle, wantArtist, wantIsrc);
       if (match && match.id) {
-        cSet(cacheKey, match, 86400); // 24h
-        console.log('[qobuz] isrc HIT', isrc, '->', match.id, match.title);
+        cSet(cacheKey, match, 86400);
+        console.log('[qobuz] isrc HIT', isrc, '->', match.id, match.title, '|', 'bd=' + (match.bit_depth || '?'), 'sr=' + (match.maximum_sampling_rate || match.sampling_rate || '?'));
         return match;
       }
     }
-  } catch(e) { /* fall through to MISS */ }
+  } catch(e) {}
 
-  cSet(cacheKey, 'MISS', 1800); // 30 min miss
+  cSet(cacheKey, 'MISS', 1800);
   return null;
 }
 
@@ -488,53 +526,62 @@ async function qobuzFindByIsrc(isrc) {
 // Tier 3: Qobuz raw text search (last resort fallback).
 // All tiers cached to avoid redundant outbound calls.
 async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
-  // ── Tier 1: confirmed ISRC fast path ──────────────────────────────────────
-  // First try the bare ISRC if we already have it from TIDAL metadata
+  let isrcCandidate = null;
+  let titleCandidate = null;
+
   if (isrc) {
-    const byIsrc = await qobuzFindByIsrc(isrc);
-    if (byIsrc) return byIsrc;
-    console.log('[qobuz] bare ISRC miss for', isrc, '— trying parallel resolution');
+    isrcCandidate = await qobuzFindByIsrc(isrc, title, artist);
+    if (!isrcCandidate) console.log('[qobuz] bare ISRC miss for', isrc, '— trying parallel resolution');
   }
 
-  // Run TIDAL+Deezer parallel resolver to get a confirmed ISRC
-  if (title) {
+  if (!isrcCandidate && title) {
     const resolved = await resolveIsrc(title, artist, instanceUrl);
     if (resolved && resolved.isrc) {
-      const byResolvedIsrc = await qobuzFindByIsrc(resolved.isrc);
-      if (byResolvedIsrc) return byResolvedIsrc;
-      console.log('[qobuz] resolved ISRC', resolved.isrc, 'not in Qobuz vault — falling to title search');
+      isrcCandidate = await qobuzFindByIsrc(resolved.isrc, title, artist);
+      if (!isrcCandidate) console.log('[qobuz] resolved ISRC', resolved.isrc, 'not in Qobuz vault — falling to title search');
     }
   }
 
-  // ── Tier 2: scoring-engine title+artist search on Qobuz ───────────────────
-  if (!title) return null;
-  const cacheKey = 'qmatch2:' + (title || '').toLowerCase() + ':' + (artist || '').toLowerCase();
-  const cached = cGet(cacheKey);
-  if (cached === 'MISS') return null;
-  if (cached) return cached;
-
-  const q = (artist ? artist + ' ' : '') + removeFeat(title);
-  for (const inst of QOBUZ_INSTANCES) {
-    try {
-      const r = await axios.get(inst + '/search', {
-        params: { q, limit: 15 },
-        headers: { 'User-Agent': UA },
-        timeout: 10000
-      });
-      const items = r.data?.tracks?.items || [];
-      if (!items.length) continue;
-      const match = scoringFindBest(items, (artist ? artist + ' ' : '') + title, artist);
-      if (match.item && match.score >= 40) { // lower threshold for direct Qobuz search
-        if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-        cSet(cacheKey, match.item, 3600);
-        console.log('[qobuz] title search HIT score=' + match.score, match.item.title);
-        return match.item;
+  if (title) {
+    const cacheKey = 'qmatch2:' + (title || '').toLowerCase() + ':' + (artist || '').toLowerCase();
+    const cached = cGet(cacheKey);
+    if (cached !== 'MISS' && cached) titleCandidate = cached;
+    else {
+      const q = (artist ? artist + ' ' : '') + removeFeat(title);
+      for (const inst of QOBUZ_INSTANCES) {
+        try {
+          const r = await axios.get(inst + '/search', {
+            params: { q, limit: 15 },
+            headers: { 'User-Agent': UA },
+            timeout: 10000
+          });
+          const items = r.data?.tracks?.items || [];
+          if (!items.length) continue;
+          const match = scoringFindBest(items, (artist ? artist + ' ' : '') + title, artist);
+          if (match.item && match.score >= 40) {
+            if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
+            cSet(cacheKey, match.item, 3600);
+            console.log('[qobuz] title search HIT score=' + match.score, match.item.title);
+            titleCandidate = match.item;
+            break;
+          }
+        } catch(e) { continue; }
       }
-    } catch(e) { continue; }
+      if (!titleCandidate) cSet(cacheKey, 'MISS', 1800);
+    }
   }
 
-  cSet(cacheKey, 'MISS', 1800);
-  return null;
+  if (isrcCandidate && titleCandidate) {
+    const isrcScore = qobuzTrackQualityScore(isrcCandidate);
+    const titleScore = qobuzTrackQualityScore(titleCandidate);
+    if (titleScore >= isrcScore + 200) {
+      console.log('[qobuz] preferring title candidate over ISRC candidate for higher quality', 'isrc=' + isrcScore, 'title=' + titleScore);
+      return titleCandidate;
+    }
+    return isrcCandidate;
+  }
+
+  return isrcCandidate || titleCandidate || null;
 }
 
 
@@ -1035,7 +1082,7 @@ const { token } = parseTokenParam(rawParam);
 return Response.json({
 id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
 name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudochrome'; })(),
-version: '2.4.4',
+version: '2.4.5',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
 resources: ['search', 'stream', 'catalog'],
@@ -1289,15 +1336,8 @@ const skipQobuz = isTidalOnlyPref || (!qTitle && !qIsrc);
 // Qobuz promise — full find+stream pipeline
 const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
   try {
-    // Fast path: if we have ISRC, try direct ISRC lookup first (skips scoring engine)
-    let qTrack = null;
-    if (qIsrc) {
-      qTrack = await qobuzFindByIsrc(qIsrc);
-    }
-    // Slow path: full title/artist search with scoring engine
-    if (!qTrack) {
-      qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
-    }
+    // Smart path: compare ISRC and title-search candidates, then prefer the best-quality edition
+    const qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
     if (!qTrack || !qTrack.id) return null;
     // Title sanity check: if we have a known title and the Qobuz track title shares
     // zero words with it, reject the match — prevents wrong-song streams.
@@ -1769,7 +1809,7 @@ async function _spineGetArtist(artistId) {
 return {
   id: 'claudochrome-tidal',
   name: 'Claudochrome',
-  version: '2.4.4',
+  version: '2.4.5',
   labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
   searchTracks: _spineSearchTracks,
   getTrackStreamUrl: _spineGetTrackStreamUrl,
@@ -1790,7 +1830,7 @@ app.get('/8spine', async c => {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
     author: 'Ricky',
-    version: '2.4.4',
+    version: '2.4.5',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
     download: base + '/8spine.js'
   });
@@ -1817,7 +1857,7 @@ app.get('/8spine-source.json', async c => {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
     author: 'Ricky',
-    version: '2.4.4',
+    version: '2.4.5',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
     labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
     download: base + '/8spine.js'
