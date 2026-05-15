@@ -1029,7 +1029,7 @@ const { token } = parseTokenParam(rawParam);
 return Response.json({
 id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
 name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudochrome'; })(),
-version: '2.3.0',
+version: '2.4.2',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
 resources: ['search', 'stream', 'catalog'],
@@ -1174,6 +1174,29 @@ if (redisMeta) {
   }
 }
 
+// ── Cold-start meta lookup: if cache missed, fetch from HiFi API ─────────────
+// This handles the case where Eclipse calls /stream/:id directly (album, artist,
+// playlist flows) without a preceding /search — meaning TRACK_META_CACHE is empty.
+if (!qTitle && !qIsrc) {
+  try {
+    const trackInfo = await hifiGetForTokenSafe(inst, '/track', { id: tid, quality: 'LOSSLESS' });
+    const payload = trackInfo?.data ? trackInfo.data : trackInfo;
+    if (payload && (payload.title || payload.resource?.title)) {
+      const t = payload.resource || payload;
+      qTitle  = t.title  || qTitle;
+      qArtist = trackArtist(t) || qArtist;
+      qIsrc   = t.isrc   || qIsrc || null;
+      console.log('meta: HiFi cold-lookup HIT for tid', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : '');
+      // Cache it so next call is instant
+      if (qTitle) {
+        cacheTrackMeta(tid, qTitle, qArtist, qIsrc);
+        redisCacheTrackMeta(String(tid), qTitle, qArtist, qIsrc).catch(() => {});
+      }
+    }
+  } catch(e) {
+    console.log('meta: HiFi cold-lookup failed for tid', tid, '-', e.message);
+  }
+}
 if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid, '- skipping Qobuz');
 
 // ── Quality maps ─────────────────────────────────────────────────────────────
@@ -1182,8 +1205,8 @@ const PREF_TO_QOBUZ_KEY = {
   'HI96': 'HI96', 'LOSSLESS': 'LOSSLESS',
   'HIGH': 'AAC320', 'AAC320': 'AAC320',
   'LOW': 'AAC96',  'AAC96': 'AAC96',
-  // TIDAL-only tiers — skip Qobuz entirely
-  'TIDAL_HIMAX': 'AAC96', 'TIDAL_LOSSLESS': 'AAC96', 'TIDAL_HIGH': 'AAC96', 'TIDAL_LOW': 'AAC96',
+  // TIDAL-only tiers — Qobuz is skipped via isTidalOnlyPref above, these are never reached
+  'TIDAL_HIMAX': null, 'TIDAL_LOSSLESS': null, 'TIDAL_HIGH': null, 'TIDAL_LOW': null,
 };
 const PREF_TO_TIDAL = {
   'HI_RES_LOSSLESS': 'HI_RES_LOSSLESS', 'HIRESLOSSLESS': 'HI_RES_LOSSLESS',
@@ -1236,7 +1259,11 @@ async function getTidalStream() {
 // If TIDAL resolves first (Qobuz still searching), we hold it and return it only
 // if Qobuz ultimately fails. This gives Qobuz Hi-Res quality without Qobuz latency cost.
 const qobuzPrefKey = pref ? (PREF_TO_QOBUZ_KEY[pref] || null) : null;
-const skipQobuz = !qTitle && !qIsrc;
+// Skip Qobuz only if: user explicitly chose a TIDAL-only tier, OR we have no metadata at all.
+// For all Qobuz/auto tiers, always try Qobuz first — cascade ALL formats (27->7->6->5)
+// before falling back to TIDAL. pref only controls TIDAL fallback quality, not Qobuz skipping.
+const isTidalOnlyPref = pref && ['TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW'].includes(pref);
+const skipQobuz = isTidalOnlyPref || (!qTitle && !qIsrc);
 
 // Qobuz promise — full find+stream pipeline
 const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
@@ -1713,7 +1740,7 @@ async function _spineGetArtist(artistId) {
 return {
   id: 'claudochrome-tidal',
   name: 'Claudochrome',
-  version: '2.3.0',
+  version: '2.4.2',
   labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
   searchTracks: _spineSearchTracks,
   getTrackStreamUrl: _spineGetTrackStreamUrl,
@@ -1734,7 +1761,7 @@ app.get('/8spine', async c => {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
     author: 'Ricky',
-    version: '2.3.0',
+    version: '2.4.2',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
     download: base + '/8spine.js'
   });
@@ -1761,7 +1788,7 @@ app.get('/8spine-source.json', async c => {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
     author: 'Ricky',
-    version: '2.3.0',
+    version: '2.4.2',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
     labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
     download: base + '/8spine.js'
