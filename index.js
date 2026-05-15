@@ -1093,8 +1093,7 @@ cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
 redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
 // Background Qobuz pre-warm — no await, result cached so stream is instant
 qobuzFindBestTrack(tTitle, tArtist, t.isrc || null, inst).catch(() => {});
-const _cachedStream = cGet('tstream:' + String(t.id) + ':' + (entry.preferredQuality || 'auto'));
-tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: _cachedStream ? (_cachedStream.format || 'flac') : 'flac', ...(_cachedStream ? { streamURL: _cachedStream.url } : {}) });
+tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: 'flac' });
 }
 
 const artistList = Object.keys(artistMap)
