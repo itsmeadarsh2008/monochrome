@@ -1097,9 +1097,9 @@ const { token } = parseTokenParam(rawParam);
 return Response.json({
 id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
 name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudochrome'; })(),
-version: '2.4.6',
+version: '3.0.0',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
-icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcSQeDbvCgGyEcwqhFv8S-Y7ULHa-0FCSHlfJQqpB0CuQs10',
+icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRtklZxzKIxXbfKsPsGTlnL6lbQqrr1fsIuJY2g4Xtt4w&s=10',
 resources: ['search', 'stream', 'catalog'],
 types: ['track', 'album', 'artist', 'playlist']
 });
@@ -1832,7 +1832,7 @@ async function _spineGetArtist(artistId) {
 return {
   id: 'claudochrome-tidal',
   name: 'Claudochrome',
-  version: '2.4.6',
+  version: '3.0.0',
   labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
   searchTracks: _spineSearchTracks,
   getTrackStreamUrl: _spineGetTrackStreamUrl,
@@ -1853,7 +1853,7 @@ app.get('/8spine', async c => {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
     author: 'Ricky',
-    version: '2.4.6',
+    version: '3.0.0',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
     download: base + '/8spine.js'
   });
@@ -1880,7 +1880,7 @@ app.get('/8spine-source.json', async c => {
     id: 'claudochrome-tidal',
     name: 'Claudochrome',
     author: 'Ricky',
-    version: '2.4.6',
+    version: '3.0.0',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
     labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
     download: base + '/8spine.js'
