@@ -845,7 +845,6 @@ h += '<div class="ql-btn" id="ql-HI96"        onclick="selectQ(\'HI96\',\'q\')">
 h += '</div>';
 h += '<div class="ql-row">';
 h += '<div class="ql-btn" id="ql-LOSSLESS"    onclick="selectQ(\'LOSSLESS\',\'q\')">CD Quality<span class="ql-sub">16-bit / 44.1kHz</span></div>';
-h += '<div class="ql-btn" id="ql-AAC320"      onclick="selectQ(\'AAC320\',\'q\')">320 kbps<span class="ql-sub">Qobuz AAC 320</span></div>';
 h += '</div>';
 
 h += '<div class="ql-group-label" style="margin-top:14px">&#9675; TIDAL (skips Qobuz)</div>';
@@ -906,7 +905,7 @@ h += '<footer>Monochrome Eclipse Addon &bull; TIDAL search &bull; Qobuz Hi-Res s
 h += '<script>';
 h += 'var gu,ru,selQ=null,selGroup=null;';
 
-h += 'var QKEYS=["HIMAX","HI96","LOSSLESS","AAC320"];';
+h += 'var QKEYS=["HIMAX","HI96","LOSSLESS"];';
 h += 'var TKEYS=["TIDAL_HIMAX","TIDAL_LOSSLESS","TIDAL_HIGH","TIDAL_LOW"];';
 h += 'var ALLKEYS=QKEYS.concat(TKEYS);';
 
@@ -914,7 +913,6 @@ h += 'var QLABELS={';
 h += '"HIMAX":"Hi-Res 192 \u00b7 24-bit/192kHz",';
 h += '"HI96":"Hi-Res 96 \u00b7 24-bit/96kHz",';
 h += '"LOSSLESS":"CD Quality \u00b7 16-bit/44.1kHz",';
-h += '"AAC320":"320 kbps \u00b7 Qobuz AAC",';
 h += '"TIDAL_HIMAX":"TIDAL Hi-Res \u00b7 24-bit/192kHz",';
 h += '"TIDAL_LOSSLESS":"TIDAL CD Quality \u00b7 16-bit/44.1kHz",';
 h += '"TIDAL_HIGH":"TIDAL 320 kbps",';
