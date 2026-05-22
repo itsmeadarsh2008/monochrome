@@ -711,16 +711,128 @@ addonName: p.addonName || null,
 
 // ─── Token auth ───────────────────────────────────────────────────────────────
 const TOKEN_CACHE = new Map();
-const IP_CREATES = new Map();
-const MAX_TOKENS_PER_IP = 10, RATE_MAX = 80, RATE_WINDOW_MS = 60000;
+const IP_CREATES  = new Map();
+
+// ─── Rate limit constants ─────────────────────────────────────────────────────
+const MAX_TOKENS_PER_IP  = 3;        // reduced from 10 — prevents token farming
+const MAX_GEN_PER_HOUR   = 5;        // max token generations per IP per hour
+const RATE_MAX           = 80;       // general requests per token per minute
+const RATE_WINDOW_MS     = 60000;
+
+// Stream / download limits (per-token)
+const STREAM_MAX_PER_MIN  = 15;      // max stream/download calls per token per minute
+const STREAM_MAX_PER_HOUR = 300;     // hard session cap per token per hour (~5 albums)
+const STREAM_WINDOW_MIN   = 60000;
+const STREAM_WINDOW_HOUR  = 3600000;
+
+// Bulk download guard — blocks insane playlist downloads (20k track attempts etc.)
+const BULK_DL_MAX       = 500;       // max tracks per 10-minute window per token
+const BULK_DL_WINDOW_MS = 600000;    // 10 minutes
+
+// Search limits (per-token)
+const SEARCH_MAX_PER_MIN = 20;
+const SEARCH_WINDOW_MS   = 60000;
+
+// Global daily budget — shared across ALL tokens / ALL addons on this worker
+const GLOBAL_DAILY_LIMIT        = 85000; // conservative buffer below 100k/day cap
+const GLOBAL_STREAM_DAILY_LIMIT = 60000; // 60k of daily cap reserved for streams
+let   globalDailyCount    = 0;
+let   globalStreamCount   = 0;
+let   globalDayStart      = Date.now();
+
+// Per-IP token generation hourly rate
+const IP_GEN_RATE = new Map(); // ip -> { count, resetAt }
+
+// Per-IP unauthenticated endpoint rate limit
+const IP_UNAUTH_RATE = new Map(); // ip -> { count, resetAt }
+const UNAUTH_MAX_PER_MIN = 10;
 
 function generateToken() { return crypto.randomBytes(14).toString('hex'); }
 
 function getOrCreateIpBucket(ip) {
-var now = Date.now();
-var b = IP_CREATES.get(ip);
-if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + 86400000 }; IP_CREATES.set(ip, b); }
-return b;
+  var now = Date.now();
+  var b = IP_CREATES.get(ip);
+  if (!b || now > b.resetAt) { b = { count: 0, resetAt: now + 86400000 }; IP_CREATES.set(ip, b); }
+  return b;
+}
+
+// ─── Global daily budget helpers ──────────────────────────────────────────────
+function consumeGlobalBudget() {
+  const now = Date.now();
+  if (now - globalDayStart > 86400000) {
+    globalDailyCount = 0; globalStreamCount = 0; globalDayStart = now;
+  }
+  if (globalDailyCount >= GLOBAL_DAILY_LIMIT) return false;
+  globalDailyCount++;
+  return true;
+}
+
+function consumeGlobalStreamBudget() {
+  const now = Date.now();
+  if (now - globalDayStart > 86400000) {
+    globalDailyCount = 0; globalStreamCount = 0; globalDayStart = now;
+  }
+  if (globalStreamCount >= GLOBAL_STREAM_DAILY_LIMIT) return false;
+  globalStreamCount++;
+  return true;
+}
+
+// ─── Per-token stream / download rate checker ──────────────────────────────────
+// Uses escalating cooldown: first over-limit = 1hr wait, repeated abuse = 2hr then 4hr.
+function checkStreamRateLimit(entry) {
+  const now = Date.now();
+  const cooldown = entry.streamCooldown || STREAM_WINDOW_HOUR;
+
+  entry.streamWinMin  = (entry.streamWinMin  || []).filter(t => now - t < STREAM_WINDOW_MIN);
+  entry.streamWinHour = (entry.streamWinHour || []).filter(t => now - t < cooldown);
+
+  if (entry.streamWinMin.length  >= STREAM_MAX_PER_MIN)  return { ok: false, reason: 'stream_min' };
+  if (entry.streamWinHour.length >= STREAM_MAX_PER_HOUR) {
+    // Escalate: 1hr → 2hr → 4hr max
+    entry.streamCooldown = Math.min((entry.streamCooldown || STREAM_WINDOW_HOUR) * 2, 14400000);
+    return { ok: false, reason: 'stream_hour' };
+  }
+
+  // Reset escalation once they're under the limit again
+  entry.streamCooldown = STREAM_WINDOW_HOUR;
+
+  if (!consumeGlobalStreamBudget()) return { ok: false, reason: 'global_stream' };
+
+  entry.streamWinMin.push(now);
+  entry.streamWinHour.push(now);
+  return { ok: true };
+}
+
+// ─── Bulk download / playlist guard ───────────────────────────────────────────
+// Blocks anyone trying to download huge playlists (500+ tracks per 10min).
+// 20k track download attempt → blocked after 500, then the window resets and
+// blocks again — making it practically impossible to complete.
+function checkBulkDownloadLimit(entry) {
+  const now = Date.now();
+  entry.bulkWin = (entry.bulkWin || []).filter(t => now - t < BULK_DL_WINDOW_MS);
+  if (entry.bulkWin.length >= BULK_DL_MAX) return false;
+  entry.bulkWin.push(now);
+  return true;
+}
+
+// ─── Per-token search rate checker ────────────────────────────────────────────
+function checkSearchRateLimit(entry) {
+  const now = Date.now();
+  entry.searchWin = (entry.searchWin || []).filter(t => now - t < SEARCH_WINDOW_MS);
+  if (entry.searchWin.length >= SEARCH_MAX_PER_MIN) return false;
+  entry.searchWin.push(now);
+  return true;
+}
+
+// ─── Per-IP unauthenticated endpoint rate limiter ─────────────────────────────
+function checkUnauthRateLimit(ip) {
+  const now = Date.now();
+  const b = IP_UNAUTH_RATE.get(ip) || { count: 0, resetAt: now + 60000 };
+  if (now > b.resetAt) { b.count = 0; b.resetAt = now + 60000; }
+  if (b.count >= UNAUTH_MAX_PER_MIN) return false;
+  b.count++;
+  IP_UNAUTH_RATE.set(ip, b);
+  return true;
 }
 
 async function getTokenEntry(token) {
@@ -754,7 +866,9 @@ const rawParam = c.req.param('token');
 const { token, embeddedInstance } = parseTokenParam(rawParam);
 const entry = await getTokenEntry(token);
 if (!entry) return Response.json({ error: 'Invalid token.' }, { status: 404 });
-if (!checkRateLimit(entry)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
+// Global daily cap — protects the 100k/day limit across all tokens and all addons
+if (!consumeGlobalBudget()) return Response.json({ error: 'Daily request limit reached. Service will resume tomorrow.' }, { status: 429 });
+if (!checkRateLimit(entry)) return Response.json({ error: 'Rate limit exceeded. Max 80 requests per minute per token.' }, { status: 429 });
 if (embeddedInstance) entry.instanceUrl = embeddedInstance;
 if (entry.reqCount % 20 === 0) await redisSave(token, entry);
 return handler(entry);
@@ -1011,8 +1125,15 @@ return new Response(buildConfigPage(baseUrl), { headers: { 'Content-Type': 'text
 app.post('/generate', async c => {
 const body = await parseBody(c);
 const ip = (c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown').split(',')[0].trim();
+// Daily token cap per IP
 const bucket = getOrCreateIpBucket(ip);
-if (bucket.count >= MAX_TOKENS_PER_IP) return Response.json({ error: 'Too many tokens from this IP today.' }, { status: 429 });
+if (bucket.count >= MAX_TOKENS_PER_IP) return Response.json({ error: 'Too many tokens from this IP today. Max ' + MAX_TOKENS_PER_IP + ' per day.' }, { status: 429 });
+// Hourly generation rate — prevents rapid token cycling / farming
+const genBucket = IP_GEN_RATE.get(ip) || { count: 0, resetAt: Date.now() + 3600000 };
+if (Date.now() > genBucket.resetAt) { genBucket.count = 0; genBucket.resetAt = Date.now() + 3600000; }
+if (genBucket.count >= MAX_GEN_PER_HOUR) return Response.json({ error: 'Too many tokens generated this hour. Try again in an hour.' }, { status: 429 });
+genBucket.count++;
+IP_GEN_RATE.set(ip, genBucket);
 let instanceUrl = (body && body.instanceUrl) ? String(body.instanceUrl).trim().replace(/\/$/, '') : null;
 if (instanceUrl) {
 if (!/^https?:\/\//.test(instanceUrl)) return Response.json({ error: 'Instance URL must start with http or https' }, { status: 400 });
@@ -1085,7 +1206,24 @@ app.get('/qobuz-ping', async c => {
 });
 
 app.get('/health', c => {
-return Response.json({ status: 'ok', version: '2.4.6', activeInstance, instanceHealthy, qobuzBase: activeQobuzInstance, cachedTracks: TRACK_META_CACHE.size, cachedQobuzIds: QOBUZ_TRACK_ID_CACHE.size, activeTokens: TOKEN_CACHE.size, timestamp: new Date().toISOString() });
+return Response.json({
+  status: 'ok',
+  version: '2.4.6',
+  activeInstance,
+  instanceHealthy,
+  qobuzBase: activeQobuzInstance,
+  cachedTracks: TRACK_META_CACHE.size,
+  cachedQobuzIds: QOBUZ_TRACK_ID_CACHE.size,
+  activeTokens: TOKEN_CACHE.size,
+  rateLimits: {
+    globalDailyUsed: globalDailyCount,
+    globalDailyLimit: GLOBAL_DAILY_LIMIT,
+    globalStreamUsed: globalStreamCount,
+    globalStreamLimit: GLOBAL_STREAM_DAILY_LIMIT,
+    globalDayResetIn: Math.max(0, Math.ceil((86400000 - (Date.now() - globalDayStart)) / 60000)) + 'min',
+  },
+  timestamp: new Date().toISOString(),
+});
 });
 
 app.get('/u/:token/manifest.json', async c => {
@@ -1107,6 +1245,10 @@ types: ['track', 'album', 'artist', 'playlist']
 // ─── Search — TIDAL + cache track meta for stream ─────────────────────────────
 app.get('/u/:token/search', async c => {
 return withToken(c, async entry => {
+// Per-token search rate limit — 20 searches per minute
+if (!checkSearchRateLimit(entry)) {
+  return Response.json({ error: 'Search rate limit exceeded. Max 20 searches per minute.', tracks: [], albums: [], artists: [], playlists: [] }, { status: 429 });
+}
 const q = String(c.req.query('q') || c.req.query('query') || c.req.query('s') || '').trim();
 const limit = Math.min(parseInt(c.req.query('limit') || '20', 10) || 20, 50);
 const inst = entry.instanceUrl;
@@ -1226,6 +1368,27 @@ return Response.json({ error: 'Search failed: ' + e.message, tracks: [], albums:
 // ─── Stream: Qobuz Hi-Res first, TIDAL fallback ────────────────────────────────
 app.get('/u/:token/stream/:id', async c => {
 return withToken(c, async entry => {
+
+// ── Stream / download rate limiting ──────────────────────────────────────────
+// This is the most expensive route — called once per track for every stream AND download.
+// A 20k-track playlist download attempt will be blocked after 500 tracks per 10-minute window.
+const streamCheck = checkStreamRateLimit(entry);
+if (!streamCheck.ok) {
+  const msgs = {
+    stream_min:    'Stream rate limit: too fast. Max ' + STREAM_MAX_PER_MIN + ' per minute.',
+    stream_hour:   'Hourly stream limit reached (' + STREAM_MAX_PER_HOUR + ' tracks). Resume in ' + Math.ceil((entry.streamCooldown || STREAM_WINDOW_HOUR) / 3600000) + ' hour(s).',
+    global_stream: 'Service stream capacity reached for today. Try again tomorrow.',
+  };
+  return Response.json({ error: msgs[streamCheck.reason] || 'Stream rate limit exceeded.' }, { status: 429 });
+}
+
+// Bulk download / playlist guard — catches insane playlist downloads
+if (!checkBulkDownloadLimit(entry)) {
+  return Response.json({
+    error: 'Download limit reached. Max ' + BULK_DL_MAX + ' tracks per 10 minutes. Wait before resuming. Large playlist downloads are not supported.',
+  }, { status: 429 });
+}
+
 const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
@@ -1846,6 +2009,8 @@ function buildClaudochromeSpineJs(baseUrl) {
 
 // ─── 8SPINE: module info ──────────────────────────────────────────────────────
 app.get('/8spine', async c => {
+  const ip = (c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown').split(',')[0].trim();
+  if (!checkUnauthRateLimit(ip)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
   const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
   return c.json({
     id: 'claudochrome-tidal',
@@ -1859,6 +2024,8 @@ app.get('/8spine', async c => {
 
 // ─── 8SPINE: serve module JS ──────────────────────────────────────────────────
 app.get('/8spine.js', async c => {
+  const ip = (c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown').split(',')[0].trim();
+  if (!checkUnauthRateLimit(ip)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
   const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
   return new Response(buildClaudochromeSpineJs(base), {
     headers: { 'Content-Type': 'application/javascript; charset=utf-8' }
@@ -1872,6 +2039,8 @@ const EXTRA_SPINE_SOURCES = [
 ];
 
 app.get('/8spine-source.json', async c => {
+  const ip = (c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown').split(',')[0].trim();
+  if (!checkUnauthRateLimit(ip)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
   const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
 
   const ourEntry = {
