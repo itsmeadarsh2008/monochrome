@@ -2036,8 +2036,8 @@ app.get('/8spine.js', async c => {
 // ─── 8SPINE: source list — merges Claudochrome + any extra source URLs ────────
 // Add more 8spine-source.json URLs to EXTRA_SPINE_SOURCES to include them.
 const EXTRA_SPINE_SOURCES = [
-  'https://all-in-one.rickyaddons.dpdns.org/8spine-source.json'
-  'https://eclipse3.cyrusna29.workers.dev/8spine-source.json'
+  'https://all-in-one.rickyaddons.dpdns.org/8spine-source.json',
+  'https://eclipse3.cyrusna29.workers.dev/8spine-source.json',
 ];
 
 app.get('/8spine-source.json', async c => {
