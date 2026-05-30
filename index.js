@@ -64,6 +64,8 @@ function cacheQobuzTrackId(tidalId, qobuzTrack) {
     const firstKey = QOBUZ_TRACK_ID_CACHE.keys().next().value;
     QOBUZ_TRACK_ID_CACHE.delete(firstKey);
   }
+  // Also persist to Redis so other CF Worker isolates benefit from this pre-warm
+  redisSaveQobuzId(tidalId, qobuzTrack).catch(() => {});
 }
 function getCachedQobuzTrack(tidalId) {
   return QOBUZ_TRACK_ID_CACHE.get(String(tidalId)) || null;
@@ -457,7 +459,7 @@ async function getIsrcFromDeezer(query, knownArtist) {
 // Returns { isrc, track, source, score } or null.
 async function resolveIsrc(title, artist, instanceUrl) {
   const query = (artist ? artist + ' ' : '') + removeFeat(title || '');
-  const cacheKey = 'isrc2:' + (artist ? artist.toLowerCase() + ':' : '') + removeFeat(title || '').toLowerCase();
+  const cacheKey = 'isrc2:' + query.toLowerCase();
   const cached = cGet(cacheKey);
   if (cached === 'MISS') return null;
   if (cached) return cached;
@@ -587,11 +589,19 @@ async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
   }
 
   if (isrcCandidate && titleCandidate) {
+    // ISRC is an exact identifier — only allow title candidate to win if it is literally
+    // the same Qobuz track (same id) but the ISRC lookup returned a lower-quality pressing.
+    // Never let a different song override a confirmed ISRC match, even at higher quality.
     const isrcScore = qobuzTrackQualityScore(isrcCandidate);
     const titleScore = qobuzTrackQualityScore(titleCandidate);
-    if (titleScore >= isrcScore + 200) {
-      console.log('[qobuz] preferring title candidate over ISRC candidate for higher quality', 'isrc=' + isrcScore, 'title=' + titleScore);
+    if (isrcCandidate.id === titleCandidate.id && titleScore > isrcScore) {
+      // Same track, title search found a better pressing — use it
+      console.log('[qobuz] same track, title pressing has higher quality', 'isrc=' + isrcScore, 'title=' + titleScore);
       return titleCandidate;
+    }
+    // Different tracks — ISRC always wins (it is the exact song by identifier)
+    if (isrcCandidate.id !== titleCandidate.id && titleScore > isrcScore) {
+      console.log('[qobuz] ISRC match wins over title candidate (different track)', 'isrc=' + isrcScore, 'title=' + titleScore, 'isrcId=' + isrcCandidate.id, 'titleId=' + titleCandidate.id);
     }
     return isrcCandidate;
   }
@@ -680,6 +690,35 @@ async function redisLoadTrackMeta(tid) {
 const raw = await upstashCmd('GET', 'mc:tmeta:' + tid);
 if (!raw) return null;
 try { return JSON.parse(raw); } catch(e) { return null; }
+}
+
+// Persist Qobuz track ID mapping (TIDAL id -> Qobuz track obj) to Redis
+// Survives across CF Worker isolates — fixes cross-isolate cache miss problem
+async function redisSaveQobuzId(tidalId, qobuzTrack) {
+  if (!tidalId || !qobuzTrack || !qobuzTrack.id) return;
+  await upstashCmd('SET', 'mc:qid:' + tidalId,
+    JSON.stringify({ id: qobuzTrack.id, title: qobuzTrack.title, bitdepth: qobuzTrack.bitdepth, maximumsamplingrate: qobuzTrack.maximumsamplingrate, samplingrate: qobuzTrack.samplingrate, hires: qobuzTrack.hires, hires_streamable: qobuzTrack.hires_streamable, streamable: qobuzTrack.streamable, displayable: qobuzTrack.displayable }),
+    'EX', 86400);
+}
+
+async function redisLoadQobuzId(tidalId) {
+  const raw = await upstashCmd('GET', 'mc:qid:' + tidalId);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch(e) { return null; }
+}
+
+// Persist pre-warmed Qobuz stream URL to Redis so any isolate can serve it instantly
+async function redisSaveQobuzStream(tidalId, prefKey, streamResult) {
+  if (!tidalId || !streamResult) return;
+  const k = 'mc:qstream:' + tidalId + ':' + (prefKey || 'auto');
+  await upstashCmd('SET', k, JSON.stringify(streamResult), 'EX', 1680); // 28min = Qobuz URL lifetime
+}
+
+async function redisLoadQobuzStream(tidalId, prefKey) {
+  const k = 'mc:qstream:' + tidalId + ':' + (prefKey || 'auto');
+  const raw = await upstashCmd('GET', k);
+  if (!raw) return null;
+  try { return JSON.parse(raw); } catch(e) { return null; }
 }
 
 async function redisSave(token, entry) {
@@ -1301,26 +1340,29 @@ cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
 redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
 // Background Qobuz pre-warm — find track AND pre-warm stream URL into cache
 // so /stream/:id returns instantly from cache without any live Qobuz API calls.
+// Also persists to Redis so any CF Worker isolate can serve the stream instantly.
 (async () => {
   try {
     const qTrack = await qobuzFindBestTrack(tTitle, tArtist, t.isrc || null, inst);
     if (qTrack && qTrack.id) {
-      cacheQobuzTrackId(t.id, qTrack); // cache mapping for instant stream lookup
-      // Pre-warm ALL quality tiers in parallel so any pref selection is instant at stream time.
-      // Using Promise.allSettled so all fire simultaneously and the cache is hot
-      // before the user taps play.
+      cacheQobuzTrackId(t.id, qTrack); // writes to in-memory + Redis (cross-isolate)
+      // Pre-warm all quality tiers in parallel — await so streams are in Redis before user taps play
       const preWarmKeys = [null, 'HIMAX', 'HI96', 'LOSSLESS', 'AAC320'];
-      await Promise.allSettled(preWarmKeys.map(key => {
-        const cKey = 'qstream:' + qTrack.id + ':' + (key || 'auto');
-        return cGet(cKey) ? Promise.resolve() : qobuzStream(qTrack.id, key).catch(() => {});
-      }));
-      // Write the top-quality result into tstream cache keyed by TIDAL id — stream route
-      // checks this first and returns instantly without entering any Qobuz pipeline.
-      const topStream = cGet('qstream:' + qTrack.id + ':auto')
-                     || cGet('qstream:' + qTrack.id + ':HIMAX');
-      if (topStream) {
-        cSet('tstream:' + String(t.id) + ':auto',  topStream, 1680);
-        cSet('tstream:' + String(t.id) + ':HIMAX', topStream, 1680);
+      const streamResults = await Promise.allSettled(
+        preWarmKeys.map(async key => {
+          const cKey = 'qstream:' + qTrack.id + ':' + (key || 'auto');
+          let result = cGet(cKey);
+          if (!result) result = await qobuzStream(qTrack.id, key).catch(() => null);
+          if (result) {
+            // Write to Redis keyed by TIDAL id so cross-isolate stream lookups are instant
+            await redisSaveQobuzStream(t.id, key, result).catch(() => {});
+          }
+          return result;
+        })
+      );
+      const firstStream = streamResults.find(r => r.status === 'fulfilled' && r.value)?.value;
+      if (firstStream) {
+        console.log('[prewarm] cached stream to Redis for tid=' + t.id + ' qid=' + qTrack.id + ' quality=' + firstStream.quality);
       }
     }
   } catch(e) {}
@@ -1402,17 +1444,6 @@ const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
 return dedupeCall('stream:' + tid + ':' + (inst || 'pool') + ':' + (pref || 'auto'), async () => {
-
-// Fast path: pre-warmed full stream result written during search pre-warm.
-// This is how streams become instant — same pattern as qobuz-tidal-eclipse.
-// If the search pre-warm completed before the user tapped play, we return immediately
-// without running any Qobuz or TIDAL lookup at all.
-const preWarmedStream = cGet('tstream:' + tid + ':' + (pref || 'auto'))
-                     || cGet('tstream:' + tid + ':auto');
-if (preWarmedStream && !(pref && ['TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW'].includes(pref))) {
-  console.log('[stream] tstream fast-path HIT tid=' + tid + ' source=' + preWarmedStream.source + ' quality=' + preWarmedStream.quality);
-  return Response.json(preWarmedStream);
-}
 
 // Step 1: title+artist from Eclipse query params (some clients send these)
 let qTitle = String(c.req.query('title') || '').trim();
@@ -1536,10 +1567,26 @@ const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
     // Cache hit = skip the entire qobuzFindBestTrack pipeline entirely.
     let qTrack = getCachedQobuzTrack(tid);
     if (qTrack) {
-      console.log('[stream] qobuz id-cache HIT tid=' + tid + ' -> qobuzId=' + qTrack.id);
+      console.log('[stream] qobuz id-cache HIT (memory) tid=' + tid + ' -> qobuzId=' + qTrack.id);
     } else {
+      // Check Redis — survives across CF Worker isolates (fixes cross-isolate cache miss)
+      qTrack = await redisLoadQobuzId(tid);
+      if (qTrack) {
+        cSet('qid:' + tid, qTrack, 3600); // warm local memory too
+        console.log('[stream] qobuz id-cache HIT (redis) tid=' + tid + ' -> qobuzId=' + qTrack.id);
+      }
+    }
+    if (!qTrack) {
+      // Also check if Redis has a pre-warmed stream URL directly (fastest possible path)
+      const preWarmedStream = await redisLoadQobuzStream(tid, qobuzPrefKey);
+      if (preWarmedStream) {
+        console.log('[stream] qobuz stream HIT (redis pre-warm) tid=' + tid + ' quality=' + preWarmedStream.quality);
+        return preWarmedStream;
+      }
+    }
+    if (!qTrack) {
       qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
-      if (qTrack && qTrack.id) cacheQobuzTrackId(tid, qTrack);
+      if (qTrack && qTrack.id) cacheQobuzTrackId(tid, qTrack); // writes to both memory + Redis
     }
     if (!qTrack || !qTrack.id) return null;
     // Title sanity check: if we have a known title and the Qobuz track title shares
