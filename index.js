@@ -457,7 +457,7 @@ async function getIsrcFromDeezer(query, knownArtist) {
 // Returns { isrc, track, source, score } or null.
 async function resolveIsrc(title, artist, instanceUrl) {
   const query = (artist ? artist + ' ' : '') + removeFeat(title || '');
-  const cacheKey = 'isrc2:' + query.toLowerCase();
+  const cacheKey = 'isrc2:' + (artist ? artist.toLowerCase() + ':' : '') + removeFeat(title || '').toLowerCase();
   const cached = cGet(cacheKey);
   if (cached === 'MISS') return null;
   if (cached) return cached;
@@ -1305,14 +1305,22 @@ redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
   try {
     const qTrack = await qobuzFindBestTrack(tTitle, tArtist, t.isrc || null, inst);
     if (qTrack && qTrack.id) {
-      cacheQobuzTrackId(t.id, qTrack); // NEW: cache mapping for instant stream lookup
-      // Pre-warm all common quality tiers so any pref selection is instant
-      const preWarmKeys = [null, 'HIMAX', 'HI96', 'LOSSLESS'];
-      for (const key of preWarmKeys) {
+      cacheQobuzTrackId(t.id, qTrack); // cache mapping for instant stream lookup
+      // Pre-warm ALL quality tiers in parallel so any pref selection is instant at stream time.
+      // Using Promise.allSettled so all fire simultaneously and the cache is hot
+      // before the user taps play.
+      const preWarmKeys = [null, 'HIMAX', 'HI96', 'LOSSLESS', 'AAC320'];
+      await Promise.allSettled(preWarmKeys.map(key => {
         const cKey = 'qstream:' + qTrack.id + ':' + (key || 'auto');
-        if (!cGet(cKey)) {
-          qobuzStream(qTrack.id, key).catch(() => {});
-        }
+        return cGet(cKey) ? Promise.resolve() : qobuzStream(qTrack.id, key).catch(() => {});
+      }));
+      // Write the top-quality result into tstream cache keyed by TIDAL id — stream route
+      // checks this first and returns instantly without entering any Qobuz pipeline.
+      const topStream = cGet('qstream:' + qTrack.id + ':auto')
+                     || cGet('qstream:' + qTrack.id + ':HIMAX');
+      if (topStream) {
+        cSet('tstream:' + String(t.id) + ':auto',  topStream, 1680);
+        cSet('tstream:' + String(t.id) + ':HIMAX', topStream, 1680);
       }
     }
   } catch(e) {}
@@ -1394,6 +1402,17 @@ const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
 return dedupeCall('stream:' + tid + ':' + (inst || 'pool') + ':' + (pref || 'auto'), async () => {
+
+// Fast path: pre-warmed full stream result written during search pre-warm.
+// This is how streams become instant — same pattern as qobuz-tidal-eclipse.
+// If the search pre-warm completed before the user tapped play, we return immediately
+// without running any Qobuz or TIDAL lookup at all.
+const preWarmedStream = cGet('tstream:' + tid + ':' + (pref || 'auto'))
+                     || cGet('tstream:' + tid + ':auto');
+if (preWarmedStream && !(pref && ['TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW'].includes(pref))) {
+  console.log('[stream] tstream fast-path HIT tid=' + tid + ' source=' + preWarmedStream.source + ' quality=' + preWarmedStream.quality);
+  return Response.json(preWarmedStream);
+}
 
 // Step 1: title+artist from Eclipse query params (some clients send these)
 let qTitle = String(c.req.query('title') || '').trim();
