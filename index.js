@@ -716,25 +716,34 @@ async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
     const cached = cGet(cacheKey);
     if (cached !== 'MISS' && cached) titleCandidate = cached;
     else {
-      const q = (artist ? artist + ' ' : '') + removeFeat(title);
+      // Try both orderings: "Artist Title" and "Title Artist"
+      // Qobuz search is word-order sensitive — rare artists need title-first for best recall
+      const qArtistFirst = (artist ? artist + ' ' : '') + removeFeat(title);
+      const qTitleFirst  = removeFeat(title) + (artist ? ' ' + artist : '');
+      const queries = qArtistFirst === qTitleFirst ? [qArtistFirst] : [qArtistFirst, qTitleFirst];
+      // Use lower threshold when ISRC confirmed but not in Qobuz vault — track definitely exists
+      const scoreThreshold = isrcCandidate ? 10 : 40;
+      outer:
       for (const inst of QOBUZ_INSTANCES) {
-        try {
-          const r = await axios.get(inst + '/search', {
-            params: { q, limit: 15 },
-            headers: { 'User-Agent': UA },
-            timeout: 10000
-          });
-          const items = r.data?.tracks?.items || [];
-          if (!items.length) continue;
-          const match = scoringFindBest(items, (artist ? artist + ' ' : '') + title, artist);
-          if (match.item && match.score >= 40) {
-            if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-            cSet(cacheKey, match.item, 3600);
-            console.log('[qobuz] title search HIT score=' + match.score, match.item.title);
-            titleCandidate = match.item;
-            break;
-          }
-        } catch(e) { continue; }
+        for (const q of queries) {
+          try {
+            const r = await axios.get(inst + '/search', {
+              params: { q, limit: 25 },
+              headers: { 'User-Agent': UA },
+              timeout: 10000
+            });
+            const items = r.data?.tracks?.items || [];
+            if (!items.length) continue;
+            const match = scoringFindBest(items, (artist ? artist + ' ' : '') + title, artist);
+            if (match.item && match.score >= scoreThreshold) {
+              if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
+              cSet(cacheKey, match.item, 3600);
+              console.log('[qobuz] title search HIT score=' + match.score, match.item.title);
+              titleCandidate = match.item;
+              break outer;
+            }
+          } catch(e) { continue; }
+        }
       }
       if (!titleCandidate) cSet(cacheKey, 'MISS', 1800);
     }
