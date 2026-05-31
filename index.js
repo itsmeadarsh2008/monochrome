@@ -980,9 +980,9 @@ h += '<svg width="52" height="52" viewBox="0 0 52 52" fill="none" style="margin-
 
 h += '<div class="card">';
 h += '<h1>Monochrome for Eclipse</h1>';
-h += '<p class="sub">Full TIDAL catalog &mdash; lossless FLAC, HiRes, AAC 320 &mdash; no account needed. Qobuz Hi-Res &rarr; TIDAL &rarr; fallback.</p>';
+h += '<p class="sub">Full TIDAL catalog &mdash; FLAC Hi-Res 24-bit, FLAC 16-bit, AAC fallback &mdash; no account needed. Qobuz Hi-Res &rarr; TIDAL FLAC &rarr; fallback.</p>';
 h += '<div class="tip"><b>Save your URL.</b> Paste it below to refresh without reinstalling.</div>';
-h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC / HiRes</span><span class="pill hi">AAC 320</span><span class="pill hi">Qobuz 24-bit</span></div>';
+h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC Hi-Res 24-bit</span><span class="pill hi">FLAC 16-bit</span><span class="pill hi">Qobuz Hi-Res</span></div>';
 
 h += '<div class="lbl">Custom Hi&#8209;Fi Instance <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<input type="text" id="customInstance" placeholder="https://your-instance.example.com">';
@@ -1002,15 +1002,15 @@ h += '</div>';
 
 h += '<div class="ql-group-label" style="margin-top:14px">&#9675; TIDAL (skips Qobuz)</div>';
 h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-TIDAL_HIMAX"    onclick="selectQ(\'TIDAL_HIMAX\',\'t\')">Hi-Res Max<span class="ql-sub">24-bit / up to 192kHz</span></div>';
-h += '<div class="ql-btn" id="ql-TIDAL_LOSSLESS" onclick="selectQ(\'TIDAL_LOSSLESS\',\'t\')">CD Quality<span class="ql-sub">16-bit / 44.1kHz</span></div>';
+h += '<div class="ql-btn" id="ql-TIDAL_HIMAX"    onclick="selectQ(\'TIDAL_HIMAX\',\'t\')">FLAC Hi-Res<span class="ql-sub">24-bit / up to 192kHz</span></div>';
+h += '<div class="ql-btn" id="ql-TIDAL_LOSSLESS" onclick="selectQ(\'TIDAL_LOSSLESS\',\'t\')">FLAC 16-bit<span class="ql-sub">44.1kHz Lossless</span></div>';
 h += '</div>';
 h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-TIDAL_HIGH"  onclick="selectQ(\'TIDAL_HIGH\',\'t\')">320 kbps<span class="ql-sub">TIDAL AAC 320</span></div>';
-h += '<div class="ql-btn" id="ql-TIDAL_LOW"   onclick="selectQ(\'TIDAL_LOW\',\'t\')">96 kbps<span class="ql-sub">TIDAL AAC 96</span></div>';
+h += '<div class="ql-btn" id="ql-TIDAL_HIGH"  onclick="selectQ(\'TIDAL_HIGH\',\'t\')">AAC 320<span class="ql-sub">TIDAL AAC 320 kbps</span></div>';
+h += '<div class="ql-btn" id="ql-TIDAL_LOW"   onclick="selectQ(\'TIDAL_LOW\',\'t\')">AAC 96<span class="ql-sub">TIDAL AAC 96 kbps</span></div>';
 h += '</div>';
 
-h += '<div class="hint" id="qlHint" style="margin-top:8px">No preference &mdash; auto-selects: Qobuz Hi-Res &rarr; TIDAL Lossless &rarr; AAC 320 &rarr; AAC 96.</div>';
+h += '<div class="hint" id="qlHint" style="margin-top:8px">No preference &mdash; auto-selects: Qobuz Hi-Res 24-bit &rarr; TIDAL Hi-Res FLAC &rarr; FLAC 16-bit &rarr; AAC 320 &rarr; AAC 96.</div>';
 
 h += '<div class="lbl">Addon Name <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<input type="text" id="customAddonName" placeholder="Claudochrome" maxlength="40">';
@@ -1039,7 +1039,7 @@ h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</
 h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>';
 h += '<div class="step"><div class="sn">4</div><div class="st">Search TIDAL\'s full catalog &mdash; Qobuz Hi-Res played first automatically</div></div>';
 h += '</div>';
-h += '<div class="warn">Stream priority: <b>Qobuz Hi-Res 24-bit</b> &rarr; TIDAL Lossless/HiRes &rarr; lower quality fallback. Selecting a <b>TIDAL</b> tier skips Qobuz entirely.</div>';
+h += '<div class="warn">Stream priority: <b>Qobuz Hi-Res 24-bit FLAC</b> &rarr; TIDAL Hi-Res FLAC &rarr; TIDAL FLAC 16-bit &rarr; AAC 320 &rarr; AAC 96. Selecting a <b>TIDAL</b> tier skips Qobuz entirely. AAC 320 only plays if FLAC is unavailable.</div>';
 h += '</div>';
 
 
@@ -1066,10 +1066,10 @@ h += 'var QLABELS={';
 h += '"HIMAX":"Hi-Res 192 \u00b7 24-bit/192kHz",';
 h += '"HI96":"Hi-Res 96 \u00b7 24-bit/96kHz",';
 h += '"LOSSLESS":"CD Quality \u00b7 16-bit/44.1kHz",';
-h += '"TIDAL_HIMAX":"TIDAL Hi-Res \u00b7 24-bit/192kHz",';
-h += '"TIDAL_LOSSLESS":"TIDAL CD Quality \u00b7 16-bit/44.1kHz",';
-h += '"TIDAL_HIGH":"TIDAL 320 kbps",';
-h += '"TIDAL_LOW":"TIDAL 96 kbps"';
+h += '"TIDAL_HIMAX":"TIDAL Hi-Res FLAC \u00b7 24-bit/192kHz",';
+h += '"TIDAL_LOSSLESS":"TIDAL FLAC \u00b7 16-bit/44.1kHz",';
+h += '"TIDAL_HIGH":"TIDAL AAC 320 kbps",';
+h += '"TIDAL_LOW":"TIDAL AAC 96 kbps"';
 h += '};';
 
 h += 'function selectQ(q,grp){';
@@ -1513,7 +1513,7 @@ const PREF_TO_TIDAL = {
   'TIDAL_HIGH': 'HIGH', 'TIDAL_LOW': 'LOW',
 };
 const ALL_QUALITIES  = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];
-const AUTO_QUALITIES = ['LOSSLESS', 'HIGH', 'LOW'];
+const AUTO_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];  // always try Hi-Res FLAC first
 
 // ── TIDAL stream helper ───────────────────────────────────────────────────────
 async function getTidalStream() {
@@ -1531,14 +1531,14 @@ async function getTidalStream() {
         if (decoded && decoded.url) {
           const codec = (decoded.codec || '').toLowerCase();
           const isFlac = decoded.isDash || codec.includes('flac') || codec.includes('audio/flac');
-          const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
+          const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'Hi-Res FLAC' : ql === 'LOSSLESS' ? 'FLAC 16-bit / 44.1 kHz' : ql === 'HIGH' ? '320kbps AAC' : '96kbps AAC';
           return { url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000 + 21600) };
         }
       }
       if (payload && payload.url) {
         const looksLikeFlac = (payload.url || '').match(/\.flac(\?|$)/i);
         const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
-        const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'hires' : ql === 'LOSSLESS' ? 'lossless' : ql === 'HIGH' ? '320kbps' : '96kbps';
+        const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'Hi-Res FLAC' : ql === 'LOSSLESS' ? 'FLAC 16-bit / 44.1 kHz' : ql === 'HIGH' ? '320kbps AAC' : '96kbps AAC';
         return { url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000 + 21600) };
       }
     } catch(e) {
