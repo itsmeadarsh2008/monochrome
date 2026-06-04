@@ -730,6 +730,10 @@ reqCount: entry.reqCount || 0,
 instanceUrl: entry.instanceUrl || null,
 preferredQuality: entry.preferredQuality || null,
 addonName: entry.addonName || null,
+jellyfinUrl: entry.jellyfinUrl || null,
+jellyfinToken: entry.jellyfinToken || null,
+jellyfinUserId: entry.jellyfinUserId || null,
+jellyfinPriority: entry.jellyfinPriority || null,
 }), 'EX', 2592000);
 }
 
@@ -745,6 +749,10 @@ reqCount: p.reqCount || 0,
 instanceUrl: p.instanceUrl || null,
 preferredQuality: p.preferredQuality || null,
 addonName: p.addonName || null,
+jellyfinUrl: p.jellyfinUrl || null,
+jellyfinToken: p.jellyfinToken || null,
+jellyfinUserId: p.jellyfinUserId || null,
+jellyfinPriority: p.jellyfinPriority || null,
 };
 } catch(e) { return null; }
 }
@@ -879,12 +887,12 @@ async function getTokenEntry(token) {
 if (TOKEN_CACHE.has(token)) return TOKEN_CACHE.get(token);
 var saved = await redisLoad(token);
 if (saved) {
-var entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, instanceUrl: saved.instanceUrl || null, preferredQuality: saved.preferredQuality || null, addonName: saved.addonName || null, rateWin: [] };
+var entry = { createdAt: saved.createdAt, lastUsed: saved.lastUsed, reqCount: saved.reqCount, instanceUrl: saved.instanceUrl || null, preferredQuality: saved.preferredQuality || null, addonName: saved.addonName || null, jellyfinUrl: saved.jellyfinUrl || null, jellyfinToken: saved.jellyfinToken || null, jellyfinUserId: saved.jellyfinUserId || null, jellyfinPriority: saved.jellyfinPriority || null, rateWin: [] };
 TOKEN_CACHE.set(token, entry);
 return entry;
 }
 if (/^[a-f0-9]{28}$/.test(token)) {
-var fresh = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl: null, preferredQuality: null, addonName: null };
+var fresh = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl: null, preferredQuality: null, addonName: null, jellyfinUrl: null, jellyfinToken: null, jellyfinUserId: null, jellyfinPriority: null };
 TOKEN_CACHE.set(token, fresh);
 return fresh;
 }
@@ -924,6 +932,76 @@ return { token, embeddedInstance, embeddedName };
 }
 
 // ─── Config page ──────────────────────────────────────────────────────────────
+
+// ─── Jellyfin client ──────────────────────────────────────────────────────────
+// jellyfinAuth: exchanges username+password for an API token at generate-time.
+// Credentials are never stored — only the resulting token+userId goes to Redis.
+async function jellyfinAuth(serverUrl, username, password) {
+  const base = serverUrl.replace(/\/$/, '');
+  try {
+    const res = await fetch(base + '/Users/AuthenticateByName', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Emby-Authorization': 'MediaBrowser Client="Monochrome", Device="Worker", DeviceId="monochrome-worker", Version="1.0.0"',
+      },
+      body: JSON.stringify({ Username: username, Pw: password }),
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const token = data && data.AccessToken ? data.AccessToken : null;
+    const userId = data && data.User && data.User.Id ? data.User.Id : null;
+    if (!token || !userId) return null;
+    return { token, userId };
+  } catch(e) { return null; }
+}
+
+// jellyfinStream: searches the Jellyfin library for a matching audio track.
+// Uses static=true for lossless passthrough. Returns stream result or null.
+async function jellyfinStream(serverUrl, apiToken, userId, title, artist) {
+  if (!serverUrl || !apiToken || !userId || !title) return null;
+  const base = serverUrl.replace(/\/$/, '');
+  const authHeader = 'MediaBrowser Token="' + apiToken + '"';
+  try {
+    const searchRes = await fetch(
+      base + '/Items?searchTerm=' + encodeURIComponent(title) +
+      '&IncludeItemTypes=Audio&Recursive=true&Limit=10&UserId=' + userId +
+      '&Fields=MediaSources',
+      { headers: { 'X-Emby-Authorization': authHeader }, signal: AbortSignal.timeout(8000) }
+    );
+    if (!searchRes.ok) return null;
+    const searchData = await searchRes.json();
+    const items = searchData && searchData.Items ? searchData.Items : [];
+    if (!items.length) return null;
+    const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').trim();
+    const wantTitle = norm(title);
+    const wantArtist = artist ? norm(artist) : null;
+    let best = null, bestScore = -1;
+    for (const item of items) {
+      const gotTitle  = norm(item.Name || '');
+      const gotArtist = norm((item.AlbumArtist) || (item.Artists && item.Artists[0]) || '');
+      let score = 0;
+      if (gotTitle === wantTitle) score += 100;
+      else if (gotTitle.includes(wantTitle) || wantTitle.includes(gotTitle)) score += 50;
+      if (wantArtist && (gotArtist.includes(wantArtist) || wantArtist.includes(gotArtist))) score += 40;
+      if (score > bestScore) { bestScore = score; best = item; }
+    }
+    if (!best || bestScore < 30) return null;
+    const streamUrl  = base + '/Audio/' + best.Id + '/stream?static=true&api_key=' + apiToken;
+    const mediaSrc   = best.MediaSources && best.MediaSources[0] ? best.MediaSources[0] : null;
+    const bitrate    = mediaSrc && mediaSrc.Bitrate ? Math.round(mediaSrc.Bitrate / 1000) + ' kbps' : null;
+    const container  = mediaSrc && mediaSrc.Container ? mediaSrc.Container.toUpperCase() : 'Audio';
+    const qualLabel  = bitrate ? container + ' ' + bitrate : 'Jellyfin ' + container;
+    const fmt        = ['flac','alac','wav','aiff'].includes((mediaSrc && mediaSrc.Container ? mediaSrc.Container : '').toLowerCase()) ? 'flac' : 'aac';
+    console.log('[jellyfin] HIT', best.Id, best.Name, qualLabel);
+    return { url: streamUrl, format: fmt, quality: qualLabel, source: 'jellyfin', expiresAt: Math.floor(Date.now() / 1000) + 21600 };
+  } catch(e) {
+    console.warn('[jellyfin] stream error:', e.message);
+    return null;
+  }
+}
+
 function buildConfigPage(baseUrl) {
 var h = '';
 h += '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">';
@@ -1012,6 +1090,39 @@ h += '<div class="ql-btn" id="ql-TIDAL_LOW"   onclick="selectQ(\'TIDAL_LOW\',\'t
 h += '</div>';
 
 h += '<div class="hint" id="qlHint" style="margin-top:8px">No preference &mdash; auto-selects: Qobuz Hi-Res 24-bit &rarr; TIDAL Hi-Res FLAC &rarr; FLAC 16-bit &rarr; AAC 320 &rarr; AAC 96.</div>';
+
+h += '<details id="jfSection">';
+h += '<summary id="jfSummary" style="display:flex;align-items:center;gap:0.5rem;cursor:pointer;padding:0.85rem 0;font-size:0.88rem;font-weight:600;list-style:none;-webkit-user-select:none;user-select:none;border-top:1px solid #222;border-bottom:1px solid #222;margin-bottom:1.1rem;">';
+h += '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;opacity:0.7"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>';
+h += 'Jellyfin Server <span style="font-size:0.72rem;font-weight:400;color:#555;margin-left:0.2rem;">(optional)</span>';
+h += '<span id="jfBadge" style="display:none;margin-left:0.5rem;font-size:0.68rem;font-weight:700;padding:0.12rem 0.5rem;border-radius:9999px;background:#1a3a1a;color:#5fc45f;letter-spacing:0.04em;">CONNECTED</span>';
+h += '<svg id="jfChevron" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-left:auto;transition:transform 0.2s ease;"><polyline points="6 9 12 15 18 9"/></svg>';
+h += '</summary>';
+h += '<div style="display:flex;flex-direction:column;gap:0.85rem;padding-bottom:1.1rem;">';
+h += '<p style="font-size:0.78rem;color:#888;margin:0;line-height:1.55;">Stream directly from your personal Jellyfin library. Your username and password are used <em>once</em> to obtain an API token &mdash; only the token is stored, never your credentials.</p>';
+h += '<div class="lbl">Server URL</div>';
+h += '<input type="url" id="jfUrl" placeholder="https://jellyfin.yourdomain.com" autocomplete="off">';
+h += '<div class="lbl">Username</div>';
+h += '<input type="text" id="jfUsername" placeholder="admin" autocomplete="off">';
+h += '<div class="lbl">Password</div>';
+h += '<input type="password" id="jfPassword" placeholder="&bull;&bull;&bull;&bull;&bull;&bull;&bull;&bull;" autocomplete="new-password">';
+h += '<div class="lbl" style="margin-top:0.2rem;">Stream Priority</div>';
+h += '<div style="display:flex;flex-direction:column;gap:0.5rem;">';
+h += '<label style="display:flex;align-items:flex-start;gap:0.65rem;cursor:pointer;padding:0.65rem 0.75rem;border-radius:7px;border:1px solid #2a2a2a;background:#0e0e0e;">';
+h += '<input type="radio" name="jfPriority" value="jellyfin-first" style="margin-top:3px;flex-shrink:0;">';
+h += '<span><strong style="font-size:0.84rem;display:block;margin-bottom:0.15rem;">Jellyfin &rarr; Qobuz &rarr; TIDAL</strong><small style="color:#666;font-size:0.76rem;">Your library plays first. Falls back to Qobuz then TIDAL if the track is not in your library.</small></span>';
+h += '</label>';
+h += '<label style="display:flex;align-items:flex-start;gap:0.65rem;cursor:pointer;padding:0.65rem 0.75rem;border-radius:7px;border:1px solid #2a2a2a;background:#0e0e0e;">';
+h += '<input type="radio" name="jfPriority" value="jellyfin-last" checked style="margin-top:3px;flex-shrink:0;">';
+h += '<span><strong style="font-size:0.84rem;display:block;margin-bottom:0.15rem;">Qobuz &rarr; TIDAL &rarr; Jellyfin</strong><small style="color:#666;font-size:0.76rem;">Streaming services play first. Jellyfin is used only as a last resort if both fail.</small></span>';
+h += '</label>';
+h += '<label style="display:flex;align-items:flex-start;gap:0.65rem;cursor:pointer;padding:0.65rem 0.75rem;border-radius:7px;border:1px solid #2a2a2a;background:#0e0e0e;">';
+h += '<input type="radio" name="jfPriority" value="none" style="margin-top:3px;flex-shrink:0;">';
+h += '<span><strong style="font-size:0.84rem;display:block;margin-bottom:0.15rem;">No Jellyfin</strong><small style="color:#666;font-size:0.76rem;">Ignore Jellyfin entirely. Original Qobuz &rarr; TIDAL behavior.</small></span>';
+h += '</label>';
+h += '</div>';
+h += '</div>';
+h += '</details>';
 
 h += '<div class="lbl">Addon Name <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<input type="text" id="customAddonName" placeholder="Claudochrome" maxlength="40">';
@@ -1108,6 +1219,12 @@ h += '  var body={};';
 h += '  if(ci)body.instanceUrl=ci;';
 h += '  if(an)body.addonName=an;';
 h += '  if(selQ)body.preferredQuality=selQ;';
+h += '  var jfUrl=(document.getElementById(\'jfUrl\')||{}).value||\'\';';
+h += '  var jfUser=(document.getElementById(\'jfUsername\')||{}).value||\'\';';
+h += '  var jfPass=(document.getElementById(\'jfPassword\')||{}).value||\'\';';
+h += '  var jfPrioEl=document.querySelector(\'input[name=\"jfPriority\"]:checked\');';
+h += '  var jfPrio=jfPrioEl?jfPrioEl.value:\'none\';';
+h += '  if(jfUrl){body.jellyfinUrl=jfUrl;body.jellyfinUsername=jfUser;body.jellyfinPassword=jfPass;body.jellyfinPriority=jfPrio;}';
 h += '  fetch("/generate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)})';
 h += '  .then(function(r){return r.json();})';
 h += '  .then(function(d){';
@@ -1118,6 +1235,7 @@ h += '    updateBadge();';
 h += '    document.getElementById("genQualBadge").style.display="inline-flex";';
 h += '    document.getElementById("genBox").style.display="block";';
 h += '    btn.disabled=false;btn.textContent="Generate Another URL";';
+h += '    var jfB=document.getElementById(\'jfBadge\');var jfUrlVal=(document.getElementById(\'jfUrl\')||{}).value||\'\';if(jfB&&jfUrlVal){jfB.style.display=\'inline\';}';
 h += '  })';
 h += '  .catch(function(e){alert("Error: "+e.message);btn.disabled=false;btn.textContent="Generate My Addon URL";});';
 h += '}';
@@ -1149,6 +1267,7 @@ h += '}';
 // Qobuz ping
 
 
+h += '(function(){var det=document.getElementById(\'jfSection\');var chev=document.getElementById(\'jfChevron\');if(!det||!chev)return;det.addEventListener(\'toggle\',function(){chev.style.transform=det.open?\'rotate(180deg)\':\'\';});})();';
 h += 'checkHealth();';
 h += '</script>';
 h += '</body></html>';
@@ -1183,9 +1302,25 @@ await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, time
 }
 const VALID_QUALITIES = ['HI_RES_LOSSLESS','HIRESLOSSLESS','HIMAX','HI96','LOSSLESS','HIGH','AAC320','LOW','AAC96','TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW'];
 const preferredQuality = (body && body.preferredQuality && VALID_QUALITIES.includes(body.preferredQuality)) ? body.preferredQuality : null;
+// ── Jellyfin (optional) ───────────────────────────────────────────────────────
+let jellyfinUrl = null, jellyfinToken = null, jellyfinUserId = null, jellyfinPriority = null;
+const VALID_JF_PRIORITIES = ['jellyfin-first', 'jellyfin-last', 'none'];
+if (body && body.jellyfinUrl && String(body.jellyfinUrl).trim()) {
+  jellyfinUrl = String(body.jellyfinUrl).trim().replace(/\/$/, '');
+  if (!/^https?:\/\//.test(jellyfinUrl)) return Response.json({ error: 'Jellyfin server URL must start with http or https' }, { status: 400 });
+  const jfUser = body.jellyfinUsername ? String(body.jellyfinUsername).trim() : '';
+  const jfPass = body.jellyfinPassword !== undefined ? String(body.jellyfinPassword) : '';
+  if (!jfUser) return Response.json({ error: 'Jellyfin username is required when providing a server URL' }, { status: 400 });
+  const jfAuth = await jellyfinAuth(jellyfinUrl, jfUser, jfPass);
+  if (!jfAuth) return Response.json({ error: 'Could not authenticate with your Jellyfin server. Check the URL, username, and password.' }, { status: 400 });
+  jellyfinToken  = jfAuth.token;
+  jellyfinUserId = jfAuth.userId;
+  jellyfinPriority = (body.jellyfinPriority && VALID_JF_PRIORITIES.includes(body.jellyfinPriority))
+    ? body.jellyfinPriority : 'jellyfin-last';
+}
 const token = generateToken();
 const addonName = (body && body.addonName && String(body.addonName).trim()) ? String(body.addonName).trim().slice(0, 40) : null;
-const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality, addonName };
+const entry = { createdAt: Date.now(), lastUsed: Date.now(), reqCount: 0, rateWin: [], instanceUrl, preferredQuality, addonName, jellyfinUrl, jellyfinToken, jellyfinUserId, jellyfinPriority };
 TOKEN_CACHE.set(token, entry);
 await redisSave(token, entry);
 bucket.count++;
@@ -1619,16 +1754,39 @@ const tidalPromise = (async () => {
   try { return await getTidalStream(); } catch(e) { return null; }
 })();
 
-// Race: return Qobuz if it wins with a result, otherwise TIDAL, otherwise error.
-const [qResult, tResult] = await Promise.all([qobuzPromise, tidalPromise]);
+// ── Jellyfin priority routing ────────────────────────────────────────────────
+// jellyfin-first : Jellyfin wins if found, then Qobuz → TIDAL
+// jellyfin-last  : Qobuz → TIDAL first, Jellyfin only if both fail (all 3 run in parallel)
+// none / default : original Qobuz → TIDAL behavior, unchanged
+const jfPriority  = entry.jellyfinPriority || 'none';
+const hasJellyfin = !!(entry.jellyfinUrl && entry.jellyfinToken && entry.jellyfinUserId && jfPriority !== 'none');
+let finalResult = null;
 
-if (qResult) {
-  cSet('tstream:' + tid + ':' + (pref || 'auto'), qResult, 1680);
-  return Response.json(qResult);
+if (jfPriority === 'jellyfin-first' && hasJellyfin) {
+  const jfResult = await jellyfinStream(entry.jellyfinUrl, entry.jellyfinToken, entry.jellyfinUserId, qTitle, qArtist);
+  if (jfResult) {
+    console.log('[stream] jellyfin-first HIT');
+    finalResult = jfResult;
+  } else {
+    console.log('[stream] jellyfin-first MISS — falling back to Qobuz/TIDAL');
+    const [qResult, tResult] = await Promise.all([qobuzPromise, tidalPromise]);
+    finalResult = qResult || tResult || null;
+  }
+} else if (jfPriority === 'jellyfin-last' && hasJellyfin) {
+  // All three run in parallel — Qobuz and TIDAL preferred, Jellyfin is last resort
+  const jellyfinFallbackPromise = jellyfinStream(entry.jellyfinUrl, entry.jellyfinToken, entry.jellyfinUserId, qTitle, qArtist);
+  const [qResult, tResult, jfResult] = await Promise.all([qobuzPromise, tidalPromise, jellyfinFallbackPromise]);
+  if (!qResult && !tResult && jfResult) console.log('[stream] jellyfin-last fallback HIT');
+  finalResult = qResult || tResult || jfResult || null;
+} else {
+  // Default — no Jellyfin, original behavior
+  const [qResult, tResult] = await Promise.all([qobuzPromise, tidalPromise]);
+  finalResult = qResult || tResult || null;
 }
-if (tResult) {
-  cSet('tstream:' + tid + ':' + (pref || 'auto'), tResult, 1680);
-  return Response.json(tResult);
+
+if (finalResult) {
+  cSet('tstream:' + tid + ':' + (pref || 'auto'), finalResult, 1680);
+  return Response.json(finalResult);
 }
 return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
 }); // end dedupeCall
