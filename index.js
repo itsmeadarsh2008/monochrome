@@ -964,18 +964,21 @@ async function jellyfinStream(serverUrl, apiToken, userId, title, artist) {
   const base = serverUrl.replace(/\/$/, '');
   const authHeader = 'MediaBrowser Token="' + apiToken + '"';
   try {
+    // FIX: Use /Users/:userId/Items — correct Jellyfin REST path (not /Items directly)
     const searchRes = await fetch(
-      base + '/Items?searchTerm=' + encodeURIComponent(title) +
-      '&IncludeItemTypes=Audio&Recursive=true&Limit=10&UserId=' + userId +
-      '&Fields=MediaSources',
+      base + '/Users/' + userId + '/Items?searchTerm=' + encodeURIComponent(title) +
+      '&IncludeItemTypes=Audio&Recursive=true&Limit=20&Fields=MediaSources,Path',
       { headers: { 'X-Emby-Authorization': authHeader }, signal: AbortSignal.timeout(8000) }
     );
-    if (!searchRes.ok) return null;
+    if (!searchRes.ok) {
+      console.warn('[jellyfin] search HTTP', searchRes.status, 'for title:', title);
+      return null;
+    }
     const searchData = await searchRes.json();
     const items = searchData && searchData.Items ? searchData.Items : [];
     if (!items.length) return null;
     const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').trim();
-    const wantTitle = norm(title);
+    const wantTitle  = norm(title);
     const wantArtist = artist ? norm(artist) : null;
     let best = null, bestScore = -1;
     for (const item of items) {
@@ -987,15 +990,22 @@ async function jellyfinStream(serverUrl, apiToken, userId, title, artist) {
       if (wantArtist && (gotArtist.includes(wantArtist) || wantArtist.includes(gotArtist))) score += 40;
       if (score > bestScore) { bestScore = score; best = item; }
     }
-    if (!best || bestScore < 30) return null;
-    const streamUrl  = base + '/Audio/' + best.Id + '/stream?static=true&api_key=' + apiToken;
-    const mediaSrc   = best.MediaSources && best.MediaSources[0] ? best.MediaSources[0] : null;
-    const bitrate    = mediaSrc && mediaSrc.Bitrate ? Math.round(mediaSrc.Bitrate / 1000) + ' kbps' : null;
-    const container  = mediaSrc && mediaSrc.Container ? mediaSrc.Container.toUpperCase() : 'Audio';
-    const qualLabel  = bitrate ? container + ' ' + bitrate : 'Jellyfin ' + container;
-    const fmt        = ['flac','alac','wav','aiff'].includes((mediaSrc && mediaSrc.Container ? mediaSrc.Container : '').toLowerCase()) ? 'flac' : 'aac';
+    // Lowered threshold to 20 — title partial match (50) alone is sufficient
+    if (!best || bestScore < 20) return null;
+    // FIX: Use /universal endpoint with passthrough codecs — works in Eclipse
+    const streamUrl = base + '/Audio/' + best.Id +
+      '/universal?static=true&api_key=' + apiToken +
+      '&audioCodec=flac,alac,wav,aiff,mp3,aac';
+    const mediaSrc  = best.MediaSources && best.MediaSources[0] ? best.MediaSources[0] : null;
+    const bitrate   = mediaSrc && mediaSrc.Bitrate ? Math.round(mediaSrc.Bitrate / 1000) + ' kbps' : null;
+    const container = mediaSrc && mediaSrc.Container ? mediaSrc.Container.toUpperCase() : 'Audio';
+    const qualLabel = bitrate ? container + ' ' + bitrate : 'Jellyfin ' + container;
+    const fmt       = ['flac','alac','wav','aiff'].includes(
+      (mediaSrc && mediaSrc.Container ? mediaSrc.Container : '').toLowerCase()
+    ) ? 'flac' : 'aac';
     console.log('[jellyfin] HIT', best.Id, best.Name, qualLabel);
-    return { url: streamUrl, format: fmt, quality: qualLabel, source: 'jellyfin', expiresAt: Math.floor(Date.now() / 1000) + 21600 };
+    return { url: streamUrl, format: fmt, quality: qualLabel, source: 'jellyfin',
+             expiresAt: Math.floor(Date.now() / 1000) + 21600 };
   } catch(e) {
     console.warn('[jellyfin] stream error:', e.message);
     return null;
@@ -1412,7 +1422,10 @@ version: '3.0.0',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRtklZxzKIxXbfKsPsGTlnL6lbQqrr1fsIuJY2g4Xtt4w&s=10',
 resources: ['search', 'stream', 'catalog'],
-types: ['track', 'album', 'artist', 'playlist']
+types: ['track', 'album', 'artist', 'playlist'],
+catalogs: (entry.jellyfinUrl && entry.jellyfinToken && entry.jellyfinPriority !== 'none')
+  ? [{ type: 'playlist', id: 'jellyfin-library', name: '\uD83C\uDFB5 My Jellyfin Library', extra: [] }]
+  : [],
 });
 });
 });
@@ -1541,6 +1554,19 @@ for (const p of [...(Array.isArray(plFromSearch) ? plFromSearch : []),
   if (plItems.length >= 10) break;
 }
 
+// FIX: Inject Jellyfin Library as a virtual playlist when configured
+const hasJfCatalog = !!(entry.jellyfinUrl && entry.jellyfinToken && entry.jellyfinUserId &&
+                        entry.jellyfinPriority && entry.jellyfinPriority !== 'none');
+if (hasJfCatalog) {
+  plItems.unshift({
+    id: 'jellyfin-library',
+    title: '🎵 My Jellyfin Library',
+    creator: 'Jellyfin',
+    artworkURL: undefined,
+    trackCount: undefined,
+    isJellyfinLibrary: true,
+  });
+}
 const result = { tracks, albums: Object.values(albumMap).slice(0, 8), artists: artistList, playlists: plItems };
   cSet(cacheKey, result, 300); // also cache in-memory for instant repeat hits
   upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 300);
@@ -1580,6 +1606,18 @@ const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
 
 return dedupeCall('stream:' + tid + ':' + (inst || 'pool') + ':' + (pref || 'auto'), async () => {
+
+// FIX: Handle jf_ Jellyfin Library track IDs — stream directly from Jellyfin
+if (String(tid).startsWith('jf_') && entry.jellyfinUrl && entry.jellyfinToken && entry.jellyfinUserId) {
+  const mem = getCachedMeta(tid);
+  const jTitle  = (mem && mem.title)  || String(c.req.query('title')  || '').trim();
+  const jArtist = (mem && mem.artist) || String(c.req.query('artist') || '').trim();
+  if (jTitle) {
+    const jfDirect = await jellyfinStream(entry.jellyfinUrl, entry.jellyfinToken, entry.jellyfinUserId, jTitle, jArtist);
+    if (jfDirect) return Response.json(jfDirect);
+  }
+  return Response.json({ error: 'Jellyfin track not found in library: ' + tid }, { status: 404 });
+}
 
 // Step 1: title+artist from Eclipse query params (some clients send these)
 let qTitle = String(c.req.query('title') || '').trim();
@@ -2069,6 +2107,53 @@ app.get('/u/:token/playlist/:id', async c => {
 return withToken(c, async entry => {
 const pid = c.req.param('id');
 const inst = entry.instanceUrl;
+// FIX: Route Jellyfin Library virtual playlist
+if (pid === 'jellyfin-library') {
+  if (!entry.jellyfinUrl || !entry.jellyfinToken || !entry.jellyfinUserId) {
+    return Response.json({ error: 'No Jellyfin server configured for this token.' }, { status: 404 });
+  }
+  const base = entry.jellyfinUrl.replace(/\/$/, '');
+  const authHeader = 'MediaBrowser Token="' + entry.jellyfinToken + '"';
+  try {
+    const offset = parseInt(c.req.query('offset') || '0', 10) || 0;
+    const limit  = Math.min(parseInt(c.req.query('limit') || '200', 10) || 200, 500);
+    const res = await fetch(
+      base + '/Users/' + entry.jellyfinUserId + '/Items' +
+      '?IncludeItemTypes=Audio&Recursive=true&Limit=' + limit + '&StartIndex=' + offset +
+      '&SortBy=SortName&SortOrder=Ascending&Fields=MediaSources,RunTimeTicks,AlbumArtist',
+      { headers: { 'X-Emby-Authorization': authHeader }, signal: AbortSignal.timeout(15000) }
+    );
+    if (!res.ok) return Response.json({ error: 'Jellyfin returned HTTP ' + res.status }, { status: 502 });
+    const data  = await res.json();
+    const items = data.Items || [];
+    const tracks = items.map(item => {
+      const artist = item.AlbumArtist || (item.Artists && item.Artists[0]) || 'Unknown';
+      const dur    = item.RunTimeTicks ? Math.round(item.RunTimeTicks / 10000000) : undefined;
+      // Synthetic ID prefixed with jf_ so stream route knows to hit Jellyfin directly
+      const fakeId = 'jf_' + item.Id.replace(/-/g, '').slice(0, 16);
+      cacheTrackMeta(fakeId, item.Name || 'Unknown', artist, null);
+      return {
+        id: fakeId,
+        title: item.Name || 'Unknown',
+        artist: artist,
+        album: item.Album || '',
+        duration: dur,
+        artworkURL: item.ImageTags && item.ImageTags.Primary
+          ? base + '/Items/' + item.Id + '/Images/Primary?maxWidth=320&api_key=' + entry.jellyfinToken
+          : undefined,
+      };
+    });
+    return Response.json({
+      id: 'jellyfin-library',
+      title: '\uD83C\uDFB5 My Jellyfin Library',
+      creator: 'Jellyfin',
+      trackCount: data.TotalRecordCount || tracks.length,
+      tracks,
+    });
+  } catch(e) {
+    return Response.json({ error: 'Jellyfin library fetch failed: ' + e.message }, { status: 502 });
+  }
+}
 if (!isPlaylistUUID(pid)) return Response.json({ error: 'Invalid playlist ID. TIDAL playlist IDs must be UUIDs.' }, { status: 404 });
 try {
 const data = await hifiGetForToken(inst, '/playlist', { id: pid, limit: 100, offset: 0 });
@@ -2094,6 +2179,58 @@ return Response.json({ error: 'Playlist fetch failed: ' + e.message }, { status:
 });
 });
 
+
+// ─── Jellyfin Library Route ─────────────────────────────────────────────────
+// Returns all audio items in the user's Jellyfin library as a paginated playlist
+app.get('/u/:token/jellyfin-library', async c => {
+  return withToken(c, async entry => {
+    if (!entry.jellyfinUrl || !entry.jellyfinToken || !entry.jellyfinUserId) {
+      return Response.json({ error: 'No Jellyfin server configured for this token.' }, { status: 404 });
+    }
+    const base = entry.jellyfinUrl.replace(/\/$/, '');
+    const authHeader = 'MediaBrowser Token="' + entry.jellyfinToken + '"';
+    try {
+      const offset = parseInt(c.req.query('offset') || '0', 10) || 0;
+      const limit  = Math.min(parseInt(c.req.query('limit') || '200', 10) || 200, 500);
+      const res = await fetch(
+        base + '/Users/' + entry.jellyfinUserId + '/Items' +
+        '?IncludeItemTypes=Audio&Recursive=true&Limit=' + limit + '&StartIndex=' + offset +
+        '&SortBy=SortName&SortOrder=Ascending&Fields=MediaSources,RunTimeTicks,AlbumArtist',
+        { headers: { 'X-Emby-Authorization': authHeader }, signal: AbortSignal.timeout(15000) }
+      );
+      if (!res.ok) return Response.json({ error: 'Jellyfin returned HTTP ' + res.status }, { status: 502 });
+      const data  = await res.json();
+      const items = data.Items || [];
+      const tracks = items.map(item => {
+        const artist = item.AlbumArtist || (item.Artists && item.Artists[0]) || 'Unknown';
+        const dur    = item.RunTimeTicks ? Math.round(item.RunTimeTicks / 10000000) : undefined;
+        const fakeId = 'jf_' + item.Id.replace(/-/g, '').slice(0, 16);
+        cacheTrackMeta(fakeId, item.Name || 'Unknown', artist, null);
+        return {
+          id: fakeId,
+          title: item.Name || 'Unknown',
+          artist: artist,
+          album: item.Album || '',
+          duration: dur,
+          artworkURL: item.ImageTags && item.ImageTags.Primary
+            ? base + '/Items/' + item.Id + '/Images/Primary?maxWidth=320&api_key=' + entry.jellyfinToken
+            : undefined,
+        };
+      });
+      return Response.json({
+        id: 'jellyfin-library',
+        title: '\uD83C\uDFB5 My Jellyfin Library',
+        creator: 'Jellyfin',
+        trackCount: data.TotalRecordCount || tracks.length,
+        offset,
+        limit,
+        tracks,
+      });
+    } catch(e) {
+      return Response.json({ error: 'Jellyfin library fetch failed: ' + e.message }, { status: 502 });
+    }
+  });
+});
 
 // ─── Claudochrome 8SPINE Module Code ─────────────────────────────────────────
 // Loaded by 8SPINE via: const createModule = new Function(code); createModule();
