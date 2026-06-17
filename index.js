@@ -13,19 +13,6 @@ try { return await c.req.json(); } catch(e) { return {}; }
 
 const HIFI_INSTANCES = [
 'https://hifi-api-bffw.onrender.com',
-'https://hifi-api-pj08.onrender.com',
-'https://mono.kennyy.com.br/hifi-api',
-'https://api.iwakura.workers.dev',
-'https://tidal-api.binimum.org',
-'https://triton.squid.wtf',
-'https://ohio-1.monochrome.tf',
-'https://frankfurt-1.monochrome.tf',
-'https://eu-central.monochrome.tf',
-'https://monochrome-api.samidy.com',
-'https://hifi-two.spotisaver.net',
-'https://katze.qqdl.site',
-'https://hund.qqdl.site',
-'https://api.monochrome.tf',
 ];
 let activeInstance = HIFI_INSTANCES[0];
 let instanceHealthy = false;
