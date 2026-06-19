@@ -2091,6 +2091,7 @@ const EXTRA_SPINE_SOURCES = [
   'https://all-in-one.rickyaddons.dpdns.org/8spine-source.json',
   'https://eclipse3.cyrusna29.workers.dev/8spine-source.json',
   'https://qobuz-tidal-eclipse.cyrusna29.workers.dev/8spine-source.json',
+  'https://improved-all-in-one.cyrusna29.workers.dev/8spine-source.json',
 ];
 
 app.get('/8spine-source.json', async c => {
