@@ -13,6 +13,10 @@ try { return await c.req.json(); } catch(e) { return {}; }
 
 const HIFI_INSTANCES = [
 'https://hifi-api-bffw.onrender.com',
+'https://hifi-2tzpyfhd.geeked.wtf/',
+'https://hifi.geeked.wtf',
+'https://vogel.qqdl.site',
+'https://api.monochrome.tf',
 ];
 let activeInstance = HIFI_INSTANCES[0];
 let instanceHealthy = false;
