@@ -915,7 +915,7 @@ function buildConfigPage(baseUrl) {
 var h = '';
 h += '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">';
 h += '<meta name="viewport" content="width=device-width,initial-scale=1">';
-h += '<title>Monochrome - TIDAL + Qobuz</title>';
+h += '<title>Claudo - TIDAL + Qobuz</title>';
 h += '<style>';
 h += '*{box-sizing:border-box;margin:0;padding:0}';
 h += 'body{background:#080808;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px 64px}';
@@ -967,7 +967,7 @@ h += '</style></head><body>';
 h += '<svg width="52" height="52" viewBox="0 0 52 52" fill="none" style="margin-bottom:22px"><circle cx="26" cy="26" r="26" fill="#fff"/><rect x="10" y="20" width="4" height="12" rx="2" fill="#000"/><rect x="17" y="14" width="4" height="24" rx="2" fill="#000"/><rect x="24" y="18" width="4" height="16" rx="2" fill="#000"/><rect x="31" y="11" width="4" height="30" rx="2" fill="#000"/><rect x="38" y="17" width="4" height="18" rx="2" fill="#000"/></svg>';
 
 h += '<div class="card">';
-h += '<h1>Monochrome for Eclipse</h1>';
+h += '<h1>Claudo for Eclipse</h1>';
 h += '<p class="sub">Full TIDAL catalog &mdash; FLAC Hi-Res 24-bit, FLAC 16-bit, AAC fallback &mdash; no account needed. Qobuz Hi-Res &rarr; TIDAL FLAC &rarr; fallback.</p>';
 h += '<div class="tip"><b>Save your URL.</b> Paste it below to refresh without reinstalling.</div>';
 h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC Hi-Res 24-bit</span><span class="pill hi">FLAC 16-bit</span><span class="pill hi">Qobuz Hi-Res</span></div>';
@@ -1001,7 +1001,7 @@ h += '</div>';
 h += '<div class="hint" id="qlHint" style="margin-top:8px">No preference &mdash; auto-selects: Qobuz Hi-Res 24-bit &rarr; TIDAL Hi-Res FLAC &rarr; FLAC 16-bit &rarr; AAC 320 &rarr; AAC 96.</div>';
 
 h += '<div class="lbl">Addon Name <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
-h += '<input type="text" id="customAddonName" placeholder="Claudochrome" maxlength="40">';
+h += '<input type="text" id="customAddonName" placeholder="Claudo" maxlength="40">';
 h += '<div class="hint">Customize the name shown in Eclipse\'s connections list. Leave blank to keep the previous name.</div>';
 h += '<button class="bw" id="genBtn" onclick="generate()">Generate My Addon URL</button>';
 
@@ -1040,7 +1040,7 @@ h += '<div class="inst-list" id="instList"><div style="color:#333;font-size:13px
 h += '<button class="bg" style="margin-top:14px" onclick="checkHealth()">Refresh Status</button>';
 h += '</div>';
 
-h += '<footer>Monochrome Eclipse Addon &bull; TIDAL search &bull; Qobuz Hi-Res streams</footer>';
+h += '<footer>Claudo Eclipse Addon &bull; TIDAL search &bull; Qobuz Hi-Res streams</footer>';
 
 // JS
 h += '<script>';
@@ -1258,8 +1258,8 @@ return withToken(c, entry => {
 const rawParam = c.req.param('token');
 const { token } = parseTokenParam(rawParam);
 return Response.json({
-id: 'com.eclipse.claudochrome.' + token.slice(0, 8),
-name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudochrome'; })(),
+id: 'com.eclipse.claudo.' + token.slice(0, 8),
+name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudo'; })(),
 version: '3.0.0',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRtklZxzKIxXbfKsPsGTlnL6lbQqrr1fsIuJY2g4Xtt4w&s=10',
@@ -1924,12 +1924,12 @@ return Response.json({ error: 'Playlist fetch failed: ' + e.message }, { status:
 });
 
 
-// ─── Claudochrome 8SPINE Module Code ─────────────────────────────────────────
+// ─── Claudo 8SPINE Module Code ─────────────────────────────────────────
 // Loaded by 8SPINE via: const createModule = new Function(code); createModule();
 // Must end with a top-level `return { id, ... }` — no IIFE wrapper.
 // __BASE_URL__ replaced at serve-time with the actual deployment URL.
 // All vars are prefixed _spine* to avoid any naming collision with Eclipse routes.
-const CLAUDOCHROME_SPINE_MODULE_CODE = `
+const CLAUDO_SPINE_MODULE_CODE = `
 var _spineBaseUrl = '__BASE_URL__';
 var _spineToken = null;
 
@@ -2045,8 +2045,8 @@ async function _spineGetArtist(artistId) {
 
 // ─── Module export — top-level return required by 8SPINE Module Manager ───────
 return {
-  id: 'claudochrome-tidal',
-  name: 'Claudochrome',
+  id: 'claudo-tidal',
+  name: 'Claudo',
   version: '3.0.0',
   labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
   searchTracks: _spineSearchTracks,
@@ -2057,8 +2057,8 @@ return {
 `;
 
 // ─── Helper: inject runtime base URL into module code ────────────────────────
-function buildClaudochromeSpineJs(baseUrl) {
-  return CLAUDOCHROME_SPINE_MODULE_CODE.replace(/__BASE_URL__/g, baseUrl);
+function buildClaudoSpineJs(baseUrl) {
+  return CLAUDO_SPINE_MODULE_CODE.replace(/__BASE_URL__/g, baseUrl);
 }
 
 // ─── 8SPINE: module info ──────────────────────────────────────────────────────
@@ -2067,8 +2067,8 @@ app.get('/8spine', async c => {
   if (!checkUnauthRateLimit(ip)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
   const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
   return c.json({
-    id: 'claudochrome-tidal',
-    name: 'Claudochrome',
+    id: 'claudo-tidal',
+    name: 'Claudo',
     author: 'Ricky',
     version: '3.0.0',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
@@ -2081,12 +2081,12 @@ app.get('/8spine.js', async c => {
   const ip = (c.req.header('cf-connecting-ip') || c.req.header('x-forwarded-for') || 'unknown').split(',')[0].trim();
   if (!checkUnauthRateLimit(ip)) return Response.json({ error: 'Rate limit exceeded.' }, { status: 429 });
   const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
-  return new Response(buildClaudochromeSpineJs(base), {
+  return new Response(buildClaudoSpineJs(base), {
     headers: { 'Content-Type': 'application/javascript; charset=utf-8' }
   });
 });
 
-// ─── 8SPINE: source list — merges Claudochrome + any extra source URLs ────────
+// ─── 8SPINE: source list — merges Claudo + any extra source URLs ────────
 // Add more 8spine-source.json URLs to EXTRA_SPINE_SOURCES to include them.
 const EXTRA_SPINE_SOURCES = [
   'https://all-in-one.rickyaddons.dpdns.org/8spine-source.json',
@@ -2101,8 +2101,8 @@ app.get('/8spine-source.json', async c => {
   const base = (c.req.header('x-forwarded-proto') || 'https') + '://' + c.req.header('host');
 
   const ourEntry = {
-    id: 'claudochrome-tidal',
-    name: 'Claudochrome',
+    id: 'claudo-tidal',
+    name: 'Claudo',
     author: 'Ricky',
     version: '3.0.0',
     description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
