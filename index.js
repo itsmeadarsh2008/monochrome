@@ -13,6 +13,7 @@ try { return await c.req.json(); } catch(e) { return {}; }
 
 const HIFI_INSTANCES = [
 'https://hifi-api1.onrender.com',
+'https://hifi-api.thevolecitor.qzz.io/',
 'https://hifi-api-bffw.onrender.com',
 ];
 let activeInstance = HIFI_INSTANCES[0];
