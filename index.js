@@ -210,7 +210,7 @@ function qobuzPickBestEdition(items, wantTitle, wantArtist, wantIsrc) {
     const tArtist = norm(trackArtist(t));
     const tIsrc = String(t.isrc || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
     let score = qobuzTrackQualityScore(t);
-    if (isrcNeedle && tIsrc === isrcNeedle) score += 10000;
+    if (isrcNeedle && tIsrc === isrcNeedle) score += 5000; // ISRC confirms song identity; quality (base score) breaks ties among same-ISRC pressings
     if (titleNeedle && tTitle === titleNeedle) score += 1000;
     else if (titleNeedle && tTitle.includes(titleNeedle)) score += 400;
     if (artistNeedle && tArtist.includes(artistNeedle)) score += 500;
@@ -506,7 +506,7 @@ async function qobuzFindByIsrc(isrc, wantTitle = null, wantArtist = null) {
         + '?app_id='          + QOBUZ_APP_ID
         + '&user_auth_token=' + QOBUZ_USER_TOKEN
         + '&query='           + encodeURIComponent(wantIsrc)
-        + '&limit=20',
+        + '&limit=50', // increased to catch Hi-Res editions further down the result list
       { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(6000) }
     );
     if (r.ok) {
@@ -1393,7 +1393,25 @@ for (const p of [...(Array.isArray(plFromSearch) ? plFromSearch : []),
   if (plItems.length >= 10) break;
 }
 
-const result = { tracks, albums: Object.values(albumMap).slice(0, 8), artists: artistList, playlists: plItems };
+// === DEDUP: collapse duplicate TIDAL pressings of the same song into one result.
+// Keeps the entry with the highest TIDAL audio quality tier so the pre-warmed
+// Qobuz Hi-Res stream (cached by that TIDAL ID) is used at stream time.
+const TIDAL_QUALITY_RANK = { HIRES_LOSSLESS: 4, HI_RES_LOSSLESS: 4, LOSSLESS: 3, HIGH: 2, LOW: 1 };
+const seenTracks = new Map();
+for (const t of tracks) {
+  const key = (t.title || '').toLowerCase().replace(/[^a-z0-9]/g, '') + '||' + (t.artist || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const existing = seenTracks.get(key);
+  if (!existing) {
+    seenTracks.set(key, t);
+  } else {
+    const existingRank = TIDAL_QUALITY_RANK[existing.audioQuality] ?? 0;
+    const newRank = TIDAL_QUALITY_RANK[t.audioQuality] ?? 0;
+    if (newRank > existingRank) seenTracks.set(key, t);
+  }
+}
+const dedupedTracks = [...seenTracks.values()];
+
+const result = { tracks: dedupedTracks, albums: Object.values(albumMap).slice(0, 8), artists: artistList, playlists: plItems };
   cSet(cacheKey, result, 300); // also cache in-memory for instant repeat hits
   upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 300);
 return Response.json(result);
