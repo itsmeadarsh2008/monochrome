@@ -514,7 +514,7 @@ async function qobuzFindByIsrc(isrc, wantTitle = null, wantArtist = null) {
       const items = (data?.tracks?.items || []).filter(t => t && t.isrc && normIsrc(t.isrc) === wantIsrc);
       const match = qobuzPickBestEdition(items, wantTitle, wantArtist, wantIsrc);
       if (match && match.id) {
-        cSet(cacheKey, match, 86400);
+        cSet(cacheKey, match, 1800); // 30min — short TTL so Hi-Res editions aren't locked out by cached SD pressings
         console.log('[qobuz] isrc HIT', isrc, '->', match.id, match.title, '|', 'bd=' + (match.bit_depth || '?'), 'sr=' + (match.maximum_sampling_rate || match.sampling_rate || '?'));
         return match;
       }
@@ -557,7 +557,7 @@ async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
       for (const inst of QOBUZ_INSTANCES) {
         try {
           const r = await axios.get(inst + '/search', {
-            params: { q, limit: 15 },
+            params: { q, limit: 30 },
             headers: { 'User-Agent': UA },
             timeout: 10000
           });
@@ -578,19 +578,26 @@ async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
   }
 
   if (isrcCandidate && titleCandidate) {
-    // ISRC is an exact identifier — only allow title candidate to win if it is literally
-    // the same Qobuz track (same id) but the ISRC lookup returned a lower-quality pressing.
-    // Never let a different song override a confirmed ISRC match, even at higher quality.
     const isrcScore = qobuzTrackQualityScore(isrcCandidate);
     const titleScore = qobuzTrackQualityScore(titleCandidate);
-    if (isrcCandidate.id === titleCandidate.id && titleScore > isrcScore) {
-      // Same track, title search found a better pressing — use it
-      console.log('[qobuz] same track, title pressing has higher quality', 'isrc=' + isrcScore, 'title=' + titleScore);
+    // Check if titleCandidate is plausibly the same song (title+artist match)
+    const normStr = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+    const isrcTitle  = normStr(removeFeat(isrcCandidate.title || ''));
+    const titleTitle = normStr(removeFeat(titleCandidate.title || ''));
+    const isrcArtist  = normStr(trackArtist(isrcCandidate));
+    const titleArtist = normStr(trackArtist(titleCandidate));
+    const sameTitle  = isrcTitle === titleTitle || isrcTitle.includes(titleTitle) || titleTitle.includes(isrcTitle);
+    const sameArtist = isrcArtist === titleArtist || isrcArtist.includes(titleArtist) || titleArtist.includes(isrcArtist);
+    const sameSong   = sameTitle && sameArtist;
+
+    if (sameSong && titleScore > isrcScore) {
+      // Title search found a higher-quality pressing of the same song — use it (e.g. Hi-Res vs CD)
+      console.log('[qobuz] title candidate is higher quality pressing of same song — upgrading', 'isrc=' + isrcScore, 'title=' + titleScore, 'isrcId=' + isrcCandidate.id, 'titleId=' + titleCandidate.id);
       return titleCandidate;
     }
-    // Different tracks — ISRC always wins (it is the exact song by identifier)
-    if (isrcCandidate.id !== titleCandidate.id && titleScore > isrcScore) {
-      console.log('[qobuz] ISRC match wins over title candidate (different track)', 'isrc=' + isrcScore, 'title=' + titleScore, 'isrcId=' + isrcCandidate.id, 'titleId=' + titleCandidate.id);
+    if (!sameSong) {
+      // Different song entirely — ISRC match is authoritative, ignore title candidate
+      console.log('[qobuz] ISRC match wins (different song detected)', 'isrc=' + isrcScore, 'title=' + titleScore);
     }
     return isrcCandidate;
   }
