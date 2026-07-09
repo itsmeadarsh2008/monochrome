@@ -989,15 +989,24 @@ h += '<div class="lbl">Preferred Audio Quality <span style="color:#2a2a2a;font-w
 
 h += '<div class="ql-group-label">&#9675; Qobuz</div>';
 h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-HIMAX"    onclick="selectQ(\'HIMAX\',\'q\')">Hi-Res 192<span class="ql-sub">24-bit / up to 192kHz</span></div>';
-h += '<div class="ql-btn" id="ql-HI96"     onclick="selectQ(\'HI96\',\'q\')">Hi-Res 96<span class="ql-sub">24-bit / up to 96kHz</span></div>';
+h += '<div class="ql-btn" id="ql-HIMAX"       onclick="selectQ(\'HIMAX\',\'q\')">Hi-Res 192<span class="ql-sub">24-bit / up to 192kHz</span></div>';
+h += '<div class="ql-btn" id="ql-HI96"        onclick="selectQ(\'HI96\',\'q\')">Hi-Res 96<span class="ql-sub">24-bit / up to 96kHz</span></div>';
 h += '</div>';
 h += '<div class="ql-row">';
-h += '<div class="ql-btn" id="ql-LOSSLESS" onclick="selectQ(\'LOSSLESS\',\'q\')">CD Quality<span class="ql-sub">16-bit / 44.1kHz</span></div>';
-h += '<div class="ql-btn" id="ql-AAC320"   onclick="selectQ(\'AAC320\',\'q\')">AAC 320<span class="ql-sub">320 kbps AAC</span></div>';
+h += '<div class="ql-btn" id="ql-LOSSLESS"    onclick="selectQ(\'LOSSLESS\',\'q\')">CD Quality<span class="ql-sub">16-bit / 44.1kHz</span></div>';
 h += '</div>';
 
-h += '<div class="hint" id="qlHint" style="margin-top:8px">No preference &mdash; auto-selects best available quality: Hi-Res 192kHz &rarr; Hi-Res 96kHz &rarr; CD Quality &rarr; AAC 320.</div>';
+h += '<div class="ql-group-label" style="margin-top:14px">&#9675; TIDAL (skips Qobuz)</div>';
+h += '<div class="ql-row">';
+h += '<div class="ql-btn" id="ql-TIDAL_HIMAX"    onclick="selectQ(\'TIDAL_HIMAX\',\'t\')">FLAC Hi-Res<span class="ql-sub">24-bit / up to 192kHz</span></div>';
+h += '<div class="ql-btn" id="ql-TIDAL_LOSSLESS" onclick="selectQ(\'TIDAL_LOSSLESS\',\'t\')">FLAC 16-bit<span class="ql-sub">44.1kHz Lossless</span></div>';
+h += '</div>';
+h += '<div class="ql-row">';
+h += '<div class="ql-btn" id="ql-TIDAL_HIGH"  onclick="selectQ(\'TIDAL_HIGH\',\'t\')">AAC 320<span class="ql-sub">TIDAL AAC 320 kbps</span></div>';
+h += '<div class="ql-btn" id="ql-TIDAL_LOW"   onclick="selectQ(\'TIDAL_LOW\',\'t\')">AAC 96<span class="ql-sub">TIDAL AAC 96 kbps</span></div>';
+h += '</div>';
+
+h += '<div class="hint" id="qlHint" style="margin-top:8px">No preference &mdash; auto-selects: Qobuz Hi-Res 24-bit &rarr; TIDAL Hi-Res FLAC &rarr; FLAC 16-bit &rarr; AAC 320 &rarr; AAC 96.</div>';
 
 h += '<div class="lbl">Addon Name <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<input type="text" id="customAddonName" placeholder="Claudo" maxlength="40">';
@@ -1026,7 +1035,7 @@ h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</
 h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>';
 h += '<div class="step"><div class="sn">4</div><div class="st">Search TIDAL\'s full catalog &mdash; Qobuz Hi-Res played first automatically</div></div>';
 h += '</div>';
-h += '<div class="warn">Stream priority: <b>Hi-Res 192kHz</b> &rarr; Hi-Res 96kHz &rarr; CD Quality FLAC &rarr; AAC 320. AAC 320 plays when FLAC is unavailable on Qobuz, with TIDAL as fallback for all tiers.</div>';
+h += '<div class="warn">Stream priority: <b>Qobuz Hi-Res 24-bit FLAC</b> &rarr; TIDAL Hi-Res FLAC &rarr; TIDAL FLAC 16-bit &rarr; AAC 320 &rarr; AAC 96. Selecting a <b>TIDAL</b> tier skips Qobuz entirely. AAC 320 only plays if FLAC is unavailable.</div>';
 h += '</div>';
 
 
@@ -1045,14 +1054,18 @@ h += '<footer>Claudo Eclipse Addon &bull; TIDAL search &bull; Qobuz Hi-Res strea
 h += '<script>';
 h += 'var gu,ru,selQ=null,selGroup=null;';
 
-h += 'var QKEYS=["HIMAX","HI96","LOSSLESS","AAC320"];';
-h += 'var ALLKEYS=QKEYS;';
+h += 'var QKEYS=["HIMAX","HI96","LOSSLESS"];';
+h += 'var TKEYS=["TIDAL_HIMAX","TIDAL_LOSSLESS","TIDAL_HIGH","TIDAL_LOW"];';
+h += 'var ALLKEYS=QKEYS.concat(TKEYS);';
 
 h += 'var QLABELS={';
 h += '"HIMAX":"Hi-Res 192 \u00b7 24-bit/192kHz",';
 h += '"HI96":"Hi-Res 96 \u00b7 24-bit/96kHz",';
 h += '"LOSSLESS":"CD Quality \u00b7 16-bit/44.1kHz",';
-h += '"AAC320":"AAC 320 kbps"';
+h += '"TIDAL_HIMAX":"TIDAL Hi-Res FLAC \u00b7 24-bit/192kHz",';
+h += '"TIDAL_LOSSLESS":"TIDAL FLAC \u00b7 16-bit/44.1kHz",';
+h += '"TIDAL_HIGH":"TIDAL AAC 320 kbps",';
+h += '"TIDAL_LOW":"TIDAL AAC 96 kbps"';
 h += '};';
 
 h += 'function selectQ(q,grp){';
@@ -1065,9 +1078,9 @@ h += '    if(selQ===k)el.classList.add(selGroup==="q"?"sel-q":"sel-t");';
 h += '  });';
 h += '  var hint=document.getElementById("qlHint");';
 h += '  if(selQ){';
-h += '    hint.textContent="Selected: "+QLABELS[selQ]+" \u2014 Qobuz first, TIDAL fallback.";';
+h += '    hint.textContent="Selected: "+QLABELS[selQ]+(selGroup==="t"?" \u2014 TIDAL only, skips Qobuz":" \u2014 Qobuz first, TIDAL fallback")+".";';
 h += '  }else{';
-h += '    hint.textContent="No preference \u2014 auto-selects best quality: Hi-Res \u2192 CD Quality \u2192 AAC 320.";';
+h += '    hint.textContent="No preference \u2014 auto-selects: Qobuz Hi-Res \u2192 TIDAL Lossless \u2192 AAC 320 \u2192 AAC 96.";';
 h += '  }';
 h += '  updateBadge();';
 h += '}';
@@ -1076,7 +1089,8 @@ h += 'function updateBadge(){';
 h += '  var b=document.getElementById("genQualBadge");';
 h += '  if(!b)return;';
 h += '  if(!selQ){b.className="qual-badge none";b.textContent="No quality preference";return;}';
-h += '  b.className="qual-badge qobuz";b.innerHTML="&#9675; Qobuz \u00b7 "+QLABELS[selQ];';
+h += '  if(selGroup==="q"){b.className="qual-badge qobuz";b.innerHTML="&#9675; Qobuz \u00b7 "+QLABELS[selQ];}';
+h += '  else{b.className="qual-badge tidal";b.innerHTML="&#9675; TIDAL \u00b7 "+QLABELS[selQ];}';
 h += '}';
 
 h += 'function generate(){';
