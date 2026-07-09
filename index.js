@@ -12,9 +12,9 @@ try { return await c.req.json(); } catch(e) { return {}; }
 }
 
 const HIFI_INSTANCES = [
-'https://hifi-api-bffw.onrender.com',
 'https://hifi-api1.onrender.com',
 'https://hifi-api.thevolecitor.qzz.io/',
+'https://hifi-api-bffw.onrender.com',
 ];
 let activeInstance = HIFI_INSTANCES[0];
 let instanceHealthy = false;
@@ -898,13 +898,14 @@ function getBaseUrl(req) { return (req.headers['x-forwarded-proto'] || req.proto
 // ─── withToken ────────────────────────────────────────────────────────────────
 async function withToken(c, handler) {
 const rawParam = c.req.param('token');
-const { token, embeddedInstance } = parseTokenParam(rawParam);
+const { token, embeddedInstance, embeddedQuality } = parseTokenParam(rawParam);
 const entry = await getTokenEntry(token);
 if (!entry) return Response.json({ error: 'Invalid token.' }, { status: 404 });
 // Global daily cap — protects the 100k/day limit across all tokens and all addons
 if (!consumeGlobalBudget()) return Response.json({ error: 'Daily request limit reached. Service will resume tomorrow.' }, { status: 429 });
 if (!checkRateLimit(entry)) return Response.json({ error: 'Rate limit exceeded. Max 80 requests per minute per token.' }, { status: 429 });
 if (embeddedInstance) entry.instanceUrl = embeddedInstance;
+if (embeddedQuality) entry.preferredQuality = embeddedQuality;
 if (entry.reqCount % 20 === 0) await redisSave(token, entry);
 return handler(entry);
 }
@@ -912,10 +913,11 @@ return handler(entry);
 function parseTokenParam(rawParam) {
 const parts = rawParam.split('~');
 const token = parts[0];
-let embeddedInstance = null, embeddedName = null;
+let embeddedInstance = null, embeddedName = null, embeddedQuality = null;
 try { if (parts[1]) embeddedInstance = Buffer.from(parts[1], 'base64url').toString('utf8'); } catch(e) {}
 try { if (parts[2]) embeddedName = decodeURIComponent(Buffer.from(parts[2], 'base64url').toString('utf8')).slice(0, 40); } catch(e) {}
-return { token, embeddedInstance, embeddedName };
+try { if (parts[3]) embeddedQuality = Buffer.from(parts[3], 'base64url').toString('utf8'); } catch(e) {}
+return { token, embeddedInstance, embeddedName, embeddedQuality };
 }
 
 // ─── Config page ──────────────────────────────────────────────────────────────
@@ -1174,6 +1176,12 @@ let tokenSegment = instanceUrl ? token + '~' + Buffer.from(instanceUrl).toString
 if (addonName) {
   if (!instanceUrl) tokenSegment += '~';
   tokenSegment += '~' + Buffer.from(encodeURIComponent(addonName)).toString('base64url');
+}
+if (preferredQuality) {
+  // Ensure parts[3] is at correct position (parts[1]=inst, parts[2]=name, parts[3]=quality)
+  const currentParts = tokenSegment.split('~').length - 1; // number of ~ already in segment
+  while (tokenSegment.split('~').length - 1 < 3) tokenSegment += '~';
+  tokenSegment += Buffer.from(preferredQuality).toString('base64url');
 }
 return Response.json({ token, manifestUrl: baseUrl + '/u/' + tokenSegment + '/manifest.json', usingCustomInstance: !!instanceUrl, preferredQuality, addonName });
 });
