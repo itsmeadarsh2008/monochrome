@@ -2114,7 +2114,6 @@ app.get('/8spine.js', async c => {
 // ─── 8SPINE: source list — merges Claudo + any extra source URLs ────────
 // Add more 8spine-source.json URLs to EXTRA_SPINE_SOURCES to include them.
 const EXTRA_SPINE_SOURCES = [
-  'https://all-in-one.rickyaddons.dpdns.org/8spine-source.json',
   'https://eclipse3.cyrusna29.workers.dev/8spine-source.json',
   'https://qobuz-tidal-eclipse.cyrusna29.workers.dev/8spine-source.json',
   'https://improved-all-in-one.cyrusna29.workers.dev/8spine-source.json',
