@@ -107,15 +107,39 @@ function decodeManifest(manifest) {
 try {
 const raw = Buffer.from(manifest, 'base64').toString('utf8');
 if (raw.trimStart().startsWith('<')) {
-const urlMatch = raw.match(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/i)
-|| raw.match(/<SegmentURL[^>]+media="([^"]+)"/i);
-if (urlMatch && urlMatch[1]) {
-const url = urlMatch[1].trim()
-.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
-const codec = raw.match(/codecs="([^"]+)"/i)?.[1] || 'flac';
-return { url, codec, isDash: true };
-}
-return null;
+  // Extract codec from DASH XML — do NOT default to 'flac'.
+  // AAC DASH: codecs="mp4a.40.2"  Hi-Res FLAC DASH: codecs="flac"
+  // If absent, we leave null and let getTidalStream decide based on tier.
+  const codec = raw.match(/codecs="([^"]+)"/i)?.[1] || null;
+
+  // Simple DASH — <BaseURL> contains a direct CDN link
+  const baseUrlMatch = raw.match(/<BaseURL[^>]*>([^<]+)<\/BaseURL>/i);
+  if (baseUrlMatch && baseUrlMatch[1]) {
+    const url = baseUrlMatch[1].trim()
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
+    return { url, codec, isDash: true };
+  }
+
+  // Segment list DASH — <SegmentURL media="...">
+  const segUrlMatch = raw.match(/<SegmentURL[^>]+media="([^"]+)"/i);
+  if (segUrlMatch && segUrlMatch[1]) {
+    const url = segUrlMatch[1].trim()
+      .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"');
+    return { url, codec, isDash: true };
+  }
+
+  // Segmented template DASH (Hi-Res FLAC): no inline URL, but we can build the
+  // initialization segment URL from the BaseURL + SegmentTemplate initialization attr.
+  const initAttr = raw.match(/initialization="([^"]+)"/i);
+  const cdnBase  = raw.match(/https?:\/\/[a-z0-9\-\.]+\.tidal\.com\/[^\s"<>]+/i);
+  if (initAttr && cdnBase) {
+    const init = initAttr[1].replace('$RepresentationID$', '1').replace(/^\//,'');
+    const base = cdnBase[0].replace(/\/[^/]+$/, '');
+    return { url: base + '/' + init, codec, isDash: true };
+  }
+
+  // No URL extractable — return null so the tier waterfall can try lower quality
+  return null;
 }
 const decoded = JSON.parse(raw);
 const url = (decoded.urls && decoded.urls.length > 0) ? decoded.urls[0] : (decoded.url || null);
@@ -1528,80 +1552,37 @@ async function getTidalStream() {
   const qualities = tidalStartTier
     ? [tidalStartTier, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(tidalStartTier))]
     : AUTO_QUALITIES;
-
   for (let qi = 0; qi < qualities.length; qi++) {
     const ql = qualities[qi];
     try {
-      // ── Primary path: /trackManifests/ returns a pre-resolved direct CDN URI
-      // with real audioInfo (bitDepth + sampleRate) and a formats[] array that
-      // confirms whether HI_RES_LOSSLESS was actually delivered.
-      // This is the same endpoint used by Qobuz_tidal1.js and is the only
-      // reliable way to get Hi-Res / FLAC above AAC 320 from HiFi instances.
-      const manifestData = await hifiGetForToken(inst, '/trackManifests/', { id: tid, formats: ql });
-      const streamUrl = manifestData?.data?.attributes?.uri;
-      const returnedFormats = manifestData?.data?.attributes?.formats || [];
-      const trackPresentation = manifestData?.data?.attributes?.trackPresentation;
-      const audioInfo = manifestData?.audioInfo || {};
-
-      if (streamUrl && trackPresentation !== 'PREVIEW') {
-        const hasHiRes   = returnedFormats.includes('HI_RES_LOSSLESS');
-        const hasLossless = returnedFormats.includes('LOSSLESS') || returnedFormats.includes('FLAC');
-
-        let bd = Number(audioInfo.bitDepth  || 0);
-        let sr = Number(audioInfo.sampleRate || 0);
-        if (sr >= 1000) sr = sr / 1000; // convert Hz -> kHz
-
-        let qualityLabel, format;
-        if (ql === 'HI_RES_LOSSLESS' && hasHiRes) {
-          // Confirmed Hi-Res — use real bit depth + sample rate when available
-          qualityLabel = (bd > 0 && sr > 0) ? ('FLAC ' + bd + '-bit / ' + sr.toFixed(1) + ' kHz') : 'Hi-Res FLAC';
-          format = 'flac';
-        } else if ((ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS') && (hasLossless || !returnedFormats.length)) {
-          // Requested Hi-Res but only lossless CD available — still real FLAC, not AAC
-          qualityLabel = (bd > 0 && sr > 0) ? ('FLAC ' + bd + '-bit / ' + sr.toFixed(1) + ' kHz') : 'FLAC 16-bit / 44.1 kHz';
-          format = 'flac';
-        } else if (ql === 'LOSSLESS') {
-          qualityLabel = 'FLAC 16-bit / 44.1 kHz';
-          format = 'flac';
-        } else if (ql === 'HIGH') {
-          qualityLabel = '320kbps AAC';
-          format = 'aac';
-        } else {
-          qualityLabel = '96kbps AAC';
-          format = 'aac';
-        }
-
-        console.log('[tidal] /trackManifests/ HIT ql=' + ql + ' returned=' + JSON.stringify(returnedFormats) + ' bd=' + bd + ' sr=' + sr + ' -> ' + qualityLabel);
-        return { url: streamUrl, format, quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
-      }
-
-      // ── Fallback path: /track endpoint (returns base64 manifest blob)
-      // Only reached if /trackManifests/ returned no usable URI (e.g. instance
-      // doesn't support that endpoint). Codec is validated before labeling quality.
-      const trackData = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
-      const payload = trackData && trackData.data ? trackData.data : trackData;
-
+      const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
+      const payload = data && data.data ? data.data : data;
       if (payload && payload.manifest) {
         const decoded = decodeManifest(payload.manifest);
         if (decoded && decoded.url) {
           const codec = (decoded.codec || '').toLowerCase();
-          // Only label as FLAC if codec truly says so — never trust isDash alone
-          const isRealFlac = codec.includes('flac') || codec.includes('audio/flac');
-          // If we requested Hi-Res/Lossless but got AAC codec, skip this tier
-          // so the waterfall can try the next lower format rather than silently serving AAC
-          const isHighTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
-          if (isHighTier && !isRealFlac && codec && !decoded.isDash) {
-            console.log('[tidal] /track manifest returned AAC codec for ' + ql + ' tier — skipping tier, trying lower quality');
-            continue; // skip to next tier in the waterfall
+          // Explicit codec detection — never rely on isDash alone for format labeling.
+          // FLAC DASH manifests from TIDAL have codecs="flac" or no codecs attr at all.
+          // AAC DASH manifests always have codecs="mp4a.40.2" or similar mp4a string.
+          const isExplicitFlac = codec.includes('flac') || codec.includes('audio/flac');
+          const isExplicitAac  = codec.includes('mp4a') || codec.includes('aac') || codec.includes('he-aac');
+          const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
+          // If the instance returned AAC for a lossless-tier request, it can't deliver lossless
+          // for this track — skip to the next waterfall tier rather than mislabeling as FLAC.
+          if (isExplicitAac && isLosslessTier) {
+            console.log('[tidal] Got AAC codec for ' + ql + ' — waterfall to next tier');
+            continue;
           }
+          // isFlac: explicitly FLAC codec, OR codec absent on a lossless tier (TIDAL Hi-Res DASH
+          // often omits the codecs attr — if we requested HI_RES_LOSSLESS/LOSSLESS it must be FLAC)
+          const isFlac = isExplicitFlac || (!isExplicitAac && isLosslessTier);
           const qualityLabel = ql === 'HI_RES_LOSSLESS' ? 'Hi-Res FLAC'
             : ql === 'LOSSLESS' ? 'FLAC 16-bit / 44.1 kHz'
             : ql === 'HIGH'     ? '320kbps AAC'
             : '96kbps AAC';
-          return { url: decoded.url, format: isRealFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
+          return { url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
         }
       }
-
       if (payload && payload.url) {
         const looksLikeFlac  = /\.flac(\?|$)/i.test(payload.url || '');
         const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
