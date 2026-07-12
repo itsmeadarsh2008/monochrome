@@ -12,6 +12,7 @@ try { return await c.req.json(); } catch(e) { return {}; }
 }
 
 const HIFI_INSTANCES = [
+'tidal-come-one.francescorick99.workers.dev',
 'https://hifi-api1.onrender.com',
 'https://hifi-api.thevolecitor.qzz.io/',
 'https://hifi-api-bffw.onrender.com',
