@@ -14,7 +14,6 @@ try { return await c.req.json(); } catch(e) { return {}; }
 const HIFI_INSTANCES = [
 'https://hifi-api-bffw.onrender.com',
 'https://hifi-api1.onrender.com',
-'https://hifi-api1-n5zg.onrender.com',
 ];
 let activeInstance = HIFI_INSTANCES[0];
 let instanceHealthy = false;
