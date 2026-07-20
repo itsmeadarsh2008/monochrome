@@ -172,8 +172,8 @@ return 0;
 
 // ─── Qobuz credentials (direct API — no proxy needed) ────────────────────────
 const QOBUZ_APP_ID    = '798273057';
-const QOBUZ_USER_TOKEN = 'cBcGactSoGqTZ-Uk7mODCqz_v7QSiriSltxW6104RJbuNFxwEkZENtr9Fy2PM1m6pwcWv5fDzn5nnmyIoWpH_w';
-const QOBUZ_SECRET    = 'abb21364945c0583309667d13ca3d93a';
+const QOBUZ_USER_TOKEN = 'qNL0eKjXhz6rSvrMOo4JtXym1AOTQa5mSMEc9hSD_dlN5mJ0WDQ7UZDEc5LpYh5KEUd43f_SszgKmM_nn4AONg';
+const QOBUZ_SECRET    = '05a4851e74ee47fda346f50cfdfc4f09';
 
 // Format ID map — same as QTE
 const QOBUZ_FORMAT_MAP = {
