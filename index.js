@@ -1183,7 +1183,7 @@ let instanceUrl = (body && body.instanceUrl) ? String(body.instanceUrl).trim().r
 if (instanceUrl) {
 if (!/^https?:\/\//.test(instanceUrl)) return Response.json({ error: 'Instance URL must start with http or https' }, { status: 400 });
 try {
-await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, timeout: 8000 });
+await axios.get(instanceUrl + '/search/', { params: { s: 'test', limit: 1 }, timeout: 8000 });
 } catch(e) { return Response.json({ error: 'Could not reach your instance: ' + e.message }, { status: 400 }); }
 }
 const VALID_QUALITIES = ['HI_RES_LOSSLESS','HIRESLOSSLESS','HIMAX','HI96','LOSSLESS','HIGH','AAC320','LOW','AAC96','TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW'];
@@ -1231,7 +1231,7 @@ app.get('/instances', async c => {
   const results = await Promise.all(HIFI_INSTANCES.map(async inst => {
     const start = Date.now();
     try {
-      await axios.get(inst + '/search', { params: { s: 'test', limit: 1 }, timeout: 6000 });
+      await axios.get(inst + '/search/', { params: { s: 'test', limit: 1 }, timeout: 6000 });
       return { url: inst, ok: true, ms: Date.now() - start };
     } catch(e) { return { url: inst, ok: false, ms: null }; }
   }));
