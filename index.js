@@ -1,6 +1,5 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { serve } from '@hono/node-server';
 import axios from 'axios';
 import crypto from 'crypto';
 
@@ -2197,10 +2196,5 @@ app.get('/8spine-source.json', async c => {
   return c.json(merged);
 });
 
-
-const PORT = parseInt(process.env.PORT || '3000', 10);
-serve({ fetch: app.fetch, port: PORT }, () => {
-  console.log('Server running on http://localhost:' + PORT);
-});
 
 export default app;
