@@ -12,7 +12,7 @@ try { return await c.req.json(); } catch(e) { return {}; }
 }
 
 const HIFI_INSTANCES = [
-'https://hifi-api-1-xq99.onrender.com',
+'https://hifi-api-w9y8.onrender.com',
 'https://hifi-api-bffw.onrender.com',
 'https://hifi-api1.onrender.com',
 ];
