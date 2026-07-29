@@ -1143,7 +1143,7 @@ h += '    data.instances.forEach(function(inst){';
 h += '      var row=document.createElement("div");row.className="inst";';
 h += '      var dot=document.createElement("span");dot.className="dot "+(inst.ok?"ok":"err");';
 h += '      var urlSpan=document.createElement("span");urlSpan.className="inst-url";';
-h += '      urlSpan.textContent=inst.url;';
+h += '      urlSpan.textContent=inst.url.split(\'-\').pop().split(\'.\')[0];';
 h += '      row.appendChild(dot);row.appendChild(urlSpan);';
 h += '      if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}';
 h += '      list.appendChild(row);';
