@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
+import { serve } from '@hono/node-server';
 import axios from 'axios';
 import crypto from 'crypto';
 
@@ -425,7 +426,7 @@ const ISRC_MIN_SCORE = 100; // minimum scoring engine threshold for a valid matc
 
 async function getIsrcFromTidal(query, instanceUrl, knownArtist) {
   try {
-    const data = await hifiGetForTokenSafe(instanceUrl, '/search', { s: query, limit: 20 });
+    const data = await hifiGetForTokenSafe(instanceUrl, '/search/', { s: query, limit: 20 });
     let items = data?.tracks?.items || data?.items || data?.data?.items ||
                 data?.data?.tracks?.items || (Array.isArray(data) ? data : []);
     if (!items.length) return null;
@@ -434,7 +435,7 @@ async function getIsrcFromTidal(query, instanceUrl, knownArtist) {
     const track = match.item;
     let isrc = track.isrc;
     if (!isrc) {
-      const info = await hifiGetForTokenSafe(instanceUrl, '/info', { id: track.id });
+      const info = await hifiGetForTokenSafe(instanceUrl, '/info/', { id: track.id });
       isrc = info?.isrc || info?.data?.isrc || null;
     }
     console.log('[isrc] TIDAL hit score=' + match.score + ' isrc=' + isrc + ' for: ' + query);
@@ -580,7 +581,7 @@ async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
       const q = (artist ? artist + ' ' : '') + removeFeat(title);
       for (const inst of QOBUZ_INSTANCES) {
         try {
-          const r = await axios.get(inst + '/search', {
+          const r = await axios.get(inst + '/search/', {
             params: { q, limit: 30 },
             headers: { 'User-Agent': UA },
             timeout: 10000
@@ -1142,9 +1143,7 @@ h += '    data.instances.forEach(function(inst){';
 h += '      var row=document.createElement("div");row.className="inst";';
 h += '      var dot=document.createElement("span");dot.className="dot "+(inst.ok?"ok":"err");';
 h += '      var urlSpan=document.createElement("span");urlSpan.className="inst-url";';
-h += '      var raw=inst.url.replace(/^https?:\\/\\//,"");';
-h += '      var masked=raw.slice(0,3)+"\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022";';
-h += '      urlSpan.textContent=masked;';
+h += '      urlSpan.textContent=inst.url.split(\'-\').pop().split(\'.\')[0];';
 h += '      row.appendChild(dot);row.appendChild(urlSpan);';
 h += '      if(inst.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=inst.ms+"ms";row.appendChild(ms);}';
 h += '      list.appendChild(row);';
@@ -1184,7 +1183,7 @@ let instanceUrl = (body && body.instanceUrl) ? String(body.instanceUrl).trim().r
 if (instanceUrl) {
 if (!/^https?:\/\//.test(instanceUrl)) return Response.json({ error: 'Instance URL must start with http or https' }, { status: 400 });
 try {
-await axios.get(instanceUrl + '/search', { params: { s: 'test', limit: 1 }, timeout: 8000 });
+await axios.get(instanceUrl + '/search/', { params: { s: 'test', limit: 1 }, timeout: 8000 });
 } catch(e) { return Response.json({ error: 'Could not reach your instance: ' + e.message }, { status: 400 }); }
 }
 const VALID_QUALITIES = ['HI_RES_LOSSLESS','HIRESLOSSLESS','HIMAX','HI96','LOSSLESS','HIGH','AAC320','LOW','AAC96','TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW'];
@@ -1232,7 +1231,7 @@ app.get('/instances', async c => {
   const results = await Promise.all(HIFI_INSTANCES.map(async inst => {
     const start = Date.now();
     try {
-      await axios.get(inst + '/search', { params: { s: 'test', limit: 1 }, timeout: 6000 });
+      await axios.get(inst + '/search/', { params: { s: 'test', limit: 1 }, timeout: 6000 });
       return { url: inst, ok: true, ms: Date.now() - start };
     } catch(e) { return { url: inst, ok: false, ms: null }; }
   }));
@@ -1325,8 +1324,8 @@ try {
 // Track search: GET /search/?s=query  (returns tracks, albums, artists)
 // Playlist search: GET /search/?p=query  (TIDAL top-hits PLAYLISTS via HiFi proxy)
 const [mainResult, plResult] = await Promise.allSettled([
-  hifiGetForToken(inst, '/search', { s: q, limit, offset: 0 }),
-  hifiGetForTokenSafe(inst, '/search', { p: q, limit: 10, offset: 0 }),
+  hifiGetForToken(inst, '/search/', { s: q, limit, offset: 0 }),
+  hifiGetForTokenSafe(inst, '/search/', { p: q, limit: 10, offset: 0 }),
 ]);
 const data  = mainResult.status === 'fulfilled' ? (mainResult.value || null) : null;
 // Items array (tracks) at data.data.items OR data.items
@@ -1507,7 +1506,7 @@ if (redisMeta) {
 if (!qTitle && !qIsrc) {
   try {
     // Use /info (metadata endpoint) — NOT /track (stream endpoint) which returns manifest, not title/artist
-    const trackInfo = await hifiGetForTokenSafe(inst, '/info', { id: tid });
+    const trackInfo = await hifiGetForTokenSafe(inst, '/info/', { id: tid });
     // HiFi API returns either {title, artist/artists, isrc} or {data:{...}} or {resource:{...}}
     const payload = trackInfo?.resource || trackInfo?.data || trackInfo;
     const coldTitle = payload?.title || null;
@@ -1555,7 +1554,7 @@ async function getTidalStream() {
   for (let qi = 0; qi < qualities.length; qi++) {
     const ql = qualities[qi];
     try {
-      const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
+      const data = await hifiGetForToken(inst, '/track/', { id: tid, quality: ql });
       const payload = data && data.data ? data.data : data;
       if (payload && payload.manifest) {
         const decoded = decodeManifest(payload.manifest);
@@ -1692,7 +1691,7 @@ return withToken(c, async entry => {
 const aid = c.req.param('id');
 const inst = entry.instanceUrl;
 try {
-  const data = await hifiGetForToken(inst, '/album', { id: aid, limit: 100, offset: 0 });
+  const data = await hifiGetForToken(inst, '/album/', { id: aid, limit: 100, offset: 0 });
   // Unwrap all known HiFi API response shapes
   const album = data?.data?.id ? data.data
     : data?.data?.album?.id ? data.data.album
@@ -1963,7 +1962,7 @@ const pid = c.req.param('id');
 const inst = entry.instanceUrl;
 if (!isPlaylistUUID(pid)) return Response.json({ error: 'Invalid playlist ID. TIDAL playlist IDs must be UUIDs.' }, { status: 404 });
 try {
-const data = await hifiGetForToken(inst, '/playlist', { id: pid, limit: 100, offset: 0 });
+const data = await hifiGetForToken(inst, '/playlist/', { id: pid, limit: 100, offset: 0 });
 let pl = null, rawItems = [];
 if (data.playlist?.uuid || data.playlist?.id) { pl = data.playlist; rawItems = data.items || data.playlist.items || []; }
 else if (data.data?.playlist) { pl = data.data.playlist; rawItems = data.data.items || data.items || []; }
@@ -2198,5 +2197,10 @@ app.get('/8spine-source.json', async c => {
   return c.json(merged);
 });
 
+
+const PORT = parseInt(process.env.PORT || '3000', 10);
+serve({ fetch: app.fetch, port: PORT }, () => {
+  console.log('Server running on http://localhost:' + PORT);
+});
 
 export default app;
