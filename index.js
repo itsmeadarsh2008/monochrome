@@ -426,7 +426,7 @@ const ISRC_MIN_SCORE = 100; // minimum scoring engine threshold for a valid matc
 
 async function getIsrcFromTidal(query, instanceUrl, knownArtist) {
   try {
-    const data = await hifiGetForTokenSafe(instanceUrl, '/search', { s: query, limit: 20 });
+    const data = await hifiGetForTokenSafe(instanceUrl, '/search/', { s: query, limit: 20 });
     let items = data?.tracks?.items || data?.items || data?.data?.items ||
                 data?.data?.tracks?.items || (Array.isArray(data) ? data : []);
     if (!items.length) return null;
@@ -581,7 +581,7 @@ async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
       const q = (artist ? artist + ' ' : '') + removeFeat(title);
       for (const inst of QOBUZ_INSTANCES) {
         try {
-          const r = await axios.get(inst + '/search', {
+          const r = await axios.get(inst + '/search/', {
             params: { q, limit: 30 },
             headers: { 'User-Agent': UA },
             timeout: 10000
@@ -1324,8 +1324,8 @@ try {
 // Track search: GET /search/?s=query  (returns tracks, albums, artists)
 // Playlist search: GET /search/?p=query  (TIDAL top-hits PLAYLISTS via HiFi proxy)
 const [mainResult, plResult] = await Promise.allSettled([
-  hifiGetForToken(inst, '/search', { s: q, limit, offset: 0 }),
-  hifiGetForTokenSafe(inst, '/search', { p: q, limit: 10, offset: 0 }),
+  hifiGetForToken(inst, '/search/', { s: q, limit, offset: 0 }),
+  hifiGetForTokenSafe(inst, '/search/', { p: q, limit: 10, offset: 0 }),
 ]);
 const data  = mainResult.status === 'fulfilled' ? (mainResult.value || null) : null;
 // Items array (tracks) at data.data.items OR data.items
