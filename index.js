@@ -1691,7 +1691,7 @@ return withToken(c, async entry => {
 const aid = c.req.param('id');
 const inst = entry.instanceUrl;
 try {
-  const data = await hifiGetForToken(inst, '/album', { id: aid, limit: 100, offset: 0 });
+  const data = await hifiGetForToken(inst, '/album/', { id: aid, limit: 100, offset: 0 });
   // Unwrap all known HiFi API response shapes
   const album = data?.data?.id ? data.data
     : data?.data?.album?.id ? data.data.album
@@ -1962,7 +1962,7 @@ const pid = c.req.param('id');
 const inst = entry.instanceUrl;
 if (!isPlaylistUUID(pid)) return Response.json({ error: 'Invalid playlist ID. TIDAL playlist IDs must be UUIDs.' }, { status: 404 });
 try {
-const data = await hifiGetForToken(inst, '/playlist', { id: pid, limit: 100, offset: 0 });
+const data = await hifiGetForToken(inst, '/playlist/', { id: pid, limit: 100, offset: 0 });
 let pl = null, rawItems = [];
 if (data.playlist?.uuid || data.playlist?.id) { pl = data.playlist; rawItems = data.items || data.playlist.items || []; }
 else if (data.data?.playlist) { pl = data.data.playlist; rawItems = data.data.items || data.items || []; }
