@@ -435,7 +435,7 @@ async function getIsrcFromTidal(query, instanceUrl, knownArtist) {
     const track = match.item;
     let isrc = track.isrc;
     if (!isrc) {
-      const info = await hifiGetForTokenSafe(instanceUrl, '/info', { id: track.id });
+      const info = await hifiGetForTokenSafe(instanceUrl, '/info/', { id: track.id });
       isrc = info?.isrc || info?.data?.isrc || null;
     }
     console.log('[isrc] TIDAL hit score=' + match.score + ' isrc=' + isrc + ' for: ' + query);
@@ -1506,7 +1506,7 @@ if (redisMeta) {
 if (!qTitle && !qIsrc) {
   try {
     // Use /info (metadata endpoint) — NOT /track (stream endpoint) which returns manifest, not title/artist
-    const trackInfo = await hifiGetForTokenSafe(inst, '/info', { id: tid });
+    const trackInfo = await hifiGetForTokenSafe(inst, '/info/', { id: tid });
     // HiFi API returns either {title, artist/artists, isrc} or {data:{...}} or {resource:{...}}
     const payload = trackInfo?.resource || trackInfo?.data || trackInfo;
     const coldTitle = payload?.title || null;
@@ -1554,7 +1554,7 @@ async function getTidalStream() {
   for (let qi = 0; qi < qualities.length; qi++) {
     const ql = qualities[qi];
     try {
-      const data = await hifiGetForToken(inst, '/track', { id: tid, quality: ql });
+      const data = await hifiGetForToken(inst, '/track/', { id: tid, quality: ql });
       const payload = data && data.data ? data.data : data;
       if (payload && payload.manifest) {
         const decoded = decodeManifest(payload.manifest);
