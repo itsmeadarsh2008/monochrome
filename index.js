@@ -320,10 +320,8 @@ async function qobuzStream(trackId, prefKey) {
       const result = {
         url:       data.url,
         format:    fmtLabel[fmt] || 'flac',
-        quality:   qobuzQualityLabel(fmt, data),
-        streamQuality: qobuzStreamQuality,
-        provider:  'Qobuz',
-        source:    'qobuz',
+        quality:   'Qobuz · ' + qobuzQualityLabel(fmt, data),
+        streamQuality: '[Qobuz] ' + qobuzStreamQuality,
         expiresAt: Math.floor(Date.now() / 1000) + 1680, // 28 min
       };
       cSet(cacheKey, result, 1680);
@@ -1475,8 +1473,8 @@ redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
   } catch(e) {}
 })();
 const tFormat = (t.audioQuality === 'HIGH' || t.audioQuality === 'LOW') ? 'aac' : 'flac';
-tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: tFormat });
-}
+      tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: tFormat, isrc: t.isrc || undefined, audioQuality: t.audioQuality || undefined });
+    }
 
 const artistList = Object.keys(artistMap)
 .sort((a, b) => (artistRelevance(artistMap[b].name, q) * 100 + (artistHits[b] || 0)) - (artistRelevance(artistMap[a].name, q) * 100 + (artistHits[a] || 0)))
@@ -1677,7 +1675,7 @@ async function getTidalStream() {
             : ql === 'HIGH'     ? '320kbps AAC'
             : '96kbps AAC';
           const streamQuality = ql === 'HI_RES_LOSSLESS' ? 'HI_RES_LOSSLESS' : ql === 'LOSSLESS' ? 'LOSSLESS' : ql === 'HIGH' ? 'HIGH' : 'LOW';
-          return { url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, streamQuality, provider: 'Tidal', codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
+          return { url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: 'Tidal · ' + qualityLabel, streamQuality: '[Tidal] ' + streamQuality, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
         }
       }
       if (payload && payload.url) {
@@ -1688,7 +1686,7 @@ async function getTidalStream() {
           : ql === 'HIGH'     ? '320kbps AAC'
           : '96kbps AAC';
         const streamQuality = ql === 'HI_RES_LOSSLESS' ? 'HI_RES_LOSSLESS' : ql === 'LOSSLESS' ? 'LOSSLESS' : ql === 'HIGH' ? 'HIGH' : 'LOW';
-        return { url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, streamQuality, provider: 'Tidal', expiresAt: Math.floor(Date.now() / 1000) + 21600 };
+        return { url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: 'Tidal · ' + qualityLabel, streamQuality: '[Tidal] ' + streamQuality, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
       }
     } catch(e) {
       if (qi === qualities.length - 1) throw e;
@@ -1818,7 +1816,8 @@ try {
     const tArtist = trackArtist(t) || artistName;
     cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
     redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
-    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover, 1080) };
+    const tFormat = (t.audioQuality === 'HIGH' || t.audioQuality === 'LOW') ? 'aac' : 'flac';
+    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover, 1080), format: tFormat, isrc: t.isrc || undefined };
   }).filter(Boolean);
   return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: coverUrl(cover, 1080), year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
@@ -2075,7 +2074,8 @@ const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
 cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
 redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
-return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover, 1080) };
+const tFormat = (t.audioQuality === 'HIGH' || t.audioQuality === 'LOW') ? 'aac' : 'flac';
+return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover, 1080), format: tFormat, isrc: t.isrc || undefined };
 }).filter(Boolean);
 return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, artworkURL: (pl?.squareImage || pl?.image) ? coverUrl(pl.squareImage || pl.image, 1080) : undefined, trackCount: pl?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
