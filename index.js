@@ -1070,8 +1070,7 @@ h += '</div>';
 h += '<div class="card">';
 h += '<h2>Quality Tier Status</h2>';
 h += '<p class="sub" style="margin-bottom:14px">Tests if each audio quality tier is reachable on the active HiFi instance.</p>';
-h += '<div class="inst-list" id="qtList"><div style="color:#333;font-size:13px">Click "Run Test" to check all tiers.</div></div>';
-h += '<button class="bg" style="margin-top:14px" onclick="runQualityTest()">Run Test</button>';
+h += '<div class="inst-list" id="qtList"><div style="color:#333;font-size:13px">Checking tiers...</div></div>';
 h += '</div>';
 
 h += '<footer>Claudo Eclipse Addon &bull; TIDAL search &bull; Qobuz Hi-Res streams</footer>';
@@ -1160,9 +1159,8 @@ h += '  }).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size
 h += '}';
 
 h += 'function runQualityTest(){';
-h += 'var btn=document.getElementById("qtBtn");var list=document.getElementById("qtList");';
-h += 'btn.disabled=true;btn.textContent="Testing...";';
-h += 'list.innerHTML=\'<div style="color:#333;font-size:13px">Testing all tiers...</div>\';';
+h += 'var list=document.getElementById("qtList");';
+h += 'list.innerHTML=\'<div style="color:#333;font-size:13px">Checking tiers...</div>\';';
 h += 'fetch("/quality-test").then(function(r){return r.json();}).then(function(d){';
 h += 'list.innerHTML="";';
 h += '(d.results||[]).forEach(function(t){';
@@ -1176,11 +1174,11 @@ h += '});';
 h += 'var s=d.summary||{};var sum=document.createElement("div");sum.style.cssText="margin-top:10px;font-size:12px;color:#555";';
 h += 'sum.textContent="Qobuz: "+s.qobuz+" | TIDAL: "+s.tidal;';
 h += 'list.appendChild(sum);';
-h += 'btn.disabled=false;btn.textContent="Test Again";';
-h += '}).catch(function(e){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Test failed: \'+e.message+\'</div>\';btn.disabled=false;btn.textContent="Run Test";});';
+h += '}).catch(function(e){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Test failed: \'+e.message+\'</div>\';});';
 h += '}';
 
 h += 'checkHealth();';
+h += 'runQualityTest();';
 h += '</script>';
 h += '</body></html>';
 return h;
