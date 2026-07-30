@@ -1066,6 +1066,14 @@ h += '<div class="inst-list" id="instList"><div style="color:#333;font-size:13px
 h += '<button class="bg" style="margin-top:14px" onclick="checkHealth()">Refresh Status</button>';
 h += '</div>';
 
+// Quality Tier Status card
+h += '<div class="card">';
+h += '<h2>Quality Tier Status</h2>';
+h += '<p class="sub" style="margin-bottom:14px">Tests if each audio quality tier is reachable on the active HiFi instance.</p>';
+h += '<div class="inst-list" id="qtList"><div style="color:#333;font-size:13px">Click "Run Test" to check all tiers.</div></div>';
+h += '<button class="bg" style="margin-top:14px" onclick="runQualityTest()">Run Test</button>';
+h += '</div>';
+
 h += '<footer>Claudo Eclipse Addon &bull; TIDAL search &bull; Qobuz Hi-Res streams</footer>';
 
 // JS
@@ -1151,8 +1159,26 @@ h += '    });';
 h += '  }).catch(function(){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Could not reach server</div>\';});';
 h += '}';
 
-// Qobuz ping
-
+h += 'function runQualityTest(){';
+h += 'var btn=document.getElementById("qtBtn");var list=document.getElementById("qtList");';
+h += 'btn.disabled=true;btn.textContent="Testing...";';
+h += 'list.innerHTML=\'<div style="color:#333;font-size:13px">Testing all tiers...</div>\';';
+h += 'fetch("/quality-test").then(function(r){return r.json();}).then(function(d){';
+h += 'list.innerHTML="";';
+h += '(d.results||[]).forEach(function(t){';
+h += 'var row=document.createElement("div");row.className="inst";';
+h += 'var dot=document.createElement("span");dot.className="dot "+(t.ok?"ok":"err");';
+h += 'var label=document.createElement("span");label.className="inst-url";label.textContent=t.label;';
+h += 'row.appendChild(dot);row.appendChild(label);';
+h += 'if(t.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.textContent=t.ms+"ms";row.appendChild(ms);}';
+h += 'list.appendChild(row);';
+h += '});';
+h += 'var s=d.summary||{};var sum=document.createElement("div");sum.style.cssText="margin-top:10px;font-size:12px;color:#555";';
+h += 'sum.textContent="Qobuz: "+s.qobuz+" | TIDAL: "+s.tidal;';
+h += 'list.appendChild(sum);';
+h += 'btn.disabled=false;btn.textContent="Test Again";';
+h += '}).catch(function(e){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Test failed: \'+e.message+\'</div>\';btn.disabled=false;btn.textContent="Run Test";});';
+h += '}';
 
 h += 'checkHealth();';
 h += '</script>';
@@ -1254,6 +1280,46 @@ app.get('/qobuz-ping', async c => {
   } catch(e) {
     return Response.json({ ok: false, error: e.message });
   }
+});
+
+app.get('/quality-test', async c => {
+  const TEST_TRACK_ID = '501963434';
+  const TIERS = [
+    { id: 'qobuz_himax',    label: 'Qobuz Hi-Res 192',    type: 'qobuz', format: 27 },
+    { id: 'qobuz_hi96',     label: 'Qobuz Hi-Res 96',     type: 'qobuz', format: 7 },
+    { id: 'qobuz_lossless', label: 'Qobuz CD FLAC',        type: 'qobuz', format: 6 },
+    { id: 'qobuz_aac320',   label: 'Qobuz AAC 320',        type: 'qobuz', format: 5 },
+    { id: 'tidal_hires',    label: 'TIDAL Hi-Res FLAC',    type: 'tidal', quality: 'HI_RES_LOSSLESS' },
+    { id: 'tidal_lossless', label: 'TIDAL FLAC 16-bit',    type: 'tidal', quality: 'LOSSLESS' },
+    { id: 'tidal_aac320',   label: 'TIDAL AAC 320',        type: 'tidal', quality: 'HIGH' },
+    { id: 'tidal_aac96',    label: 'TIDAL AAC 96',         type: 'tidal', quality: 'LOW' },
+  ];
+  const results = await Promise.all(TIERS.map(async tier => {
+    const start = Date.now();
+    try {
+      if (tier.type === 'qobuz') {
+        const ts = Math.floor(Date.now() / 1000);
+        const sig = md5('trackgetFileUrlformat_id' + tier.format + 'intentstreamtrack_id1' + ts + QOBUZ_SECRET);
+        const url = 'https://www.qobuz.com/api.json/0.2/track/getFileUrl'
+          + '?app_id=' + QOBUZ_APP_ID + '&user_auth_token=' + QOBUZ_USER_TOKEN
+          + '&track_id=1&format_id=' + tier.format + '&intent=stream'
+          + '&request_ts=' + ts + '&request_sig=' + sig;
+        const r = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
+        const ok = r.status === 200 || r.status === 400 || r.status === 404;
+        return { id: tier.id, label: tier.label, ok, ms: Date.now() - start };
+      } else {
+        const data = await hifiGet('/track/', { id: TEST_TRACK_ID, quality: tier.quality });
+        const payload = data && data.data ? data.data : data;
+        const hasUrl = payload && (payload.manifest || payload.url);
+        return { id: tier.id, label: tier.label, ok: !!hasUrl, ms: Date.now() - start };
+      }
+    } catch(e) {
+      return { id: tier.id, label: tier.label, ok: false, ms: Date.now() - start };
+    }
+  }));
+  const qobuzOk = results.filter(r => r.id.startsWith('qobuz') && r.ok).length;
+  const tidalOk = results.filter(r => r.id.startsWith('tidal') && r.ok).length;
+  return Response.json({ results, summary: { qobuz: qobuzOk + '/4', tidal: tidalOk + '/4' } });
 });
 
 app.get('/health', c => {
