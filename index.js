@@ -320,6 +320,7 @@ async function qobuzStream(trackId, prefKey) {
         url:       data.url,
         format:    fmtLabel[fmt] || 'flac',
         quality:   qobuzQualityLabel(fmt, data),
+        streamQuality: 'LOSSLESS',
         source:    'qobuz',
         expiresAt: Math.floor(Date.now() / 1000) + 1680, // 28 min
       };
@@ -1673,7 +1674,8 @@ async function getTidalStream() {
             : ql === 'LOSSLESS' ? 'FLAC 16-bit / 44.1 kHz'
             : ql === 'HIGH'     ? '320kbps AAC'
             : '96kbps AAC';
-          return { url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
+          const streamQuality = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS' ? 'LOSSLESS' : ql === 'HIGH' ? 'HIGH' : 'LOW';
+          return { url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, streamQuality, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
         }
       }
       if (payload && payload.url) {
@@ -1683,7 +1685,8 @@ async function getTidalStream() {
           : ql === 'LOSSLESS' ? 'FLAC 16-bit / 44.1 kHz'
           : ql === 'HIGH'     ? '320kbps AAC'
           : '96kbps AAC';
-        return { url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
+        const streamQuality = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS' ? 'LOSSLESS' : ql === 'HIGH' ? 'HIGH' : 'LOW';
+        return { url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, streamQuality, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
       }
     } catch(e) {
       if (qi === qualities.length - 1) throw e;
@@ -2131,7 +2134,8 @@ async function _spineSearchTracks(query, limit) {
           artist: t.artist || 'Unknown',
           album: t.album || '',
           duration: t.duration || 0,
-          albumCover: t.artworkURL || ''
+          albumCover: t.artworkURL || '',
+          format: t.format || ''
         };
       });
       return { tracks: tracks, total: tracks.length };
@@ -2145,7 +2149,7 @@ async function _spineGetTrackStreamUrl(trackId, quality) {
   var tidalId = trackId.slice(sep + 2);
   return _spineFetch('/u/' + token + '/stream/' + encodeURIComponent(tidalId), {})
     .then(function(data) {
-      var aq = (data.quality === 'hires' || data.quality === 'lossless') ? 'LOSSLESS' : 'HIGH';
+      var aq = data.streamQuality || ((data.quality === 'hires' || data.quality === 'lossless' || data.format === 'flac' || data.source === 'qobuz') ? 'LOSSLESS' : 'HIGH');
       return { streamUrl: data.url || data.streamUrl || null, track: { id: trackId, audioQuality: aq } };
     }).catch(function() {
       return { streamUrl: null, track: { id: trackId, audioQuality: 'HIGH' } };
