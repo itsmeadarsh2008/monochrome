@@ -316,11 +316,12 @@ async function qobuzStream(trackId, prefKey) {
       const data = await res.json();
       if (!data?.url) continue;
 
+      const qobuzStreamQuality = fmt === 27 || fmt === 7 ? 'HI_RES_LOSSLESS' : fmt === 6 ? 'LOSSLESS' : 'HIGH';
       const result = {
         url:       data.url,
         format:    fmtLabel[fmt] || 'flac',
         quality:   qobuzQualityLabel(fmt, data),
-        streamQuality: 'LOSSLESS',
+        streamQuality: qobuzStreamQuality,
         source:    'qobuz',
         expiresAt: Math.floor(Date.now() / 1000) + 1680, // 28 min
       };
@@ -1674,7 +1675,7 @@ async function getTidalStream() {
             : ql === 'LOSSLESS' ? 'FLAC 16-bit / 44.1 kHz'
             : ql === 'HIGH'     ? '320kbps AAC'
             : '96kbps AAC';
-          const streamQuality = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS' ? 'LOSSLESS' : ql === 'HIGH' ? 'HIGH' : 'LOW';
+          const streamQuality = ql === 'HI_RES_LOSSLESS' ? 'HI_RES_LOSSLESS' : ql === 'LOSSLESS' ? 'LOSSLESS' : ql === 'HIGH' ? 'HIGH' : 'LOW';
           return { url: decoded.url, format: isFlac ? 'flac' : 'aac', quality: qualityLabel, streamQuality, codec: decoded.codec || null, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
         }
       }
@@ -1685,7 +1686,7 @@ async function getTidalStream() {
           : ql === 'LOSSLESS' ? 'FLAC 16-bit / 44.1 kHz'
           : ql === 'HIGH'     ? '320kbps AAC'
           : '96kbps AAC';
-        const streamQuality = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS' ? 'LOSSLESS' : ql === 'HIGH' ? 'HIGH' : 'LOW';
+        const streamQuality = ql === 'HI_RES_LOSSLESS' ? 'HI_RES_LOSSLESS' : ql === 'LOSSLESS' ? 'LOSSLESS' : ql === 'HIGH' ? 'HIGH' : 'LOW';
         return { url: payload.url, format: (looksLikeFlac || isLosslessTier) ? 'flac' : 'aac', quality: qualityLabel, streamQuality, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
       }
     } catch(e) {
