@@ -1473,6 +1473,26 @@ if (qobuzItems && qobuzItems.length) {
       isrc: t.isrc || undefined,
       audioQuality: isHiRes ? 'HI_RES_LOSSLESS' : 'LOSSLESS',
     });
+    (async () => {
+      try {
+        const preWarmKeys = [null, 'HIMAX', 'HI96', 'LOSSLESS', 'AAC320'];
+        const streamResults = await Promise.allSettled(
+          preWarmKeys.map(async key => {
+            const cKey = 'qstream:' + t.id + ':' + (key || 'auto');
+            let result = cGet(cKey);
+            if (!result) result = await qobuzStream(t.id, key).catch(() => null);
+            if (result) {
+              await redisSaveQobuzStream(String(t.id), key, result).catch(() => {});
+            }
+            return result;
+          })
+        );
+        const firstStream = streamResults.find(r => r.status === 'fulfilled' && r.value)?.value;
+        if (firstStream) {
+          console.log('[qobuz-search] prewarmed stream for qid=' + t.id + ' quality=' + firstStream.quality);
+        }
+      } catch(e) {}
+    })();
   }
   const result = {
     tracks: qTracks,
