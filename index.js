@@ -107,7 +107,8 @@ return 'Unknown';
 function decodeManifest(manifest) {
 try {
 const raw = Buffer.from(manifest, 'base64').toString('utf8');
-if (raw.trimStart().startsWith('<')) {
+const trimmed = raw.trimStart();
+if (trimmed.startsWith('<')) {
   // Extract codec from DASH XML — do NOT default to 'flac'.
   // AAC DASH: codecs="mp4a.40.2"  Hi-Res FLAC DASH: codecs="flac"
   // If absent, we leave null and let getTidalStream decide based on tier.
@@ -140,6 +141,30 @@ if (raw.trimStart().startsWith('<')) {
   }
 
   // No URL extractable — return null so the tier waterfall can try lower quality
+  return null;
+}
+if (trimmed.startsWith('#EXTM3U')) {
+  // HLS manifest — extract the first variant stream URL or media segment URL
+  const lines = raw.split('\n');
+  let codec = null;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    if (line.startsWith('#EXT-X-STREAM-INF:')) {
+      const match = line.match(/CODECS="([^"]+)"/i);
+      if (match) codec = match[1];
+      if (i + 1 < lines.length) {
+        const url = lines[i + 1].trim();
+        if (url && !url.startsWith('#')) return { url, codec, isHls: true };
+      }
+    }
+  }
+  // Fallback: first non-comment, non-empty line that looks like a URL
+  for (const line of lines) {
+    const trimmedLine = line.trim();
+    if (trimmedLine && !trimmedLine.startsWith('#') && (trimmedLine.startsWith('http') || trimmedLine.startsWith('/'))) {
+      return { url: trimmedLine, codec: codec || null, isHls: true };
+    }
+  }
   return null;
 }
 const decoded = JSON.parse(raw);
@@ -1618,7 +1643,9 @@ async function getTidalStream() {
   for (let qi = 0; qi < qualities.length; qi++) {
     const ql = qualities[qi];
     try {
-      const data = await hifiGetForToken(inst, '/track/', { id: tid, quality: ql });
+      const trackParams = { id: tid, quality: ql };
+      if (ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS') trackParams.manifest = 'hls';
+      const data = await hifiGetForToken(inst, '/track/', trackParams);
       const payload = data && data.data ? data.data : data;
       if (payload && payload.manifest) {
         const decoded = decodeManifest(payload.manifest);
