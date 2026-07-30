@@ -1093,7 +1093,10 @@ h += '</div>';
 
 // Quality Tier Status card
 h += '<div class="card">';
-h += '<h2>Quality Tier Status</h2>';
+h += '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">';
+h += '<h2 style="margin-bottom:0">Quality Tier Status</h2>';
+h += '<button class="bd" style="width:auto;padding:6px 14px;font-size:12px;margin:0" onclick="runQualityTest()">Refresh</button>';
+h += '</div>';
 h += '<p class="sub" style="margin-bottom:14px">Tests if each audio quality tier is reachable on the active HiFi instance.</p>';
 h += '<div class="inst-list" id="qtList"><div style="color:#333;font-size:13px">Checking tiers...</div></div>';
 h += '</div>';
