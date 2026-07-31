@@ -9,7 +9,6 @@
     "deploy": "wrangler deploy"
   },
   "dependencies": {
-    "@hono/node-server": "^2.0.12",
     "axios": "^1.6.7",
     "hono": "^4.0.0"
   },
