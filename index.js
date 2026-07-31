@@ -1453,7 +1453,7 @@ id: 'com.eclipse.claudo.' + token.slice(0, 8),
 name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudo'; })(),
 version: '3.0.0',
 description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
-icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRtklZxzKIxXbfKsPsGTlnL6lbQqrr1fsIuJY2g4Xtt4w&s=10',
+icon: 'https://ibb.co/D0T8VQr',
 resources: ['search', 'stream', 'catalog'],
 types: ['track', 'album', 'artist', 'playlist']
 });
