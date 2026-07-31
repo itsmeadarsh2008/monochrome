@@ -1,6 +1,5 @@
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
-import { serve } from '@hono/node-server';
 import axios from 'axios';
 import crypto from 'crypto';
 
@@ -30,9 +29,9 @@ let activeQobuzInstance = QOBUZ_INSTANCES[0];
 // Populated at search time, read at stream time. Survives within the same worker instance.
 const TRACK_META_CACHE = new Map();
 
-function cacheTrackMeta(id, title, artist, isrc) {
+function cacheTrackMeta(id, title, artist, isrc, atmos) {
 if (!id || !title) return;
-TRACK_META_CACHE.set(String(id), { title, artist: artist || 'Unknown', isrc: isrc || null });
+TRACK_META_CACHE.set(String(id), { title, artist: artist || 'Unknown', isrc: isrc || null, atmos: !!atmos });
 // cap size to avoid unbounded growth in long-lived instances
 if (TRACK_META_CACHE.size > 5000) {
 const firstKey = TRACK_META_CACHE.keys().next().value;
@@ -102,6 +101,38 @@ if (!t) return 'Unknown';
 if (t.artists && t.artists.length) return t.artists.map(function(a) { return a.name; }).join(', ');
 if (t.artist && t.artist.name) return t.artist.name;
 return 'Unknown';
+}
+
+// Spatial audio detection — TIDAL marks these in audioModes (array on search
+// items) or mediaMetadata.tags (track detail).
+// Dolby Atmos tracks get the ◗◖ glyph prepended to the title; 360 Reality
+// Audio keeps a text label.
+function atmosPrefix(t) {
+if (!t) return '';
+const modes = Array.isArray(t.audioModes) ? t.audioModes
+  : (typeof t.audioMode === 'string' ? [t.audioMode] : []);
+const tags = (t.mediaMetadata && t.mediaMetadata.tags) || [];
+if (modes.includes('DOLBY_ATMOS') || tags.includes('DOLBY_ATMOS')) return '◗◖ ';
+return '';
+}
+
+function atmosSuffix(t) {
+if (!t) return '';
+const modes = Array.isArray(t.audioModes) ? t.audioModes
+  : (typeof t.audioMode === 'string' ? [t.audioMode] : []);
+const tags = (t.mediaMetadata && t.mediaMetadata.tags) || [];
+if (modes.includes('SONY_360RA') || tags.includes('SONY_360RA')) return ' (360 Reality Audio)';
+return '';
+}
+
+// True only when the TIDAL track object is marked Dolby Atmos (audioModes array
+// on search/album/playlist items, or mediaMetadata.tags on track detail).
+function isAtmosTrack(t) {
+if (!t) return false;
+const modes = Array.isArray(t.audioModes) ? t.audioModes
+  : (typeof t.audioMode === 'string' ? [t.audioMode] : []);
+const tags = (t.mediaMetadata && t.mediaMetadata.tags) || [];
+return modes.includes('DOLBY_ATMOS') || tags.includes('DOLBY_ATMOS');
 }
 
 function decodeManifest(manifest) {
@@ -656,6 +687,49 @@ async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
   return isrcCandidate || titleCandidate || null;
 }
 
+// ─── Qobuz direct search — used alongside TIDAL search, results get merged ──
+async function qobuzSearchDirect(query, limit) {
+  try {
+    const url = 'https://www.qobuz.com/api.json/0.2/track/search'
+      + '?app_id=' + QOBUZ_APP_ID
+      + '&user_auth_token=' + QOBUZ_USER_TOKEN
+      + '&query=' + encodeURIComponent(query)
+      + '&limit=' + (limit || 20);
+    const r = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return null;
+    const data = await r.json();
+    return (data?.tracks?.items || []).filter(t => t && t.id);
+  } catch(e) {
+    return null;
+  }
+}
+
+function qobuzCoverUrl(album) {
+  if (!album?.image) return undefined;
+  return album.image.large || album.image.small || album.image.thumbnail || undefined;
+}
+
+// ─── Unified stream quality scoring (Qobuz vs TIDAL comparison) ──────────────
+// Higher score = better audio. Compares tier first, then bit depth + sample rate.
+function streamQualityScore(s) {
+  if (!s) return -1;
+  const q  = (s.quality || '').toLowerCase();
+  const sq = (s.streamQuality || '').toLowerCase();
+  let score = sq.includes('hi_res') ? 400
+    : sq.includes('lossless') ? 300
+    : sq.includes('high') ? 200
+    : sq.includes('low') ? 100
+    : 0;
+  const bd = q.match(/(\d+)-bit/);
+  const sr = q.match(/(\d+)\s*khz/);
+  if (bd) score += parseInt(bd[1], 10) * 10;
+  if (sr) score += Math.min(parseInt(sr[1], 10), 192);
+  return score;
+}
+
+// Combined search quality rank — used to dedupe same song across TIDAL + Qobuz
+const MERGED_QUALITY_RANK = { HIRES_LOSSLESS: 4, HI_RES_LOSSLESS: 4, LOSSLESS: 3, HIGH: 2, LOW: 1 };
+
 
 // ─── Hi-Fi API client ─────────────────────────────────────────────────────────
 // Races ALL instances in parallel (Promise.any) — first success wins.
@@ -727,9 +801,9 @@ return json.result ?? null;
 }
 
 // Save title+artist+isrc to Redis keyed by TIDAL track id (TTL 24h)
-async function redisCacheTrackMeta(tid, title, artist, isrc) {
+async function redisCacheTrackMeta(tid, title, artist, isrc, atmos) {
 if (!tid || !title) return;
-await upstashCmd('SET', 'mc:tmeta:' + tid, JSON.stringify({ title, artist: artist || 'Unknown', isrc: isrc || null }), 'EX', 86400);
+await upstashCmd('SET', 'mc:tmeta:' + tid, JSON.stringify({ title, artist: artist || 'Unknown', isrc: isrc || null, atmos: !!atmos }), 'EX', 86400);
 }
 
 // Load title+artist+isrc from Redis by TIDAL track id
@@ -744,7 +818,7 @@ try { return JSON.parse(raw); } catch(e) { return null; }
 async function redisSaveQobuzId(tidalId, qobuzTrack) {
   if (!tidalId || !qobuzTrack || !qobuzTrack.id) return;
   await upstashCmd('SET', 'mc:qid:' + tidalId,
-    JSON.stringify({ id: qobuzTrack.id, title: qobuzTrack.title, bitdepth: qobuzTrack.bitdepth, maximumsamplingrate: qobuzTrack.maximumsamplingrate, samplingrate: qobuzTrack.samplingrate, hires: qobuzTrack.hires, hires_streamable: qobuzTrack.hires_streamable, streamable: qobuzTrack.streamable, displayable: qobuzTrack.displayable }),
+    JSON.stringify({ id: qobuzTrack.id, title: qobuzTrack.title, isrc: qobuzTrack.isrc || null, bitdepth: qobuzTrack.bitdepth, maximumsamplingrate: qobuzTrack.maximumsamplingrate, samplingrate: qobuzTrack.samplingrate, hires: qobuzTrack.hires, hires_streamable: qobuzTrack.hires_streamable, streamable: qobuzTrack.streamable, displayable: qobuzTrack.displayable }),
     'EX', 86400);
 }
 
@@ -1413,16 +1487,24 @@ return Response.json(parsed);
 }
 
 try {
-// Fire track search + playlist search in parallel.
-// Track search: GET /search/?s=query  (returns tracks, albums, artists)
-// Playlist search: GET /search/?p=query  (TIDAL top-hits PLAYLISTS via HiFi proxy)
-const [mainResult, plResult] = await Promise.allSettled([
+// TIDAL search first — the primary catalog. Qobuz search is a fallback used
+// ONLY when TIDAL returns nothing (track search + playlist search in parallel).
+// Streaming stays Qobuz-first: pre-warm + quality scoring pick Qobuz Hi-Res
+// whenever the track exists there.
+const [mainResult, alResult, arResult, plResult, qobuzPromise] = await Promise.allSettled([
   hifiGetForToken(inst, '/search/', { s: q, limit, offset: 0 }),
-  hifiGetForTokenSafe(inst, '/search/', { p: q, limit: 10, offset: 0 }),
+  hifiGetForToken(inst, '/search/', { al: q, limit: Math.min(limit, 20), offset: 0 }),
+  hifiGetForToken(inst, '/search/', { a: q, limit: Math.min(limit, 20), offset: 0 }),
+  hifiGetForTokenSafe(inst, '/search/', { p: q, limit: 20, offset: 0 }),
+  qobuzSearchDirect(q, limit + 10),
 ]);
 const data  = mainResult.status === 'fulfilled' ? (mainResult.value || null) : null;
 // Items array (tracks) at data.data.items OR data.items
 const items = data?.data?.items || data?.items || [];
+
+// Qobuz search runs in parallel (no extra latency) — its tracks top up the
+// result list only when TIDAL comes up short, never as ISRC duplicates.
+let qobuzItems = (qobuzPromise.status === 'fulfilled' && Array.isArray(qobuzPromise.value)) ? qobuzPromise.value : [];
 
 const albumMap = {}, artistMap = {}, artistHits = {}, tracks = [];
 for (let i = 0; i < items.length; i++) {
@@ -1441,8 +1523,8 @@ artistHits[arid] = (artistHits[arid] || 0) + 1;
 if (t.streamReady === false || t.allowStreaming === false) continue;
 const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
-cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
+cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null, isAtmosTrack(t));
+redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null, isAtmosTrack(t));
 // Background Qobuz pre-warm — find track AND pre-warm stream URL into cache
 // so /stream/:id returns instantly from cache without any live Qobuz API calls.
 // Also persists to Redis so any CF Worker isolate can serve the stream instantly.
@@ -1473,8 +1555,86 @@ redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
   } catch(e) {}
 })();
 const tFormat = (t.audioQuality === 'HIGH' || t.audioQuality === 'LOW') ? 'aac' : 'flac';
-      tracks.push({ id: String(t.id), title: tTitle, artist: tArtist, album: t.album ? t.album.title : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: tFormat, isrc: t.isrc || undefined, audioQuality: t.audioQuality || undefined });
+      tracks.push({ id: String(t.id), title: atmosPrefix(t) + tTitle + atmosSuffix(t), artist: tArtist, album: t.album ? t.album.title : undefined, albumId: t.album?.id ? String(t.album.id) : undefined, albumArtworkURL: t.album?.cover ? coverUrl(t.album.cover, 1080) : undefined, trackNumber: t.trackNumber || undefined, year: t.album?.releaseDate ? String(t.album.releaseDate).slice(0, 4) : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: tFormat, isrc: t.isrc || undefined, audioQuality: t.audioQuality || undefined, provider: 'Tidal', audioModes: t.audioModes || undefined });
     }
+
+// ── Album + artist search results (al= / a=) merged into the same lists ──────
+// From TIDAL's dedicated album/artist search endpoints — not just the albums
+// and artists attached to matched tracks, so search surfaces full catalog rows.
+const alData = alResult.status === 'fulfilled' ? (alResult.value || null) : null;
+const alItems = alData?.data?.albums?.items || alData?.albums?.items || [];
+for (const a of alItems) {
+  if (!a || !a.id) continue;
+  const abid = String(a.id);
+  if (!albumMap[abid]) albumMap[abid] = { id: abid, title: a.title || 'Unknown', artist: trackArtist(a), artworkURL: coverUrl(a.cover, 1080), trackCount: a.numberOfTracks, year: a.releaseDate ? String(a.releaseDate).slice(0, 4) : undefined };
+}
+const arData = arResult.status === 'fulfilled' ? (arResult.value || null) : null;
+const arItems = arData?.data?.artists?.items || arData?.artists?.items || [];
+for (const a of arItems) {
+  if (!a || !a.id) continue;
+  const arid = String(a.id);
+  if (!artistMap[arid]) artistMap[arid] = { id: arid, name: a.name || 'Unknown', artworkURL: coverUrl(a.picture, 320), ...(a.genres && a.genres.length ? { genres: a.genres.map(g => g.name || g).filter(Boolean) } : {}) };
+  artistHits[arid] = (artistHits[arid] || 0) + 1;
+}
+
+// === MERGE: Qobuz top-up tracks (only when TIDAL came up short) ─────────────
+// Qobuz IDs are namespaced with "qo:" prefix so they never collide with TIDAL's
+// numeric IDs. /stream, /album, /artist routes detect the prefix and resolve
+// through the Qobuz direct API.
+const QO_PREFIX = 'qo:';
+let remainingSlots = Math.max(0, limit - tracks.length);
+if (qobuzItems.length > 0) {
+  console.log('[search] TIDAL yielded', tracks.length, 'of', limit, '— Qobuz top-up can fill', remainingSlots, 'slot(s)');
+}
+// Best pressing first (quality score), then drop ISRC duplicates of TIDAL hits
+const tidalIsrcs = new Set(tracks.map(t => t.isrc ? String(t.isrc).toUpperCase().replace(/[^A-Z0-9]/g, '') : null).filter(Boolean));
+const seenQIsrc = new Set();
+const qobuzRanked = [...qobuzItems].sort((a, b) => qobuzTrackQualityScore(b) - qobuzTrackQualityScore(a));
+for (const qt of qobuzRanked) {
+  if (remainingSlots <= 0) break;
+  if (!qt || !qt.id) continue;
+  const qIsrcNorm = String(qt.isrc || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+  if (qIsrcNorm && (tidalIsrcs.has(qIsrcNorm) || seenQIsrc.has(qIsrcNorm))) continue;
+  if (qIsrcNorm) seenQIsrc.add(qIsrcNorm);
+  remainingSlots--;
+  const qtTitle = qt.title || 'Unknown';
+  const qtArtist = qt.performer?.name || 'Unknown';
+  const qIsHiRes = !!(qt.hires || qt.hires_streamable || qt.maximum_bit_depth > 16);
+  const qAudioQuality = qIsHiRes ? 'HI_RES_LOSSLESS' : 'LOSSLESS';
+  const qTrackId = QO_PREFIX + String(qt.id);
+  // Cache so /stream/:id can resolve this Qobuz track instantly (also Redis cross-isolate)
+  cacheTrackMeta(qTrackId, qtTitle, qtArtist, qt.isrc || null);
+  cacheQobuzTrackId(qTrackId, qt);
+  // Qobuz albums/artists — namespaced too, only added when TIDAL didn't surface them
+  if (qt.album) {
+    const qabid = QO_PREFIX + String(qt.album.id || qt.album.qobuz_id || '');
+    if (qabid !== QO_PREFIX && !albumMap[qabid]) albumMap[qabid] = { id: qabid, title: qt.album.title || 'Unknown', artist: qtArtist, artworkURL: qobuzCoverUrl(qt.album), trackCount: qt.album.tracks_count, year: qt.album.release_date_original ? String(qt.album.release_date_original).slice(0, 4) : undefined };
+  }
+  if (qt.performer) {
+    const qarid = QO_PREFIX + String(qt.performer.id || '');
+    if (qarid !== QO_PREFIX && !artistMap[qarid] && !Object.values(artistMap).some(a => (a.name || '').toLowerCase() === (qt.performer.name || '').toLowerCase())) {
+      artistMap[qarid] = { id: qarid, name: qt.performer.name || 'Unknown', artworkURL: qobuzCoverUrl(qt.album) };
+    }
+  }
+  tracks.push({ id: qTrackId, title: qtTitle, artist: qtArtist, album: qt.album?.title || undefined, albumId: (qt.album?.id || qt.album?.qobuz_id) ? QO_PREFIX + String(qt.album.id || qt.album.qobuz_id) : undefined, albumArtworkURL: qt.album ? qobuzCoverUrl(qt.album) : undefined, trackNumber: qt.track_number || undefined, year: qt.album?.release_date_original ? String(qt.album.release_date_original).slice(0, 4) : undefined, duration: trackDuration(qt), artworkURL: qobuzCoverUrl(qt.album), format: 'flac', isrc: qt.isrc || undefined, audioQuality: qAudioQuality, provider: 'Qobuz' });
+  // Background pre-warm: cache Qobuz stream URLs so /stream returns instantly
+  (async () => {
+    try {
+      const preWarmKeys = [null, 'HIMAX', 'HI96', 'LOSSLESS', 'AAC320'];
+      const streamResults = await Promise.allSettled(
+        preWarmKeys.map(async key => {
+          const cKey = 'qstream:' + qt.id + ':' + (key || 'auto');
+          let result = cGet(cKey);
+          if (!result) result = await qobuzStream(qt.id, key).catch(() => null);
+          if (result) await redisSaveQobuzStream(qTrackId, key, result).catch(() => {});
+          return result;
+        })
+      );
+      const firstStream = streamResults.find(r => r.status === 'fulfilled' && r.value)?.value;
+      if (firstStream) console.log('[prewarm] qobuz-only tid=' + qTrackId + ' qid=' + qt.id + ' quality=' + firstStream.quality);
+    } catch(e) {}
+  })();
+}
 
 const artistList = Object.keys(artistMap)
 .sort((a, b) => (artistRelevance(artistMap[b].name, q) * 100 + (artistHits[b] || 0)) - (artistRelevance(artistMap[a].name, q) * 100 + (artistHits[a] || 0)))
@@ -1510,10 +1670,9 @@ for (const p of [...(Array.isArray(plFromSearch) ? plFromSearch : []),
   if (plItems.length >= 10) break;
 }
 
-// === DEDUP: collapse duplicate TIDAL pressings of the same song into one result.
-// Keeps the entry with the highest TIDAL audio quality tier so the pre-warmed
-// Qobuz Hi-Res stream (cached by that TIDAL ID) is used at stream time.
-const TIDAL_QUALITY_RANK = { HIRES_LOSSLESS: 4, HI_RES_LOSSLESS: 4, LOSSLESS: 3, HIGH: 2, LOW: 1 };
+// === DEDUP: collapse same song across TIDAL + Qobuz into one result.
+// Keeps the entry with the highest audio quality (Hi-Res > Lossless > AAC),
+// so the best available source is what Eclipse streams.
 const seenTracks = new Map();
 for (const t of tracks) {
   const key = (t.title || '').toLowerCase().replace(/[^a-z0-9]/g, '') + '||' + (t.artist || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -1521,8 +1680,8 @@ for (const t of tracks) {
   if (!existing) {
     seenTracks.set(key, t);
   } else {
-    const existingRank = TIDAL_QUALITY_RANK[existing.audioQuality] ?? 0;
-    const newRank = TIDAL_QUALITY_RANK[t.audioQuality] ?? 0;
+    const existingRank = MERGED_QUALITY_RANK[existing.audioQuality] ?? 0;
+    const newRank = MERGED_QUALITY_RANK[t.audioQuality] ?? 0;
     if (newRank > existingRank) seenTracks.set(key, t);
   }
 }
@@ -1565,12 +1724,22 @@ if (!checkBulkDownloadLimit(entry)) {
 const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
+// Qobuz-only tracks come back from combined search as "qo:<qobuzId>".
+// These have no TIDAL equivalent — resolve and stream straight from Qobuz.
+const isQobuzOnly = String(tid).startsWith('qo:');
+const qobuzOnlyId = isQobuzOnly ? String(tid).slice(3) : null;
 
-return dedupeCall('stream:' + tid + ':' + (inst || 'pool') + ':' + (pref || 'auto'), async () => {
+const atmosDedupeKey = String(c.req.query('title') || '').trim().startsWith('◗◖ ') ? ':atmos' : '';
+return dedupeCall('stream:' + tid + ':' + (inst || 'pool') + ':' + (pref || 'auto') + atmosDedupeKey, async () => {
 
 // Step 1: title+artist from Eclipse query params (some clients send these)
 let qTitle = String(c.req.query('title') || '').trim();
 let qArtist = String(c.req.query('artist') || '').trim();
+
+// Atmos-only gate: ◗◖ tracks must get Dolby Atmos audio exclusively — no
+// stereo fallback. Detected from the Eclipse-passed title, the meta caches
+// (populated at search/album/playlist time with the atmos flag), or cold /info/.
+let atmosOnly = qTitle.startsWith('◗◖ ');
 
 // Step 2: look up from in-memory cache (populated at search time)
 let qIsrc = String(c.req.query('isrc') || '').trim() || null;
@@ -1593,6 +1762,39 @@ if (redisMeta) {
   }
 }
 
+// Atmos flag from caches. Entries written before the atmos field existed (or
+// with a failed write) carry no flag — treat "flag missing" as UNKNOWN, never
+// as "not Atmos", or stale caches would silently bypass the Atmos-only gate.
+let atmosKnown = false;
+if (!atmosOnly) {
+  const memMeta = getCachedMeta(tid);
+  atmosKnown = !!(memMeta && 'atmos' in memMeta);
+  atmosOnly = !!(memMeta && memMeta.atmos);
+}
+if (!atmosOnly) {
+  atmosKnown = atmosKnown || !!(redisMeta && 'atmos' in redisMeta);
+  atmosOnly = !!(redisMeta && redisMeta.atmos);
+}
+
+// Flag unknown (stale cache, Eclipse-passed title, direct ID call) — verify
+// against /info/ once and persist the verdict so the next request is free.
+if (!atmosOnly && !atmosKnown && !isQobuzOnly) {
+  try {
+    const trackInfo = await hifiGetForTokenSafe(inst, '/info/', { id: tid });
+    const payload = trackInfo?.resource || trackInfo?.data || trackInfo;
+    if (payload && payload.title) {
+      const vAtmos = isAtmosTrack(payload);
+      if (vAtmos) atmosOnly = true;
+      cacheTrackMeta(tid, payload.title, trackArtist(payload) || qArtist, payload?.isrc || qIsrc || null, vAtmos);
+      redisCacheTrackMeta(String(tid), payload.title, trackArtist(payload) || qArtist, payload?.isrc || qIsrc || null, vAtmos).catch(() => {});
+      console.log('meta: /info/ verify for', tid, '->', vAtmos ? 'DOLBY_ATMOS (no fallback)' : 'not Atmos');
+    }
+  } catch(e) {
+    console.log('meta: /info/ verify failed for', tid, '-', e.message);
+  }
+}
+if (atmosOnly) console.log('meta: track', tid, 'is DOLBY_ATMOS — Atmos-only streaming, no fallback');
+
 // ── Cold-start meta lookup: if cache missed, fetch from HiFi API ─────────────
 // This handles the case where Eclipse calls /stream/:id directly (album, artist,
 // playlist flows) without a preceding /search — meaning TRACK_META_CACHE is empty.
@@ -1607,9 +1809,11 @@ if (!qTitle && !qIsrc) {
       qTitle  = coldTitle;
       qArtist = trackArtist(payload) || qArtist;
       qIsrc   = payload?.isrc || qIsrc || null;
-      console.log('meta: HiFi cold-lookup HIT for tid', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : '');
-      cacheTrackMeta(tid, qTitle, qArtist, qIsrc);
-      redisCacheTrackMeta(String(tid), qTitle, qArtist, qIsrc).catch(() => {});
+      const coldAtmos = isAtmosTrack(payload);
+      if (coldAtmos) atmosOnly = true;
+      console.log('meta: HiFi cold-lookup HIT for tid', tid, '->', qTitle, qIsrc ? '(isrc: ' + qIsrc + ')' : '', coldAtmos ? '(DOLBY_ATMOS)' : '');
+      cacheTrackMeta(tid, qTitle, qArtist, qIsrc, coldAtmos);
+      redisCacheTrackMeta(String(tid), qTitle, qArtist, qIsrc, coldAtmos).catch(() => {});
     }
   } catch(e) {
     console.log('meta: HiFi cold-lookup failed for tid', tid, '-', e.message);
@@ -1640,8 +1844,11 @@ const AUTO_QUALITIES = ['HI_RES_LOSSLESS', 'LOSSLESS', 'HIGH', 'LOW'];  // alway
 
 // ── TIDAL stream helper ───────────────────────────────────────────────────────
 async function getTidalStream() {
+  // Atmos tracks: single attempt at the tier Atmos lives on, with audioMode
+  // forced — if the instance can't deliver real Atmos we fail, never fall back.
   const tidalStartTier = pref ? (PREF_TO_TIDAL[pref] || 'LOSSLESS') : null;
-  const qualities = tidalStartTier
+  const qualities = atmosOnly ? ['HI_RES_LOSSLESS']
+    : tidalStartTier
     ? [tidalStartTier, ...ALL_QUALITIES.filter(q => ALL_QUALITIES.indexOf(q) > ALL_QUALITIES.indexOf(tidalStartTier))]
     : AUTO_QUALITIES;
   for (let qi = 0; qi < qualities.length; qi++) {
@@ -1649,12 +1856,23 @@ async function getTidalStream() {
     try {
       const trackParams = { id: tid, quality: ql };
       if (ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS') trackParams.manifest = 'hls';
+      if (atmosOnly) trackParams.audioMode = 'DOLBY_ATMOS';
       const data = await hifiGetForToken(inst, '/track/', trackParams);
       const payload = data && data.data ? data.data : data;
       if (payload && payload.manifest) {
         const decoded = decodeManifest(payload.manifest);
         if (decoded && decoded.url) {
           const codec = (decoded.codec || '').toLowerCase();
+          if (atmosOnly) {
+            // Real Atmos manifests are E-AC-3 JOC (ec-3) or AC-4 (ac-4) fMP4.
+            // Anything else (FLAC/AAC stereo) is NOT Atmos — fail, no fallback.
+            if (!codec.includes('ec-3') && !codec.includes('ac-4')) {
+              console.log('[tidal] Atmos track ' + tid + ' returned non-Atmos codec "' + codec + '" at ' + ql + ' — no fallback to stereo');
+              continue;
+            }
+            console.log('[tidal] Atmos OK for ' + tid + ' — ' + codec + ' (DOLBY_ATMOS)');
+            return { url: decoded.url, format: 'aac', quality: 'Tidal · Dolby Atmos', streamQuality: '[Tidal] DOLBY_ATMOS', codec: decoded.codec || null, atmos: true, expiresAt: Math.floor(Date.now() / 1000) + 21600 };
+          }
           // Explicit codec detection — never rely on isDash alone for format labeling.
           // FLAC DASH manifests from TIDAL have codecs="flac" or no codecs attr at all.
           // AAC DASH manifests always have codecs="mp4a.40.2" or similar mp4a string.
@@ -1679,6 +1897,12 @@ async function getTidalStream() {
         }
       }
       if (payload && payload.url) {
+        if (atmosOnly) {
+          // Direct-URL payload — no manifest codec to verify, and the instance
+          // has never returned real Atmos. Refuse rather than risk stereo.
+          console.log('[tidal] Atmos track ' + tid + ' got direct-URL payload without Atmos codec — no fallback to stereo');
+          continue;
+        }
         const looksLikeFlac  = /\.flac(\?|$)/i.test(payload.url || '');
         const isLosslessTier = ql === 'HI_RES_LOSSLESS' || ql === 'LOSSLESS';
         const qualityLabel   = ql === 'HI_RES_LOSSLESS' ? 'Hi-Res FLAC'
@@ -1696,16 +1920,14 @@ async function getTidalStream() {
 }
 
 // ── Steps 4+5: Fire Qobuz AND TIDAL in parallel ───────────────────────────────
-// Qobuz is preferred — but both race simultaneously so TIDAL never adds latency.
-// If Qobuz resolves first with a result, we return it immediately.
-// If TIDAL resolves first (Qobuz still searching), we hold it and return it only
-// if Qobuz ultimately fails. This gives Qobuz Hi-Res quality without Qobuz latency cost.
-const qobuzPrefKey = pref ? (PREF_TO_QOBUZ_KEY[pref] || null) : null;
+// Both providers resolve their best available stream. After both settle, the
+// unified quality score picks the winner — NOT whoever responds first.
+// Qobuz cascade: pref controls the format order tried (27->7->6->5 for Hi-Res tiers).
 // Skip Qobuz only if: user explicitly chose a TIDAL-only tier, OR we have no metadata at all.
-// For all Qobuz/auto tiers, always try Qobuz first — cascade ALL formats (27->7->6->5)
-// before falling back to TIDAL. pref only controls TIDAL fallback quality, not Qobuz skipping.
+const qobuzPrefKey = pref ? (PREF_TO_QOBUZ_KEY[pref] || null) : null;
 const isTidalOnlyPref = pref && ['TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW','AAC320'].includes(pref);
-const skipQobuz = isTidalOnlyPref || (!qTitle && !qIsrc);
+const skipQobuz = atmosOnly ? true : (isQobuzOnly ? false : (isTidalOnlyPref || (!qTitle && !qIsrc)));
+if (atmosOnly) console.log('[stream] Atmos-only mode — Qobuz skipped (Qobuz has no Dolby Atmos, no fallback allowed)');
 
 // Qobuz promise — full find+stream pipeline
 const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
@@ -1715,6 +1937,11 @@ const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
     let qTrack = getCachedQobuzTrack(tid);
     if (qTrack) {
       console.log('[stream] qobuz id-cache HIT (memory) tid=' + tid + ' -> qobuzId=' + qTrack.id);
+    } else if (isQobuzOnly && qobuzOnlyId) {
+      // Qobuz-only track from combined search — the Qobuz ID is embedded in the
+      // "qo:" prefix itself, so no lookup needed.
+      qTrack = { id: qobuzOnlyId, title: qTitle || null, artist: qArtist || null };
+      console.log('[stream] qobuz-only track, direct qid=' + qobuzOnlyId);
     } else {
       // Check Redis — survives across CF Worker isolates (fixes cross-isolate cache miss)
       qTrack = await redisLoadQobuzId(tid);
@@ -1738,14 +1965,22 @@ const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
     if (!qTrack || !qTrack.id) return null;
     // Title sanity check: if we have a known title and the Qobuz track title shares
     // zero words with it, reject the match — prevents wrong-song streams.
+    // EXCEPTION: identical ISRC is authoritative for song identity — titles may
+    // differ legitimately (romanized vs Japanese, e.g. "Abunaikioku" vs "アブナイキオク").
     if (qTitle && qTrack.title) {
-      const norm = s => String(s||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').trim();
-      const wantWords = norm(qTitle).split(/\s+/).filter(w => w.length > 1);
-      const gotWords  = norm(qTrack.title).split(/\s+/).filter(w => w.length > 1);
-      const overlap   = wantWords.filter(w => gotWords.includes(w)).length;
-      if (wantWords.length > 0 && overlap === 0) {
-        console.warn('[stream] qobuz title mismatch: wanted "' + qTitle + '" got "' + qTrack.title + '" — skipping');
-        return null;
+      const normIsrc = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
+      const sameIsrc = !!(qIsrc && qTrack.isrc && normIsrc(qIsrc) === normIsrc(qTrack.isrc));
+      if (!sameIsrc) {
+        const norm = s => String(s||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').trim();
+        const wantWords = norm(qTitle).split(/\s+/).filter(w => w.length > 1);
+        const gotWords  = norm(qTrack.title).split(/\s+/).filter(w => w.length > 1);
+        const overlap   = wantWords.filter(w => gotWords.includes(w)).length;
+        if (wantWords.length > 0 && overlap === 0) {
+          console.warn('[stream] qobuz title mismatch: wanted "' + qTitle + '" got "' + qTrack.title + '" — skipping');
+          return null;
+        }
+      } else {
+        console.log('[stream] qobuz match trusted by ISRC', qIsrc, '->', qTrack.title);
       }
     }
     const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
@@ -1760,21 +1995,35 @@ const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
   }
 })();
 
-// TIDAL promise — runs immediately in parallel
-const tidalPromise = (async () => {
+// TIDAL promise — runs immediately in parallel (skipped for Qobuz-only tracks,
+// which have no TIDAL equivalent and would only add latency/fail)
+const tidalPromise = isQobuzOnly ? Promise.resolve(null) : (async () => {
   try { return await getTidalStream(); } catch(e) { return null; }
 })();
 
-// Race: return Qobuz if it wins with a result, otherwise TIDAL, otherwise error.
+// ── Combine: wait for BOTH, then pick the stream with the highest quality ──
+// No racing — each provider resolves its best available stream, and the
+// unified quality score (tier + bit depth + sample rate) decides the winner.
 const [qResult, tResult] = await Promise.all([qobuzPromise, tidalPromise]);
 
-if (qResult) {
-  cSet('tstream:' + tid + ':' + (pref || 'auto'), qResult, 1680);
-  return Response.json(qResult);
+const qScore = streamQualityScore(qResult);
+const tScore = streamQualityScore(tResult);
+
+let best = null;
+if (qResult && tResult) {
+  best = qScore >= tScore ? qResult : tResult; // ties prefer Qobuz (typically 24-bit/192)
+  console.log('[stream] quality compare: Qobuz=' + (qResult.quality || '?') + ' (' + qScore + ') vs TIDAL=' + (tResult.quality || '?') + ' (' + tScore + ') — picked ' + (best === qResult ? 'Qobuz' : 'TIDAL'));
+} else {
+  best = qResult || tResult;
 }
-if (tResult) {
-  cSet('tstream:' + tid + ':' + (pref || 'auto'), tResult, 1680);
-  return Response.json(tResult);
+
+if (best) {
+  cSet('tstream:' + tid + ':' + (pref || 'auto') + (atmosOnly ? ':atmos' : ''), best, 1680);
+  return Response.json(best);
+}
+if (atmosOnly) {
+  console.log('[stream] Atmos track ' + tid + ' has no Atmos source — refusing stereo fallback');
+  return Response.json({ error: 'Dolby Atmos is unavailable for this track. The configured TIDAL instance does not serve Atmos audio, and no fallback is applied to Atmos tracks.', atmos: true }, { status: 502 });
 }
 return Response.json({ error: 'No stream found for track ' + tid }, { status: 404 });
 }); // end dedupeCall
@@ -1787,7 +2036,36 @@ app.get('/u/:token/album/:id', async c => {
 return withToken(c, async entry => {
 const aid = c.req.param('id');
 const inst = entry.instanceUrl;
+// Qobuz albums from combined search are namespaced "qo:<qobuzAlbumId>"
+const isQobuzAlbum = String(aid).startsWith('qo:');
+const qobuzAlbumId = isQobuzAlbum ? String(aid).slice(3) : null;
 try {
+  if (isQobuzAlbum) {
+    // Fetch album + tracks directly from Qobuz
+    const r = await fetch(
+      'https://www.qobuz.com/api.json/0.2/album/get'
+        + '?app_id=' + QOBUZ_APP_ID
+        + '&user_auth_token=' + QOBUZ_USER_TOKEN
+        + '&album_id=' + encodeURIComponent(qobuzAlbumId)
+        + '&limit=100&offset=0',
+      { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) }
+    );
+    if (!r.ok) return Response.json({ error: 'Qobuz album fetch failed: HTTP ' + r.status }, { status: 502 });
+    const album = await r.json();
+    const rawItems = album?.tracks?.items || album?.tracks || [];
+    const artistName = album?.artist?.name || 'Unknown';
+    const cover = qobuzCoverUrl(album?.image ? { image: album.image } : null);
+    const tracks = (Array.isArray(rawItems) ? rawItems : []).map((t, i) => {
+      if (!t || !t.id) return null;
+      const tTitle = t.title || 'Unknown';
+      const tArtist = t.performer?.name || artistName;
+      const qId = 'qo:' + String(t.id);
+      cacheTrackMeta(qId, tTitle, tArtist, t.isrc || null);
+      cacheQobuzTrackId(qId, t);
+      return { id: qId, title: tTitle, artist: tArtist, duration: t.duration ? Math.floor(t.duration) : undefined, trackNumber: t.track_number || i + 1, artworkURL: cover, format: 'flac', isrc: t.isrc || undefined };
+    }).filter(Boolean);
+    return Response.json({ id: String(aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: cover, year: album?.release_date_original ? String(album.release_date_original).slice(0, 4) : undefined, trackCount: album?.tracks_count || tracks.length, tracks });
+  }
   const data = await hifiGetForToken(inst, '/album/', { id: aid, limit: 100, offset: 0 });
   // Unwrap all known HiFi API response shapes
   const album = data?.data?.id ? data.data
@@ -1814,10 +2092,10 @@ try {
     if (!t || !t.id) return null;
     const tTitle = t.title || 'Unknown';
     const tArtist = trackArtist(t) || artistName;
-    cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-    redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
+    cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null, isAtmosTrack(t));
+    redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null, isAtmosTrack(t));
     const tFormat = (t.audioQuality === 'HIGH' || t.audioQuality === 'LOW') ? 'aac' : 'flac';
-    return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover, 1080), format: tFormat, isrc: t.isrc || undefined };
+    return { id: String(t.id), title: atmosPrefix(t) + tTitle + atmosSuffix(t), artist: tArtist, duration: trackDuration(t), trackNumber: t.trackNumber || i + 1, artworkURL: coverUrl(cover, 1080), format: tFormat, isrc: t.isrc || undefined };
   }).filter(Boolean);
   return Response.json({ id: String(album?.id || aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: coverUrl(cover, 1080), year: album?.releaseDate ? String(album.releaseDate).slice(0, 4) : undefined, trackCount: album?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
@@ -1829,8 +2107,40 @@ try {
 // ─── Artist ───────────────────────────────────────────────────────────────────
 app.get('/u/:token/artist/:id', async c => {
   return withToken(c, async entry => {
-    const aid = parseInt(c.req.param('id'), 10);
+    const rawAid = String(c.req.param('id'));
     const inst = entry.instanceUrl;
+    // Qobuz artists from combined search are namespaced "qo:<qobuzArtistId>"
+    const isQobuzArtist = rawAid.startsWith('qo:');
+    if (isQobuzArtist) {
+      const qarId = rawAid.slice(3);
+      try {
+        // Artist info + top tracks + albums straight from Qobuz
+        const r = await fetch(
+          'https://www.qobuz.com/api.json/0.2/artist/get'
+            + '?app_id=' + QOBUZ_APP_ID
+            + '&user_auth_token=' + QOBUZ_USER_TOKEN
+            + '&artist_id=' + encodeURIComponent(qarId)
+            + '&extra=tracks'
+            + '&limit=30',
+          { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) }
+        );
+        if (!r.ok) return Response.json({ error: 'Qobuz artist fetch failed: HTTP ' + r.status }, { status: 502 });
+        const data = await r.json();
+        const artistName = data?.name || 'Unknown';
+        const cover = qobuzCoverUrl(data?.image ? { image: data.image } : null);
+        const topTracks = (data?.tracks?.items || []).map(t => {
+          if (!t || !t.id) return null;
+          const qId = 'qo:' + String(t.id);
+          cacheTrackMeta(qId, t.title || 'Unknown', t.performer?.name || artistName, t.isrc || null);
+          cacheQobuzTrackId(qId, t);
+          return { id: qId, title: t.title || 'Unknown', artist: t.performer?.name || artistName, duration: t.duration ? Math.floor(t.duration) : undefined, artworkURL: qobuzCoverUrl(t.album), streamURL: undefined };
+        }).filter(Boolean);
+        return Response.json({ id: rawAid, name: artistName, artworkURL: cover, genres: (data?.genres || []).map(g => g.name).filter(Boolean), topTracks, albums: [] });
+      } catch(e) {
+        return Response.json({ error: 'Qobuz artist fetch failed: ' + e.message }, { status: 502 });
+      }
+    }
+    const aid = parseInt(rawAid, 10);
     if (isNaN(aid)) return Response.json({ error: 'Invalid artist ID' }, { status: 400 });
 
     // Pick the active base URL (custom instance or pool)
@@ -2015,10 +2325,10 @@ app.get('/u/:token/artist/:id', async c => {
         .map(t => {
           const tTitle  = t.title || 'Unknown';
           const tArtist = trackArtist(t) || artistName;
-          cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-          redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
+          cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null, isAtmosTrack(t));
+          redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null, isAtmosTrack(t));
           return {
-            id: String(t.id), title: tTitle, artist: tArtist,
+            id: String(t.id), title: atmosPrefix(t) + tTitle + atmosSuffix(t), artist: tArtist,
             duration: trackDuration(t),
             artworkURL: coverUrl(t.album?.cover || t.album?.image || t.album?.artwork, 1080),
           };
@@ -2072,10 +2382,10 @@ const t = item.item || item;
 if (!t || !t.id || t.streamReady === false) return null;
 const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
-cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null);
-redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null);
+cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null, isAtmosTrack(t));
+redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null, isAtmosTrack(t));
 const tFormat = (t.audioQuality === 'HIGH' || t.audioQuality === 'LOW') ? 'aac' : 'flac';
-return { id: String(t.id), title: tTitle, artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover, 1080), format: tFormat, isrc: t.isrc || undefined };
+return { id: String(t.id), title: atmosPrefix(t) + tTitle + atmosSuffix(t), artist: tArtist, duration: trackDuration(t), artworkURL: coverUrl(t.album?.cover, 1080), format: tFormat, isrc: t.isrc || undefined };
 }).filter(Boolean);
 return Response.json({ id: String(pl?.uuid || pl?.id || pid), title: pl?.title || 'Playlist', creator: pl?.creator?.name, artworkURL: (pl?.squareImage || pl?.image) ? coverUrl(pl.squareImage || pl.image, 1080) : undefined, trackCount: pl?.numberOfTracks || tracks.length, tracks });
 } catch(e) {
@@ -2297,10 +2607,5 @@ app.get('/8spine-source.json', async c => {
   return c.json(merged);
 });
 
-
-const PORT = parseInt(process.env.PORT || '3000', 10);
-serve({ fetch: app.fetch, port: PORT }, () => {
-  console.log('Server running on http://localhost:' + PORT);
-});
 
 export default app;
