@@ -314,7 +314,7 @@ async function qteSyncCreds() {
     return false;
   }
   try {
-    const r = await fetch(QTE_ADMIN_BASE + '/admin/creds?key=' + encodeURIComponent(adminKey), { headers: { 'User-Agent': UA, 'Accept': 'application/json' }, signal: AbortSignal.timeout(8000) });
+    const r = await withHardTimeout(fetch(QTE_ADMIN_BASE + '/admin/creds?key=' + encodeURIComponent(adminKey), { headers: { 'User-Agent': UA, 'Accept': 'application/json' }, signal: AbortSignal.timeout(8000) }), 8000, 'QTE sync');
     if (!r.ok) return false;
     const remote = await r.json();
     if (!Array.isArray(remote) || !remote.length) return false;
@@ -351,9 +351,20 @@ function qobuzEnvFallback() {
   return false;
 }
 
+// Hard wall-clock timeout that ALWAYS fires — unlike AbortSignal.timeout, it
+// also interrupts hangs at the DNS/TLS/connect phase on Workers.
+function withHardTimeout(promise, ms, label = '') {
+  let timer = null;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error((label ? label + ' ' : '') + 'timeout after ' + ms + 'ms')), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => { if (timer) clearTimeout(timer); });
+}
+
 // Returns a promise so the first Qobuz call can await the initial sync instead
 // of failing on an empty pool. Failed syncs get a 60s backoff to avoid a retry
-// storm when QTE is down.
+// storm when QTE is down. A watchdog guarantees the await can never hang a
+// request — if the sync is stuck, the request proceeds after 10s max.
 function qteEnsureSync() {
   const poolUsable = QOBUZ_CREDS.some(c => c.active);
   if (Date.now() - _qteSyncedAt < QTE_SYNC_INTERVAL_MS && poolUsable) return Promise.resolve();
@@ -368,7 +379,13 @@ function qteEnsureSync() {
       .catch(() => { _qteFailedAt = Date.now(); })
       .finally(() => { _qteSyncPromise = null; });
   }
-  return _qteSyncPromise;
+  return Promise.race([
+    _qteSyncPromise,
+    new Promise(res => setTimeout(() => {
+      console.log('[qobuz] sync watchdog fired — proceeding without waiting for QTE sync');
+      res();
+    }, 10000)),
+  ]);
 }
 
 // Low-level Qobuz API call (no signing needed) with credential rotation.
@@ -386,7 +403,7 @@ async function qobuzApi(endpoint, params, opts = {}) {
     const searchParams = new URLSearchParams();
     if (params) for (const [k, v] of Object.entries(params)) searchParams.set(k, String(v));
     try {
-      const res = await fetch(url + '&' + searchParams.toString(), { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(timeout) });
+      const res = await withHardTimeout(fetch(url + '&' + searchParams.toString(), { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(timeout) }), timeout, 'qobuzApi');
       if (!res.ok) {
         lastErr = new Error('Qobuz HTTP ' + res.status);
         if (isQobuzAuthFailure(res)) { qobuzNoteFailure(cred, 'HTTP ' + res.status); continue; }
@@ -425,7 +442,7 @@ async function qobuzGetFileUrl(trackId, formatId) {
       + '&request_ts='      + ts
       + '&request_sig='     + sig;
     try {
-      const res = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
+      const res = await withHardTimeout(fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) }), 8000, 'getFileUrl');
       if (!res.ok) {
         lastErr = new Error('Qobuz getFileUrl HTTP ' + res.status);
         if (isQobuzAuthFailure(res)) { qobuzNoteFailure(cred, 'HTTP ' + res.status); continue; }
