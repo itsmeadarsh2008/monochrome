@@ -254,8 +254,13 @@ let _qteSyncedAt = 0;
 let _qteSyncPromise = null;
 let _qteFailedAt = 0;
 
+// Worker bindings (secrets/vars) arrive via the env parameter, not globals.
+let _workerEnv = null;
+function captureEnv(env) { if (env) _workerEnv = env; }
+
 function getEnv(name) {
   if (typeof process !== 'undefined' && process.env && process.env[name]) return process.env[name];
+  if (_workerEnv && _workerEnv[name] !== undefined) return _workerEnv[name];
   try { if (typeof globalThis !== 'undefined' && globalThis[name] !== undefined) return globalThis[name]; } catch(e) {}
   return null;
 }
@@ -2871,8 +2876,12 @@ async function prewarmPopular() {
 qteEnsureSync();
 
 export default {
-  fetch: app.fetch,
+  fetch: (req, env, ctx) => {
+    captureEnv(env);
+    return app.fetch(req, env, ctx);
+  },
   async scheduled(event, env, ctx) {
+    captureEnv(env);
     ctx.waitUntil(prewarmPopular());
   },
 };
