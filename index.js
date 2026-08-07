@@ -1483,22 +1483,31 @@ const inst = entry.instanceUrl;
 if (!q) return Response.json({ tracks: [], albums: [], artists: [], playlists: [] });
 
 const cacheKey = 'mc:search:' + (inst || 'pool') + ':' + q.toLowerCase() + ':' + limit;
+// Track query popularity — the cron prewarmer re-searches the top queries so
+// every token gets an instant (warm) hit on them.
+upstashCmd('ZINCRBY', 'mc:popular:top', 1, q.toLowerCase()).catch(() => {});
 // In-memory cache check (fast path — avoids Upstash round-trip)
 const memCached = cGet(cacheKey);
 if (memCached) return Response.json(memCached);
 
 // Kick off the fresh build IMMEDIATELY (before Redis is even read), then check
 // Redis for a cached copy. Cache hit = stale-while-revalidate: serve instantly,
-// let the build refresh the cache in the background.
-const buildPromise = buildSearchResult(q, limit, inst);
-const redisCached = await upstashCmd('GET', cacheKey)
+// let the build refresh the cache in the background (only if entry is >6h old).
+const redisCachedP = upstashCmd('GET', cacheKey)
   .then(raw => { if (!raw) return null; try { const p = JSON.parse(raw); return p && p.tracks ? p : null; } catch(e) { return null; } })
   .catch(() => null);
+const buildPromise = buildSearchResult(q, limit, inst, redisCachedP.then(v => v === null));
+const redisCached = await redisCachedP;
 if (redisCached) {
   cSet(cacheKey, redisCached, 300);
   if (redisCached.tracks) redisCached.tracks.forEach(t => { if (t && t.id && t.title && !TRACK_META_CACHE.has(String(t.id))) cacheTrackMeta(t.id, t.title, t.artist); });
-  // Fresh build keeps running in the background and re-caches when done
-  buildPromise.then(r => { if (r) { cSet(cacheKey, r, 300); upstashCmd('SET', cacheKey, JSON.stringify(r), 'EX', 1800); } }).catch(() => {});
+  // Stale-while-revalidate: rebuild in the background only when the entry is
+  // older than 6h (TTL left < 18h of the 24h lifetime)
+  upstashCmd('TTL', cacheKey).then(remaining => {
+    if (typeof remaining === 'number' && remaining >= 0 && remaining < 64800) {
+      buildPromise.then(r => { if (r) { cSet(cacheKey, r, 300); upstashCmd('SET', cacheKey, JSON.stringify(r), 'EX', 86400).catch(() => {}); } }).catch(() => {});
+    }
+  }).catch(() => {});
   return Response.json(redisCached);
 }
 let result = null;
@@ -1509,7 +1518,7 @@ try {
 }
 if (result) {
   cSet(cacheKey, result, 300);
-  upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 1800).catch(() => {});
+  upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 86400).catch(() => {});
   return Response.json(result);
 }
 return Response.json({ error: 'Search failed', tracks: [], albums: [], artists: [], playlists: [] }, { status: 502 });
@@ -1517,28 +1526,33 @@ return Response.json({ error: 'Search failed', tracks: [], albums: [], artists: 
 
 // ─── Search pipeline: build a full search response ──────────────────────────────
 // All five upstream calls (TIDAL s=/al=/a=/p= + Qobuz) run in parallel and each
-// result is cached independently (memory + Redis, 10min), so repeat searches
+// result is cached independently (memory + Redis, 24h), so repeat searches
 // assemble from sub-caches instead of the network. Auxiliary calls (albums,
 // artists, playlists, Qobuz) are time-boxed so a slow one can never stall the
-// response — the critical track search gets the full budget.
-async function buildSearchResult(q, limit, inst) {
+// response — the critical track search gets the full budget. When the composite
+// cache misses, the sub-caches (same 24h TTL) are provably stale too, so their
+// Redis reads are skipped and the network is hit directly.
+async function buildSearchResult(q, limit, inst, compositeMissP, opts = {}) {
   const sKey = (type, n) => 'mc:subs:' + (inst || 'pool') + ':' + type + ':' + q.toLowerCase() + ':' + n;
   const subFetch = async (key, fn, timeoutMs) => {
     const mem = cGet(key);
     if (mem) return mem;
-    const raw = await upstashCmd('GET', key);
-    if (raw) { try { const v = JSON.parse(raw); if (v) { cSet(key, v, 600); return v; } } catch(e) {} }
+    const skipSubCache = compositeMissP ? await compositeMissP.catch(() => false) : false;
+    if (!skipSubCache) {
+      const raw = await upstashCmd('GET', key);
+      if (raw) { try { const v = JSON.parse(raw); if (v) { cSet(key, v, 600); return v; } } catch(e) {} }
+    }
     const val = await withTimeout(fn(), timeoutMs, null);
-    if (val) { cSet(key, val, 600); upstashCmd('SET', key, JSON.stringify(val), 'EX', 600).catch(() => {}); }
+    if (val) { cSet(key, val, 600); upstashCmd('SET', key, JSON.stringify(val), 'EX', 86400).catch(() => {}); }
     return val;
   };
 
   const [mainData, alData, arData, plData, qobuzItems] = await Promise.all([
     subFetch(sKey('s', limit), () => hifiGetForToken(inst, '/search/', { s: q, limit, offset: 0 }), 8000),
-    subFetch(sKey('al', Math.min(limit, 20)), () => hifiGetForTokenSafe(inst, '/search/', { al: q, limit: Math.min(limit, 20), offset: 0 }), 2000),
-    subFetch(sKey('a', Math.min(limit, 20)), () => hifiGetForTokenSafe(inst, '/search/', { a: q, limit: Math.min(limit, 20), offset: 0 }), 2000),
-    subFetch(sKey('p', 20), () => hifiGetForTokenSafe(inst, '/search/', { p: q, limit: 20, offset: 0 }), 1500),
-    subFetch(sKey('q', limit + 10), () => qobuzSearchDirect(q, limit + 10), 1500),
+    subFetch(sKey('al', Math.min(limit, 20)), () => hifiGetForTokenSafe(inst, '/search/', { al: q, limit: Math.min(limit, 20), offset: 0 }), 800),
+    subFetch(sKey('a', Math.min(limit, 20)), () => hifiGetForTokenSafe(inst, '/search/', { a: q, limit: Math.min(limit, 20), offset: 0 }), 800),
+    subFetch(sKey('p', 20), () => hifiGetForTokenSafe(inst, '/search/', { p: q, limit: 20, offset: 0 }), 700),
+    subFetch(sKey('q', limit + 10), () => qobuzSearchDirect(q, limit + 10), 800),
   ]);
 const data = mainData || null;
 // Items array (tracks) at data.data.items OR data.items
@@ -1569,7 +1583,9 @@ redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null, isAtmosTrack(
 // Background Qobuz pre-warm — find track AND pre-warm stream URL into cache
 // so /stream/:id returns instantly from cache without any live Qobuz API calls.
 // Also persists to Redis so any CF Worker isolate can serve the stream instantly.
-(async () => {
+// Skipped when opts.skipPrewarm (cron prewarmer) — protects the Qobuz token
+// from burst stream-call load; streams prewarm lazily when users play them.
+if (!opts.skipPrewarm) (async () => {
   try {
     const qTrack = await qobuzFindBestTrack(tTitle, tArtist, t.isrc || null, inst);
     if (qTrack && qTrack.id) {
@@ -1658,7 +1674,8 @@ for (const qt of qobuzRanked) {
   }
   tracks.push({ id: qTrackId, title: qtTitle, artist: qtArtist, album: qt.album?.title || undefined, albumId: (qt.album?.id || qt.album?.qobuz_id) ? QO_PREFIX + String(qt.album.id || qt.album.qobuz_id) : undefined, albumArtworkURL: qt.album ? qobuzCoverUrl(qt.album) : undefined, trackNumber: qt.track_number || undefined, year: qt.album?.release_date_original ? String(qt.album.release_date_original).slice(0, 4) : undefined, duration: trackDuration(qt), artworkURL: qobuzCoverUrl(qt.album), format: 'flac', isrc: qt.isrc || undefined, audioQuality: qAudioQuality, provider: 'Qobuz' });
   // Background pre-warm: cache Qobuz stream URLs so /stream returns instantly
-  (async () => {
+  // (skipped in cron prewarmer — see opts.skipPrewarm above)
+  if (!opts.skipPrewarm) (async () => {
     try {
       const preWarmKeys = [null, 'HIMAX', 'HI96', 'LOSSLESS', 'AAC320'];
       const streamResults = await Promise.allSettled(
@@ -2641,5 +2658,37 @@ app.get('/8spine-source.json', async c => {
   return c.json(merged);
 });
 
+// ─── Cron prewarmer: keep popular searches instant for every token ────────────
+// Every hour, re-search the top-30 most-searched queries so fresh tokens get a
+// ~100ms warm hit instead of a cold upstream round-trip. Stream pre-warm is
+// SKIPPED here on purpose — stream URLs refresh lazily on play; the cron only
+// keeps the search result caches warm (protects the Qobuz token from burst
+// stream-call load that has caused token bans before).
+const PREWARM_TOP_N = 30;
+async function prewarmPopular() {
+  try {
+    const queries = await upstashCmd('ZREVRANGE', 'mc:popular:top', 0, PREWARM_TOP_N - 1);
+    upstashCmd('ZREMRANGEBYRANK', 'mc:popular:top', 0, -101).catch(() => {});
+    if (!Array.isArray(queries) || !queries.length) return;
+    console.log('[prewarm] refreshing ' + queries.length + ' popular search(es)');
+    for (let i = 0; i < queries.length; i += 5) {
+      await Promise.all(queries.slice(i, i + 5).map(async q => {
+        const cacheKey = 'mc:search:pool:' + q + ':20';
+        const result = await buildSearchResult(q, 20, null, null, { skipPrewarm: true });
+        if (result) {
+          cSet(cacheKey, result, 300);
+          await upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 86400).catch(() => {});
+        }
+      }));
+    }
+  } catch(e) {
+    console.log('[prewarm] failed: ' + (e && e.message));
+  }
+}
 
-export default app;
+export default {
+  fetch: app.fetch,
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(prewarmPopular());
+  },
+};
