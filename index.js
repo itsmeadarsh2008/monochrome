@@ -238,10 +238,214 @@ if (n.includes(q) || q.includes(n)) return 2;
 return 0;
 }
 
-// ─── Qobuz credentials (direct API — no proxy needed) ────────────────────────
-const QOBUZ_APP_ID    = '798273057';
-const QOBUZ_USER_TOKEN = 'Ic1hf9LV33c8ds8G0-EYS9sWzYtuyeTkKujD6imipgPuNFxwEkZENtr9Fy2PM1m6pwcWv5fDzn5nnmyIoWpH_w';
-const QOBUZ_SECRET    = 'abb21364945c0583309667d13ca3d93a';
+// ─── Qobuz credential pool (QTE-style: internal rotation + cooldown) ──────────
+// The pool is synced from the QTE instance's admin store (KV-managed) — see
+// qteSyncCreds(). No credentials are hardcoded here; if QTE sync is
+// unavailable, QOBUZ_APP_ID / QOBUZ_USER_TOKEN / QOBUZ_SECRET env bindings are
+// used as a single-credential fallback.
+let QOBUZ_CREDS = [];
+const QTE_ADMIN_BASE = 'https://qobuz-tidal-eclipse.cyrusna29.workers.dev';
+const QTE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
+const QOBUZ_CRED_COOLDOWN_MS = 10 * 60 * 1000;
+const QOBUZ_CRED_FAIL_THRESHOLD = 3;
+
+const _qCredHealth = new Map(); // id -> { failCount, cooldownUntil, lastFailReason }
+let _qteSyncedAt = 0;
+let _qteSyncPromise = null;
+let _qteFailedAt = 0;
+
+function getEnv(name) {
+  if (typeof process !== 'undefined' && process.env && process.env[name]) return process.env[name];
+  try { if (typeof globalThis !== 'undefined' && globalThis[name] !== undefined) return globalThis[name]; } catch(e) {}
+  return null;
+}
+
+function qobuzPickCred() {
+  const now = Date.now();
+  const pool = QOBUZ_CREDS.filter(c => c.active && c.lastTestOk !== false);
+  const healthy = pool.filter(c => {
+    const h = _qCredHealth.get(c.id);
+    return !h || !h.cooldownUntil || h.cooldownUntil <= now;
+  });
+  const source = healthy.length ? healthy : (pool.length ? pool : QOBUZ_CREDS.filter(c => c.active));
+  if (!source.length) return null;
+  // Random pick — a shared round-robin index is race-prone under concurrent
+  // calls (two callers can grab the same cred back-to-back and both burn their
+  // retries on it). Random gives every attempt an independent chance.
+  return source[Math.floor(Math.random() * source.length)];
+}
+
+function qobuzNoteFailure(cred, reason) {
+  if (!cred) return;
+  const now = Date.now();
+  const h = _qCredHealth.get(cred.id) || { failCount: 0 };
+  h.failCount = (h.failCount || 0) + 1;
+  h.lastFailAt = now;
+  h.lastFailReason = reason || 'unknown';
+  if (h.failCount >= QOBUZ_CRED_FAIL_THRESHOLD) {
+    h.cooldownUntil = now + QOBUZ_CRED_COOLDOWN_MS;
+    h.failCount = 0;
+    console.log('[qobuz] cred "' + cred.id + '" cooled down 10min after ' + reason);
+  }
+  _qCredHealth.set(cred.id, h);
+}
+
+function qobuzNoteSuccess(cred) {
+  if (!cred) return;
+  _qCredHealth.delete(cred.id);
+}
+
+function isQobuzAuthFailure(res) {
+  return res && (res.status === 401 || res.status === 403 || res.status === 429);
+}
+
+// Sync the credential pool from the QTE instance's admin store (KV-managed).
+// Keeps local health state; only trusts QTE's tested-OK actives. The admin key
+// comes from the QTE_ADMIN_KEY secret binding — never from source code.
+async function qteSyncCreds() {
+  const adminKey = getEnv('QTE_ADMIN_KEY');
+  if (!adminKey) {
+    console.log('[qobuz] QTE_ADMIN_KEY not set — QTE sync disabled');
+    return false;
+  }
+  try {
+    const r = await fetch(QTE_ADMIN_BASE + '/admin/creds?key=' + encodeURIComponent(adminKey), { headers: { 'User-Agent': UA, 'Accept': 'application/json' }, signal: AbortSignal.timeout(8000) });
+    if (!r.ok) return false;
+    const remote = await r.json();
+    if (!Array.isArray(remote) || !remote.length) return false;
+    QOBUZ_CREDS = remote.map(rc => ({
+      id: rc.id,
+      label: rc.label || rc.id,
+      appId: rc.appId,
+      userToken: rc.userToken,
+      secret: rc.secret,
+      active: !!rc.active && rc.lastTestOk !== false,
+      lastTestOk: rc.lastTestOk === true,
+      source: 'qte',
+    }));
+    _qteSyncedAt = Date.now();
+    console.log('[qobuz] synced ' + remote.length + ' credential(s) from QTE admin');
+    return true;
+  } catch (e) {
+    console.log('[qobuz] QTE admin sync failed: ' + e.message);
+    return false;
+  }
+}
+
+// Fallback when QTE is unreachable: use QOBUZ_* env bindings (Cloudflare
+// secrets / Render / Vercel env vars) as a single credential.
+function qobuzEnvFallback() {
+  const appId = getEnv('QOBUZ_APP_ID');
+  const userToken = getEnv('QOBUZ_USER_TOKEN');
+  const secret = getEnv('QOBUZ_SECRET');
+  if (appId && userToken && secret) {
+    QOBUZ_CREDS = [{ id: 'env', label: 'env', appId, userToken, secret, active: true, lastTestOk: true, source: 'env' }];
+    console.log('[qobuz] QTE sync unavailable — using QOBUZ_* env fallback credentials');
+    return true;
+  }
+  return false;
+}
+
+// Returns a promise so the first Qobuz call can await the initial sync instead
+// of failing on an empty pool. Failed syncs get a 60s backoff to avoid a retry
+// storm when QTE is down.
+function qteEnsureSync() {
+  const poolUsable = QOBUZ_CREDS.some(c => c.active);
+  if (Date.now() - _qteSyncedAt < QTE_SYNC_INTERVAL_MS && poolUsable) return Promise.resolve();
+  if (_qteFailedAt && Date.now() - _qteFailedAt < 60000) return Promise.resolve();
+  if (!_qteSyncPromise) {
+    _qteSyncPromise = qteSyncCreds()
+      .then(ok => {
+        if (!ok) {
+          if (!qobuzEnvFallback()) _qteFailedAt = Date.now();
+        }
+      })
+      .catch(() => { _qteFailedAt = Date.now(); })
+      .finally(() => { _qteSyncPromise = null; });
+  }
+  return _qteSyncPromise;
+}
+
+// Low-level Qobuz API call (no signing needed) with credential rotation.
+async function qobuzApi(endpoint, params, opts = {}) {
+  await qteEnsureSync();
+  const timeout = opts.timeout || 8000;
+  const maxAttempts = Math.min(opts.maxAttempts || 2, 3);
+  let lastErr = null;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const cred = qobuzPickCred();
+    if (!cred) break;
+    const url = 'https://www.qobuz.com/api.json/0.2' + endpoint
+      + '?app_id=' + encodeURIComponent(cred.appId)
+      + '&user_auth_token=' + encodeURIComponent(cred.userToken);
+    const searchParams = new URLSearchParams();
+    if (params) for (const [k, v] of Object.entries(params)) searchParams.set(k, String(v));
+    try {
+      const res = await fetch(url + '&' + searchParams.toString(), { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(timeout) });
+      if (!res.ok) {
+        lastErr = new Error('Qobuz HTTP ' + res.status);
+        if (isQobuzAuthFailure(res)) { qobuzNoteFailure(cred, 'HTTP ' + res.status); continue; }
+        break;
+      }
+      const data = await res.json();
+      if (data && data.status === 'error' && data.code) {
+        lastErr = new Error(data.message || ('Qobuz ' + data.code));
+        qobuzNoteFailure(cred, lastErr.message);
+        continue;
+      }
+      qobuzNoteSuccess(cred);
+      return data;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('All Qobuz credentials failed for ' + endpoint);
+}
+
+// Signed track/getFileUrl with credential rotation on auth failure.
+async function qobuzGetFileUrl(trackId, formatId) {
+  await qteEnsureSync();
+  let lastErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const cred = qobuzPickCred();
+    if (!cred) break;
+    const ts  = Math.floor(Date.now() / 1000);
+    const sig = md5('trackgetFileUrlformat_id' + formatId + 'intentstreamtrack_id' + trackId + ts + cred.secret);
+    const url = 'https://www.qobuz.com/api.json/0.2/track/getFileUrl'
+      + '?app_id='          + encodeURIComponent(cred.appId)
+      + '&user_auth_token=' + encodeURIComponent(cred.userToken)
+      + '&track_id='        + trackId
+      + '&format_id='       + formatId
+      + '&intent=stream'
+      + '&request_ts='      + ts
+      + '&request_sig='     + sig;
+    try {
+      const res = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
+      if (!res.ok) {
+        lastErr = new Error('Qobuz getFileUrl HTTP ' + res.status);
+        if (isQobuzAuthFailure(res)) { qobuzNoteFailure(cred, 'HTTP ' + res.status); continue; }
+        break;
+      }
+      const data = await res.json();
+      if (!data || !data.url) {
+        // Qobuz returns HTTP 200 + restrictions (no url) when a credential is
+        // blocked for a specific track — that's per-credential, so rotate to the
+        // next one instead of giving up.
+        const restr = data && Array.isArray(data.restrictions) && data.restrictions.length
+          ? data.restrictions.map(r => r.code || r.message).join(',')
+          : '';
+        lastErr = new Error((data && data.message) || (restr ? 'Qobuz restricted: ' + restr : 'Qobuz getFileUrl missing url'));
+        if (data && data.status === 'error' && data.code) qobuzNoteFailure(cred, lastErr.message);
+        continue;
+      }
+      qobuzNoteSuccess(cred);
+      return data;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('All Qobuz credentials failed for getFileUrl ' + trackId);
+}
 
 // Format ID map — same as QTE
 const QOBUZ_FORMAT_MAP = {
@@ -341,21 +545,8 @@ async function qobuzStream(trackId, prefKey) {
   // Try each format in priority order — exactly like QTE's loop
   for (const fmt of fmtOrder) {
     try {
-      const ts  = Math.floor(Date.now() / 1000);
-      const sig = md5('trackgetFileUrlformat_id' + fmt + 'intentstreamtrack_id' + trackId + ts + QOBUZ_SECRET);
-      const url = 'https://www.qobuz.com/api.json/0.2/track/getFileUrl'
-        + '?app_id='          + QOBUZ_APP_ID
-        + '&user_auth_token=' + QOBUZ_USER_TOKEN
-        + '&track_id='        + trackId
-        + '&format_id='       + fmt
-        + '&intent=stream'
-        + '&request_ts='      + ts
-        + '&request_sig='     + sig;
-
-      const res = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
-      if (!res.ok) continue; // try next format
-      const data = await res.json();
-      if (!data?.url) continue;
+      const data = await qobuzGetFileUrl(trackId, fmt);
+      if (!data || !data.url) continue;
 
       const qobuzStreamQuality = fmt === 27 || fmt === 7 ? 'HI_RES_LOSSLESS' : fmt === 6 ? 'LOSSLESS' : 'HIGH';
       const result = {
@@ -593,16 +784,8 @@ async function qobuzFindByIsrc(isrc, wantTitle = null, wantArtist = null) {
   if (cached) return cached;
 
   try {
-    const r = await fetch(
-      'https://www.qobuz.com/api.json/0.2/track/search'
-        + '?app_id='          + QOBUZ_APP_ID
-        + '&user_auth_token=' + QOBUZ_USER_TOKEN
-        + '&query='           + encodeURIComponent(wantIsrc)
-        + '&limit=50', // increased to catch Hi-Res editions further down the result list
-      { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(6000) }
-    );
-    if (r.ok) {
-      const data = await r.json();
+    const data = await qobuzApi('/track/search', { query: wantIsrc, limit: 50 }); // increased to catch Hi-Res editions further down the result list
+    if (data) {
       const items = (data?.tracks?.items || []).filter(t => t && t.isrc && normIsrc(t.isrc) === wantIsrc);
       const match = qobuzPickBestEdition(items, wantTitle, wantArtist, wantIsrc);
       if (match && match.id) {
@@ -700,14 +883,7 @@ async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
 // ─── Qobuz direct search — used alongside TIDAL search, results get merged ──
 async function qobuzSearchDirect(query, limit) {
   try {
-    const url = 'https://www.qobuz.com/api.json/0.2/track/search'
-      + '?app_id=' + QOBUZ_APP_ID
-      + '&user_auth_token=' + QOBUZ_USER_TOKEN
-      + '&query=' + encodeURIComponent(query)
-      + '&limit=' + (limit || 20);
-    const r = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
-    if (!r.ok) return null;
-    const data = await r.json();
+    const data = await qobuzApi('/track/search', { query, limit: (limit || 20) });
     return (data?.tracks?.items || []).filter(t => t && t.id);
   } catch(e) {
     return null;
@@ -1378,23 +1554,20 @@ app.get('/instances', async c => {
 
 app.get('/qobuz-ping', async c => {
   try {
-    const ts  = Math.floor(Date.now() / 1000);
-    const sig = md5('trackgetFileUrlformat_id6intentstreamtrack_id1' + ts + QOBUZ_SECRET);
-    const url = 'https://www.qobuz.com/api.json/0.2/track/getFileUrl'
-      + '?app_id=' + QOBUZ_APP_ID
-      + '&user_auth_token=' + QOBUZ_USER_TOKEN
-      + '&track_id=1&format_id=6&intent=stream'
-      + '&request_ts=' + ts + '&request_sig=' + sig;
-    const r = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(5000) });
-    // 400 = bad track ID but auth worked, 200 = full success
-    return Response.json({ ok: r.status === 200 || r.status === 400, status: r.status });
+    await qobuzGetFileUrl(236929828, 6);
+    return Response.json({ ok: true, status: 200 });
   } catch(e) {
     return Response.json({ ok: false, error: e.message });
   }
 });
 
 app.get('/quality-test', async c => {
-  const TEST_TRACK_ID = '501963434';
+  // Track ids are engine-specific: Qobuz ids resolve on Qobuz, TIDAL ids on the
+  // hifi-api instances. 1781887 = Billie Jean (verified FLAC 24-bit at
+  // HI_RES_LOSSLESS on all instances). 236929828 = What Makes You Beautiful
+  // (24-bit, verified streamable on every Qobuz pool credential).
+  const QOBUZ_TEST_TRACK_ID = '236929828';
+  const TIDAL_TEST_TRACK_ID = '1781887';
   const TIERS = [
     { id: 'qobuz_himax',    label: 'Qobuz Hi-Res 192',    type: 'qobuz', format: 27 },
     { id: 'qobuz_hi96',     label: 'Qobuz Hi-Res 96',     type: 'qobuz', format: 7 },
@@ -1406,27 +1579,48 @@ app.get('/quality-test', async c => {
     { id: 'tidal_aac96',    label: 'TIDAL AAC 96',         type: 'tidal', quality: 'LOW' },
   ];
   const results = await Promise.all(TIERS.map(async tier => {
-    const start = Date.now();
-    try {
-      if (tier.type === 'qobuz') {
-        const ts = Math.floor(Date.now() / 1000);
-        const sig = md5('trackgetFileUrlformat_id' + tier.format + 'intentstreamtrack_id1' + ts + QOBUZ_SECRET);
-        const url = 'https://www.qobuz.com/api.json/0.2/track/getFileUrl'
-          + '?app_id=' + QOBUZ_APP_ID + '&user_auth_token=' + QOBUZ_USER_TOKEN
-          + '&track_id=1&format_id=' + tier.format + '&intent=stream'
-          + '&request_ts=' + ts + '&request_sig=' + sig;
-        const r = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) });
-        const ok = r.status === 200 || r.status === 400 || r.status === 404;
-        return { id: tier.id, label: tier.label, ok, ms: Date.now() - start };
-      } else {
-        const data = await hifiGet('/track/', { id: TEST_TRACK_ID, quality: tier.quality });
-        const payload = data && data.data ? data.data : data;
-        const hasUrl = payload && (payload.manifest || payload.url);
-        return { id: tier.id, label: tier.label, ok: !!hasUrl, ms: Date.now() - start };
+    const attempt = async () => {
+      const start = Date.now();
+      try {
+        if (tier.type === 'qobuz') {
+          try {
+            const d = await qobuzGetFileUrl(Number(QOBUZ_TEST_TRACK_ID), tier.format);
+            return { id: tier.id, label: tier.label, ok: true, ms: Date.now() - start, samplingRate: d?.sampling_rate || null, bitDepth: d?.bit_depth || null };
+          } catch(e) {
+            return { id: tier.id, label: tier.label, ok: false, ms: Date.now() - start, error: e.message };
+          }
+        } else {
+          // Mirror the real stream path (getTidalStream): hls manifest for lossless tiers.
+          const params = { id: TIDAL_TEST_TRACK_ID, quality: tier.quality };
+          if (tier.quality === 'HI_RES_LOSSLESS' || tier.quality === 'LOSSLESS') params.manifest = 'hls';
+          const data = await hifiGet('/track/', params);
+          const payload = data && data.data ? data.data : data;
+          // Green = a stream URL is actually obtainable (instances may downgrade
+          // a requested tier — e.g. LOSSLESS -> HIGH AAC — the delivered codec is
+          // reported so the downgrade stays visible).
+          let dec = null;
+          if (payload && payload.manifest) dec = decodeManifest(payload.manifest);
+          const hasUrl = !!(dec && dec.url);
+          return {
+            id: tier.id, label: tier.label, ok: hasUrl, ms: Date.now() - start,
+            deliveredQuality: payload && payload.audioQuality || null,
+            codec: dec && dec.codec || null,
+            bitDepth: payload && payload.bitDepth || null,
+          };
+        }
+      } catch(e) {
+        return { id: tier.id, label: tier.label, ok: false, ms: Date.now() - start, error: e.message };
       }
-    } catch(e) {
-      return { id: tier.id, label: tier.label, ok: false, ms: Date.now() - start };
+    };
+    // Retry once on failure — a single dead credential in the pool can burn all
+    // rotation attempts on one request (e.g. QTE re-adding a 401ing cred between
+    // its own tests). The retry gets fresh picks and lands on a healthy cred.
+    let result = await attempt();
+    if (!result.ok) {
+      await new Promise(r => setTimeout(r, 250));
+      result = await attempt();
     }
+    return result;
   }));
   const qobuzOk = results.filter(r => r.id.startsWith('qobuz') && r.ok).length;
   const tidalOk = results.filter(r => r.id.startsWith('tidal') && r.ok).length;
@@ -2092,17 +2286,13 @@ const isQobuzAlbum = String(aid).startsWith('qo:');
 const qobuzAlbumId = isQobuzAlbum ? String(aid).slice(3) : null;
 try {
   if (isQobuzAlbum) {
-    // Fetch album + tracks directly from Qobuz
-    const r = await fetch(
-      'https://www.qobuz.com/api.json/0.2/album/get'
-        + '?app_id=' + QOBUZ_APP_ID
-        + '&user_auth_token=' + QOBUZ_USER_TOKEN
-        + '&album_id=' + encodeURIComponent(qobuzAlbumId)
-        + '&limit=100&offset=0',
-      { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) }
-    );
-    if (!r.ok) return Response.json({ error: 'Qobuz album fetch failed: HTTP ' + r.status }, { status: 502 });
-    const album = await r.json();
+    // Fetch album + tracks directly from Qobuz (rotating credential pool)
+    let album = null;
+    try {
+      album = await qobuzApi('/album/get', { album_id: qobuzAlbumId, limit: 100, offset: 0 }, { timeout: 10000 });
+    } catch(e) {
+      return Response.json({ error: 'Qobuz album fetch failed: ' + e.message }, { status: 502 });
+    }
     const rawItems = album?.tracks?.items || album?.tracks || [];
     const artistName = album?.artist?.name || 'Unknown';
     const cover = qobuzCoverUrl(album?.image ? { image: album.image } : null);
@@ -2165,18 +2355,8 @@ app.get('/u/:token/artist/:id', async c => {
     if (isQobuzArtist) {
       const qarId = rawAid.slice(3);
       try {
-        // Artist info + top tracks + albums straight from Qobuz
-        const r = await fetch(
-          'https://www.qobuz.com/api.json/0.2/artist/get'
-            + '?app_id=' + QOBUZ_APP_ID
-            + '&user_auth_token=' + QOBUZ_USER_TOKEN
-            + '&artist_id=' + encodeURIComponent(qarId)
-            + '&extra=tracks'
-            + '&limit=30',
-          { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) }
-        );
-        if (!r.ok) return Response.json({ error: 'Qobuz artist fetch failed: HTTP ' + r.status }, { status: 502 });
-        const data = await r.json();
+        // Artist info + top tracks + albums straight from Qobuz (rotating credential pool)
+        const data = await qobuzApi('/artist/get', { artist_id: qarId, extra: 'tracks', limit: 30 }, { timeout: 10000 });
         const artistName = data?.name || 'Unknown';
         const cover = qobuzCoverUrl(data?.image ? { image: data.image } : null);
         const topTracks = (data?.tracks?.items || []).map(t => {
@@ -2685,6 +2865,10 @@ async function prewarmPopular() {
     console.log('[prewarm] failed: ' + (e && e.message));
   }
 }
+
+// Kick off the initial QTE credential sync at boot — the first Qobuz request
+// awaits it (qteEnsureSync), so there's no cold-pool window after a deploy.
+qteEnsureSync();
 
 export default {
   fetch: app.fetch,
