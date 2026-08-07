@@ -86,6 +86,16 @@ async function dedupeCall(key, fn) {
   return p;
 }
 
+// ─── Bounded wait ─────────────────────────────────────────────────────────────
+// Resolves with `fallback` (default null) if the promise doesn't settle in time,
+// so slow auxiliary upstreams can never stall the search response.
+function withTimeout(promise, ms, fallback = null) {
+  return Promise.race([
+    Promise.resolve(promise),
+    new Promise(res => setTimeout(() => res(fallback), ms)),
+  ]);
+}
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 function coverUrl(uuid, size) {
 if (!uuid) return undefined;
@@ -230,7 +240,7 @@ return 0;
 
 // ─── Qobuz credentials (direct API — no proxy needed) ────────────────────────
 const QOBUZ_APP_ID    = '798273057';
-const QOBUZ_USER_TOKEN = 'DE3BiaAiEaqUKHN9GL4UZ3vRoSTnTQK24DrGQilRHUDsZqQXaEAw2ESMKvGs-RxBT3l_3gfKV3VNAKTzrvrg5g';
+const QOBUZ_USER_TOKEN = 'Ic1hf9LV33c8ds8G0-EYS9sWzYtuyeTkKujD6imipgPuNFxwEkZENtr9Fy2PM1m6pwcWv5fDzn5nnmyIoWpH_w';
 const QOBUZ_SECRET    = 'abb21364945c0583309667d13ca3d93a';
 
 // Format ID map — same as QTE
@@ -1473,38 +1483,69 @@ const inst = entry.instanceUrl;
 if (!q) return Response.json({ tracks: [], albums: [], artists: [], playlists: [] });
 
 const cacheKey = 'mc:search:' + (inst || 'pool') + ':' + q.toLowerCase() + ':' + limit;
-  // In-memory cache check (fast path — avoids Upstash round-trip)
-  const memCached = cGet(cacheKey);
-  if (memCached) return Response.json(memCached);
-  const cached = await upstashCmd('GET', cacheKey);
-if (cached) {
-try {
-const parsed = JSON.parse(cached);
-// Re-populate in-memory meta cache from cached search results
-if (parsed.tracks) parsed.tracks.forEach(t => { if (t && t.id && t.title && !TRACK_META_CACHE.has(String(t.id))) cacheTrackMeta(t.id, t.title, t.artist); });
-return Response.json(parsed);
-} catch(e) {}
-}
+// In-memory cache check (fast path — avoids Upstash round-trip)
+const memCached = cGet(cacheKey);
+if (memCached) return Response.json(memCached);
 
+// Kick off the fresh build IMMEDIATELY (before Redis is even read), then check
+// Redis for a cached copy. Cache hit = stale-while-revalidate: serve instantly,
+// let the build refresh the cache in the background.
+const buildPromise = buildSearchResult(q, limit, inst);
+const redisCached = await upstashCmd('GET', cacheKey)
+  .then(raw => { if (!raw) return null; try { const p = JSON.parse(raw); return p && p.tracks ? p : null; } catch(e) { return null; } })
+  .catch(() => null);
+if (redisCached) {
+  cSet(cacheKey, redisCached, 300);
+  if (redisCached.tracks) redisCached.tracks.forEach(t => { if (t && t.id && t.title && !TRACK_META_CACHE.has(String(t.id))) cacheTrackMeta(t.id, t.title, t.artist); });
+  // Fresh build keeps running in the background and re-caches when done
+  buildPromise.then(r => { if (r) { cSet(cacheKey, r, 300); upstashCmd('SET', cacheKey, JSON.stringify(r), 'EX', 1800); } }).catch(() => {});
+  return Response.json(redisCached);
+}
+let result = null;
 try {
-// TIDAL search first — the primary catalog. Qobuz search is a fallback used
-// ONLY when TIDAL returns nothing (track search + playlist search in parallel).
-// Streaming stays Qobuz-first: pre-warm + quality scoring pick Qobuz Hi-Res
-// whenever the track exists there.
-const [mainResult, alResult, arResult, plResult, qobuzPromise] = await Promise.allSettled([
-  hifiGetForToken(inst, '/search/', { s: q, limit, offset: 0 }),
-  hifiGetForToken(inst, '/search/', { al: q, limit: Math.min(limit, 20), offset: 0 }),
-  hifiGetForToken(inst, '/search/', { a: q, limit: Math.min(limit, 20), offset: 0 }),
-  hifiGetForTokenSafe(inst, '/search/', { p: q, limit: 20, offset: 0 }),
-  qobuzSearchDirect(q, limit + 10),
-]);
-const data  = mainResult.status === 'fulfilled' ? (mainResult.value || null) : null;
+  result = await buildPromise;
+} catch(e) {
+  result = null;
+}
+if (result) {
+  cSet(cacheKey, result, 300);
+  upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 1800).catch(() => {});
+  return Response.json(result);
+}
+return Response.json({ error: 'Search failed', tracks: [], albums: [], artists: [], playlists: [] }, { status: 502 });
+});
+
+// ─── Search pipeline: build a full search response ──────────────────────────────
+// All five upstream calls (TIDAL s=/al=/a=/p= + Qobuz) run in parallel and each
+// result is cached independently (memory + Redis, 10min), so repeat searches
+// assemble from sub-caches instead of the network. Auxiliary calls (albums,
+// artists, playlists, Qobuz) are time-boxed so a slow one can never stall the
+// response — the critical track search gets the full budget.
+async function buildSearchResult(q, limit, inst) {
+  const sKey = (type, n) => 'mc:subs:' + (inst || 'pool') + ':' + type + ':' + q.toLowerCase() + ':' + n;
+  const subFetch = async (key, fn, timeoutMs) => {
+    const mem = cGet(key);
+    if (mem) return mem;
+    const raw = await upstashCmd('GET', key);
+    if (raw) { try { const v = JSON.parse(raw); if (v) { cSet(key, v, 600); return v; } } catch(e) {} }
+    const val = await withTimeout(fn(), timeoutMs, null);
+    if (val) { cSet(key, val, 600); upstashCmd('SET', key, JSON.stringify(val), 'EX', 600).catch(() => {}); }
+    return val;
+  };
+
+  const [mainData, alData, arData, plData, qobuzItems] = await Promise.all([
+    subFetch(sKey('s', limit), () => hifiGetForToken(inst, '/search/', { s: q, limit, offset: 0 }), 8000),
+    subFetch(sKey('al', Math.min(limit, 20)), () => hifiGetForTokenSafe(inst, '/search/', { al: q, limit: Math.min(limit, 20), offset: 0 }), 2000),
+    subFetch(sKey('a', Math.min(limit, 20)), () => hifiGetForTokenSafe(inst, '/search/', { a: q, limit: Math.min(limit, 20), offset: 0 }), 2000),
+    subFetch(sKey('p', 20), () => hifiGetForTokenSafe(inst, '/search/', { p: q, limit: 20, offset: 0 }), 1500),
+    subFetch(sKey('q', limit + 10), () => qobuzSearchDirect(q, limit + 10), 1500),
+  ]);
+const data = mainData || null;
 // Items array (tracks) at data.data.items OR data.items
 const items = data?.data?.items || data?.items || [];
 
 // Qobuz search runs in parallel (no extra latency) — its tracks top up the
 // result list only when TIDAL comes up short, never as ISRC duplicates.
-let qobuzItems = (qobuzPromise.status === 'fulfilled' && Array.isArray(qobuzPromise.value)) ? qobuzPromise.value : [];
 
 const albumMap = {}, artistMap = {}, artistHits = {}, tracks = [];
 for (let i = 0; i < items.length; i++) {
@@ -1561,14 +1602,12 @@ const tFormat = (t.audioQuality === 'HIGH' || t.audioQuality === 'LOW') ? 'aac' 
 // ── Album + artist search results (al= / a=) merged into the same lists ──────
 // From TIDAL's dedicated album/artist search endpoints — not just the albums
 // and artists attached to matched tracks, so search surfaces full catalog rows.
-const alData = alResult.status === 'fulfilled' ? (alResult.value || null) : null;
 const alItems = alData?.data?.albums?.items || alData?.albums?.items || [];
 for (const a of alItems) {
   if (!a || !a.id) continue;
   const abid = String(a.id);
   if (!albumMap[abid]) albumMap[abid] = { id: abid, title: a.title || 'Unknown', artist: trackArtist(a), artworkURL: coverUrl(a.cover, 1080), trackCount: a.numberOfTracks, year: a.releaseDate ? String(a.releaseDate).slice(0, 4) : undefined };
 }
-const arData = arResult.status === 'fulfilled' ? (arResult.value || null) : null;
 const arItems = arData?.data?.artists?.items || arData?.artists?.items || [];
 for (const a of arItems) {
   if (!a || !a.id) continue;
@@ -1582,14 +1621,15 @@ for (const a of arItems) {
 // numeric IDs. /stream, /album, /artist routes detect the prefix and resolve
 // through the Qobuz direct API.
 const QO_PREFIX = 'qo:';
+const qobuzItemsArr = Array.isArray(qobuzItems) ? qobuzItems : [];
 let remainingSlots = Math.max(0, limit - tracks.length);
-if (qobuzItems.length > 0) {
+if (qobuzItemsArr.length > 0) {
   console.log('[search] TIDAL yielded', tracks.length, 'of', limit, '— Qobuz top-up can fill', remainingSlots, 'slot(s)');
 }
 // Best pressing first (quality score), then drop ISRC duplicates of TIDAL hits
 const tidalIsrcs = new Set(tracks.map(t => t.isrc ? String(t.isrc).toUpperCase().replace(/[^A-Z0-9]/g, '') : null).filter(Boolean));
 const seenQIsrc = new Set();
-const qobuzRanked = [...qobuzItems].sort((a, b) => qobuzTrackQualityScore(b) - qobuzTrackQualityScore(a));
+const qobuzRanked = [...qobuzItemsArr].sort((a, b) => qobuzTrackQualityScore(b) - qobuzTrackQualityScore(a));
 for (const qt of qobuzRanked) {
   if (remainingSlots <= 0) break;
   if (!qt || !qt.id) continue;
@@ -1644,7 +1684,6 @@ const artistList = Object.keys(artistMap)
 // The HiFi proxy calls TIDAL's top-hits?types=PLAYLISTS endpoint via GET /search/?p=query.
 // Response shape: { data: { playlists: { items: [...] } } }
 // Each playlist has: uuid, title, squareImage, image, creator, numberOfTracks
-const plData = plResult.status === 'fulfilled' ? (plResult.value || null) : null;
 const plFromSearch = plData?.data?.playlists?.items || plData?.data?.playlists
   || plData?.playlists?.items || plData?.playlists || plData?.data?.items || plData?.items || [];
 // Also check if the main search response has a playlists field (some instances embed them)
@@ -1688,13 +1727,8 @@ for (const t of tracks) {
 const dedupedTracks = [...seenTracks.values()];
 
 const result = { tracks: dedupedTracks, albums: Object.values(albumMap).slice(0, 8), artists: artistList, playlists: plItems };
-  cSet(cacheKey, result, 300); // also cache in-memory for instant repeat hits
-  upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 300);
-return Response.json(result);
-} catch(e) {
-return Response.json({ error: 'Search failed: ' + e.message, tracks: [], albums: [], artists: [], playlists: [] }, { status: 502 });
+return result;
 }
-});
 });
 
 // ─── Stream: Qobuz Hi-Res first, TIDAL fallback ────────────────────────────────
