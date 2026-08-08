@@ -19,11 +19,6 @@ const HIFI_INSTANCES = [
 let activeInstance = HIFI_INSTANCES[0];
 let instanceHealthy = false;
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36';
-const QOBUZ_INSTANCES = [
-'https://qobuz-api1.onrender.com',
-'https://qobuz-api.stremio123.duckdns.org',
-];
-let activeQobuzInstance = QOBUZ_INSTANCES[0];
 
 // ─── In-memory track meta cache (title+artist by TIDAL id) ───────────────────
 // Populated at search time, read at stream time. Survives within the same worker instance.
@@ -41,23 +36,6 @@ TRACK_META_CACHE.delete(firstKey);
 
 function getCachedMeta(id) {
 return TRACK_META_CACHE.get(String(id)) || null;
-}
-
-// Qobuz Track ID cache: TIDAL track id -> Qobuz track object
-// Populated at search pre-warm, read in stream route to skip qobuzFindBestTrack entirely.
-const QOBUZ_TRACK_ID_CACHE = new Map();
-function cacheQobuzTrackId(tidalId, qobuzTrack) {
-  if (!tidalId || !qobuzTrack || !qobuzTrack.id) return;
-  QOBUZ_TRACK_ID_CACHE.set(String(tidalId), qobuzTrack);
-  if (QOBUZ_TRACK_ID_CACHE.size > 5000) {
-    const firstKey = QOBUZ_TRACK_ID_CACHE.keys().next().value;
-    QOBUZ_TRACK_ID_CACHE.delete(firstKey);
-  }
-  // Also persist to Redis so other CF Worker isolates benefit from this pre-warm
-  redisSaveQobuzId(tidalId, qobuzTrack).catch(() => {});
-}
-function getCachedQobuzTrack(tidalId) {
-  return QOBUZ_TRACK_ID_CACHE.get(String(tidalId)) || null;
 }
 
 // ─── Unified in-memory TTL cache ─────────────────────────────────────────────
@@ -143,6 +121,16 @@ const modes = Array.isArray(t.audioModes) ? t.audioModes
   : (typeof t.audioMode === 'string' ? [t.audioMode] : []);
 const tags = (t.mediaMetadata && t.mediaMetadata.tags) || [];
 return modes.includes('DOLBY_ATMOS') || tags.includes('DOLBY_ATMOS');
+}
+
+// Hard wall-clock timeout that ALWAYS fires — unlike AbortSignal.timeout, it
+// also interrupts hangs at the DNS/TLS/connect phase on Workers.
+function withHardTimeout(promise, ms, label = '') {
+  let timer = null;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error((label ? label + ' ' : '') + 'timeout after ' + ms + 'ms')), ms);
+  });
+  return Promise.race([promise, guard]).finally(() => { if (timer) clearTimeout(timer); });
 }
 
 function decodeManifest(manifest) {
@@ -238,704 +226,6 @@ if (n.includes(q) || q.includes(n)) return 2;
 return 0;
 }
 
-// ─── Qobuz credential pool (QTE-style: internal rotation + cooldown) ──────────
-// The pool is synced from the QTE instance's admin store (KV-managed) — see
-// qteSyncCreds(). No credentials are hardcoded here; if QTE sync is
-// unavailable, QOBUZ_APP_ID / QOBUZ_USER_TOKEN / QOBUZ_SECRET env bindings are
-// used as a single-credential fallback.
-let QOBUZ_CREDS = [];
-const QTE_ADMIN_BASE = 'https://qobuz-tidal-eclipse.cyrusna29.workers.dev';
-const QTE_SYNC_INTERVAL_MS = 5 * 60 * 1000;
-const QOBUZ_CRED_COOLDOWN_MS = 10 * 60 * 1000;
-const QOBUZ_CRED_FAIL_THRESHOLD = 3;
-
-const _qCredHealth = new Map(); // id -> { failCount, cooldownUntil, lastFailReason }
-let _qteSyncedAt = 0;
-let _qteSyncPromise = null;
-let _qteFailedAt = 0;
-
-// Worker bindings (secrets/vars) arrive via the env parameter, not globals.
-let _workerEnv = null;
-function captureEnv(env) { if (env) _workerEnv = env; }
-
-function getEnv(name) {
-  if (typeof process !== 'undefined' && process.env && process.env[name]) return process.env[name];
-  if (_workerEnv && _workerEnv[name] !== undefined) return _workerEnv[name];
-  try { if (typeof globalThis !== 'undefined' && globalThis[name] !== undefined) return globalThis[name]; } catch(e) {}
-  return null;
-}
-
-function qobuzPickCred() {
-  const now = Date.now();
-  const pool = QOBUZ_CREDS.filter(c => c.active && c.lastTestOk !== false);
-  const healthy = pool.filter(c => {
-    const h = _qCredHealth.get(c.id);
-    return !h || !h.cooldownUntil || h.cooldownUntil <= now;
-  });
-  const source = healthy.length ? healthy : (pool.length ? pool : QOBUZ_CREDS.filter(c => c.active));
-  if (!source.length) return null;
-  // Random pick — a shared round-robin index is race-prone under concurrent
-  // calls (two callers can grab the same cred back-to-back and both burn their
-  // retries on it). Random gives every attempt an independent chance.
-  return source[Math.floor(Math.random() * source.length)];
-}
-
-function qobuzNoteFailure(cred, reason) {
-  if (!cred) return;
-  const now = Date.now();
-  const h = _qCredHealth.get(cred.id) || { failCount: 0 };
-  h.failCount = (h.failCount || 0) + 1;
-  h.lastFailAt = now;
-  h.lastFailReason = reason || 'unknown';
-  if (h.failCount >= QOBUZ_CRED_FAIL_THRESHOLD) {
-    h.cooldownUntil = now + QOBUZ_CRED_COOLDOWN_MS;
-    h.failCount = 0;
-    console.log('[qobuz] cred "' + cred.id + '" cooled down 10min after ' + reason);
-  }
-  _qCredHealth.set(cred.id, h);
-}
-
-function qobuzNoteSuccess(cred) {
-  if (!cred) return;
-  _qCredHealth.delete(cred.id);
-}
-
-function isQobuzAuthFailure(res) {
-  return res && (res.status === 401 || res.status === 403 || res.status === 429);
-}
-
-// Sync the credential pool from the QTE instance's admin store (KV-managed).
-// Keeps local health state; only trusts QTE's tested-OK actives. The admin key
-// comes from the QTE_ADMIN_KEY secret binding — never from source code.
-async function qteSyncCreds() {
-  const adminKey = getEnv('QTE_ADMIN_KEY');
-  if (!adminKey) {
-    console.log('[qobuz] QTE_ADMIN_KEY not set — QTE sync disabled');
-    return false;
-  }
-  try {
-    const r = await withHardTimeout(fetch(QTE_ADMIN_BASE + '/admin/creds?key=' + encodeURIComponent(adminKey), { headers: { 'User-Agent': UA, 'Accept': 'application/json' }, signal: AbortSignal.timeout(8000) }), 8000, 'QTE sync');
-    if (!r.ok) return false;
-    const remote = await r.json();
-    if (!Array.isArray(remote) || !remote.length) return false;
-    QOBUZ_CREDS = remote.map(rc => ({
-      id: rc.id,
-      label: rc.label || rc.id,
-      appId: rc.appId,
-      userToken: rc.userToken,
-      secret: rc.secret,
-      active: !!rc.active && rc.lastTestOk !== false,
-      lastTestOk: rc.lastTestOk === true,
-      source: 'qte',
-    }));
-    _qteSyncedAt = Date.now();
-    console.log('[qobuz] synced ' + remote.length + ' credential(s) from QTE admin');
-    return true;
-  } catch (e) {
-    console.log('[qobuz] QTE admin sync failed: ' + e.message);
-    return false;
-  }
-}
-
-// Fallback when QTE is unreachable: use QOBUZ_* env bindings (Cloudflare
-// secrets / Render / Vercel env vars) as a single credential.
-function qobuzEnvFallback() {
-  const appId = getEnv('QOBUZ_APP_ID');
-  const userToken = getEnv('QOBUZ_USER_TOKEN');
-  const secret = getEnv('QOBUZ_SECRET');
-  if (appId && userToken && secret) {
-    QOBUZ_CREDS = [{ id: 'env', label: 'env', appId, userToken, secret, active: true, lastTestOk: true, source: 'env' }];
-    console.log('[qobuz] QTE sync unavailable — using QOBUZ_* env fallback credentials');
-    return true;
-  }
-  return false;
-}
-
-// Hard wall-clock timeout that ALWAYS fires — unlike AbortSignal.timeout, it
-// also interrupts hangs at the DNS/TLS/connect phase on Workers.
-function withHardTimeout(promise, ms, label = '') {
-  let timer = null;
-  const guard = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error((label ? label + ' ' : '') + 'timeout after ' + ms + 'ms')), ms);
-  });
-  return Promise.race([promise, guard]).finally(() => { if (timer) clearTimeout(timer); });
-}
-
-// Returns a promise so the first Qobuz call can await the initial sync instead
-// of failing on an empty pool. Failed syncs get a 60s backoff to avoid a retry
-// storm when QTE is down. A watchdog guarantees the await can never hang a
-// request — if the sync is stuck, the request proceeds after 10s max.
-function qteEnsureSync() {
-  const poolUsable = QOBUZ_CREDS.some(c => c.active);
-  if (Date.now() - _qteSyncedAt < QTE_SYNC_INTERVAL_MS && poolUsable) return Promise.resolve();
-  if (_qteFailedAt && Date.now() - _qteFailedAt < 60000) return Promise.resolve();
-  if (!_qteSyncPromise) {
-    _qteSyncPromise = qteSyncCreds()
-      .then(ok => {
-        if (!ok) {
-          if (!qobuzEnvFallback()) _qteFailedAt = Date.now();
-        }
-      })
-      .catch(() => { _qteFailedAt = Date.now(); })
-      .finally(() => { _qteSyncPromise = null; });
-  }
-  return Promise.race([
-    _qteSyncPromise,
-    new Promise(res => setTimeout(() => {
-      console.log('[qobuz] sync watchdog fired — proceeding without waiting for QTE sync');
-      res();
-    }, 10000)),
-  ]);
-}
-
-// Low-level Qobuz API call (no signing needed) with credential rotation.
-async function qobuzApi(endpoint, params, opts = {}) {
-  await qteEnsureSync();
-  const timeout = opts.timeout || 8000;
-  const maxAttempts = Math.min(opts.maxAttempts || 2, 3);
-  let lastErr = null;
-  for (let attempt = 0; attempt < maxAttempts; attempt++) {
-    const cred = qobuzPickCred();
-    if (!cred) break;
-    const url = 'https://www.qobuz.com/api.json/0.2' + endpoint
-      + '?app_id=' + encodeURIComponent(cred.appId)
-      + '&user_auth_token=' + encodeURIComponent(cred.userToken);
-    const searchParams = new URLSearchParams();
-    if (params) for (const [k, v] of Object.entries(params)) searchParams.set(k, String(v));
-    try {
-      const res = await withHardTimeout(fetch(url + '&' + searchParams.toString(), { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(timeout) }), timeout, 'qobuzApi');
-      if (!res.ok) {
-        lastErr = new Error('Qobuz HTTP ' + res.status);
-        if (isQobuzAuthFailure(res)) { qobuzNoteFailure(cred, 'HTTP ' + res.status); continue; }
-        break;
-      }
-      const data = await res.json();
-      if (data && data.status === 'error' && data.code) {
-        lastErr = new Error(data.message || ('Qobuz ' + data.code));
-        qobuzNoteFailure(cred, lastErr.message);
-        continue;
-      }
-      qobuzNoteSuccess(cred);
-      return data;
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error('All Qobuz credentials failed for ' + endpoint);
-}
-
-// Signed track/getFileUrl with credential rotation on auth failure.
-async function qobuzGetFileUrl(trackId, formatId) {
-  await qteEnsureSync();
-  let lastErr = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
-    const cred = qobuzPickCred();
-    if (!cred) break;
-    const ts  = Math.floor(Date.now() / 1000);
-    const sig = md5('trackgetFileUrlformat_id' + formatId + 'intentstreamtrack_id' + trackId + ts + cred.secret);
-    const url = 'https://www.qobuz.com/api.json/0.2/track/getFileUrl'
-      + '?app_id='          + encodeURIComponent(cred.appId)
-      + '&user_auth_token=' + encodeURIComponent(cred.userToken)
-      + '&track_id='        + trackId
-      + '&format_id='       + formatId
-      + '&intent=stream'
-      + '&request_ts='      + ts
-      + '&request_sig='     + sig;
-    try {
-      const res = await withHardTimeout(fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(8000) }), 8000, 'getFileUrl');
-      if (!res.ok) {
-        lastErr = new Error('Qobuz getFileUrl HTTP ' + res.status);
-        if (isQobuzAuthFailure(res)) { qobuzNoteFailure(cred, 'HTTP ' + res.status); continue; }
-        break;
-      }
-      const data = await res.json();
-      if (!data || !data.url) {
-        // Qobuz returns HTTP 200 + restrictions (no url) when a credential is
-        // blocked for a specific track — that's per-credential, so rotate to the
-        // next one instead of giving up.
-        const restr = data && Array.isArray(data.restrictions) && data.restrictions.length
-          ? data.restrictions.map(r => r.code || r.message).join(',')
-          : '';
-        lastErr = new Error((data && data.message) || (restr ? 'Qobuz restricted: ' + restr : 'Qobuz getFileUrl missing url'));
-        if (data && data.status === 'error' && data.code) qobuzNoteFailure(cred, lastErr.message);
-        continue;
-      }
-      qobuzNoteSuccess(cred);
-      return data;
-    } catch (e) {
-      lastErr = e;
-    }
-  }
-  throw lastErr || new Error('All Qobuz credentials failed for getFileUrl ' + trackId);
-}
-
-// Format ID map — same as QTE
-const QOBUZ_FORMAT_MAP = {
-  'HIMAX':    27,  // 24-bit / up to 192kHz
-  'HI96':     7,   // 24-bit / up to 96kHz
-  'LOSSLESS': 6,   // 16-bit / 44.1kHz FLAC
-  'AAC320':   5,   // 320 kbps MP3
-  'HI_RES_LOSSLESS': 27,
-  'HIRESLOSSLESS':   27,
-};
-
-function md5(str) {
-  return crypto.createHash('md5').update(str).digest('hex');
-}
-
-// qobuzQualityLabel — mirrors QTE exactly
-function qobuzQualityLabel(formatId, data) {
-  const sr = data?.sampling_rate || 0;
-  const bd = data?.bit_depth      || 0;
-  // Use actual sample rate + bit depth from Qobuz API when available — this is what Eclipse displays
-  if (bd > 0 && sr > 0) {
-    const srLabel = sr >= 1000 ? (sr / 1000).toFixed(0) + ' kHz' : sr + ' kHz';
-    return bd + '-bit / ' + srLabel;
-  }
-  // Fallback to format tier labels when API doesn't return sr/bd
-  if (formatId === 27) return '24-bit / 192 kHz';
-  if (formatId === 7)  return '24-bit / 96 kHz';
-  if (formatId === 6)  return '16-bit / 44.1 kHz FLAC';
-  if (formatId === 5)  return '320 kbps AAC';
-  return 'unknown';
-}
-
-function qobuzTrackQualityScore(t) {
-  if (!t) return -1;
-  const bd = Number(t.bit_depth || 0);
-  const sr = Number(t.maximum_sampling_rate || t.sampling_rate || 0);
-  const hires = !!(t.hires || t.hires_streamable || bd > 16 || sr > 48);
-  const purchasable = t.streamable !== false && t.displayable !== false;
-  let score = 0;
-  if (purchasable) score += 1000;
-  if (hires) score += 500;
-  score += bd * 20;
-  score += sr;
-  if (t.version) score -= 10;
-  return score;
-}
-
-function qobuzPickBestEdition(items, wantTitle, wantArtist, wantIsrc) {
-  const norm = s => String(s || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
-  const titleNeedle = norm(removeFeat(wantTitle || ''));
-  const artistNeedle = norm(wantArtist || '');
-  const isrcNeedle = String(wantIsrc || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  let best = null, bestScore = -1e9;
-  for (const t of (items || [])) {
-    if (!t || !t.id) continue;
-    const tTitle = norm(removeFeat(t.title || ''));
-    const tArtist = norm(trackArtist(t));
-    const tIsrc = String(t.isrc || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-    let score = qobuzTrackQualityScore(t);
-    if (isrcNeedle && tIsrc === isrcNeedle) score += 5000; // ISRC confirms song identity; quality (base score) breaks ties among same-ISRC pressings
-    if (titleNeedle && tTitle === titleNeedle) score += 1000;
-    else if (titleNeedle && tTitle.includes(titleNeedle)) score += 400;
-    if (artistNeedle && tArtist.includes(artistNeedle)) score += 500;
-    if (titleNeedle && tTitle && !tTitle.includes(titleNeedle) && !titleNeedle.includes(tTitle)) score -= 1500;
-    if (artistNeedle && tArtist && !tArtist.includes(artistNeedle) && !artistNeedle.includes(tArtist)) score -= 500;
-    if (score > bestScore) { best = t; bestScore = score; }
-  }
-  return best;
-}
-
-// ─── Qobuz client — direct signed API call (replaces proxy racing) ────────────
-// Mirrors QTE's getTrackStreamUrl Qobuz path exactly:
-//   ts   = Math.floor(Date.now() / 1000)
-//   sig  = md5('trackgetFileUrlformat_id' + fmt + 'intentstreamtrack_id' + id + ts + secret)
-//   hits https://www.qobuz.com/api.json/0.2/track/getFileUrl directly
-// Stream URLs cached 28 min (Qobuz URLs expire ~30 min).
-// Falls back through format priority order if a tier returns an error.
-async function qobuzStream(trackId, prefKey) {
-  if (prefKey === 'AAC96') return null; // TIDAL-only tier
-
-  const cacheKey = 'qstream:' + trackId + ':' + (prefKey || 'auto');
-  const cached = cGet(cacheKey);
-  if (cached) return cached;
-
-  // Determine format priority order based on prefKey (same as old proxy version)
-  const PREF_FMT_ORDER = {
-    'HIMAX':    [27, 7, 6, 5],
-    'HI96':     [7, 27, 6, 5],
-    'LOSSLESS': [6, 7, 27, 5],
-    'AAC320':   [5],
-    'HI_RES_LOSSLESS': [27, 7, 6, 5],
-    'HIRESLOSSLESS':   [27, 7, 6, 5],
-  };
-  const fmtOrder = (prefKey && PREF_FMT_ORDER[prefKey]) || [27, 7, 6, 5];
-  const fmtLabel = { 27: 'flac', 7: 'flac', 6: 'flac', 5: 'aac' };
-
-  // Try each format in priority order — exactly like QTE's loop
-  for (const fmt of fmtOrder) {
-    try {
-      const data = await qobuzGetFileUrl(trackId, fmt);
-      if (!data || !data.url) continue;
-
-      const qobuzStreamQuality = fmt === 27 || fmt === 7 ? 'HI_RES_LOSSLESS' : fmt === 6 ? 'LOSSLESS' : 'HIGH';
-      const result = {
-        url:       data.url,
-        format:    fmtLabel[fmt] || 'flac',
-        quality:   'Qobuz · ' + qobuzQualityLabel(fmt, data),
-        streamQuality: '[Qobuz] ' + qobuzStreamQuality,
-        expiresAt: Math.floor(Date.now() / 1000) + 1680, // 28 min
-      };
-      cSet(cacheKey, result, 1680);
-      return result;
-    } catch (e) {
-      continue; // network error — try next format
-    }
-  }
-
-  return null; // all formats failed
-}
-
-// ─── Search scoring engine (ported from 8spine V2.0 Strict) ──────────────────
-// Scores each candidate track against the search query.
-// Returns { item, score } — caller picks item if score >= threshold.
-// Anti-cover/karaoke penalty (-500) prevents junk results swamping real tracks.
-// Title guillotine (-100) kills results with zero query-word overlap.
-function normalizeStr(s) {
-  return String(s || '').toLowerCase()
-    .replace(/[''`´]/g, "'").replace(/[""«»]/g, '"')
-    .replace(/\s+/g, ' ').trim();
-}
-
-function removeFeat(s) {
-  if (!s) return '';
-  const m = String(s).search(/\s+[\(\[](feat|ft|with|vs)[\.\s]/i);
-  return (m > 0 ? s.substring(0, m) : s).trim();
-}
-
-function scoringFindBest(items, query, knownArtist) {
-  let bestItem  = null;
-  let bestScore = -1;
-
-  const qNorm      = normalizeStr(query);
-  const hasHyphen  = / - /.test(qNorm); // only space-hyphen-space, not word-internal hyphens
-  const qWords     = qNorm.replace(/[^a-z0-9\s]/gi, ' ').split(/\s+/).filter(w => w.length > 1);
-  const knownArtistNorm = knownArtist ? normalizeStr(knownArtist) : null;
-
-  // For non-hyphen queries, try to isolate the title portion
-  // by removing known-artist words from the query word list
-  const knownArtistWords = knownArtistNorm
-    ? knownArtistNorm.replace(/[^a-z0-9\s]/gi, ' ').split(/\s+/).filter(w => w.length > 1)
-    : [];
-  const titleOnlyWords = knownArtistWords.length
-    ? qWords.filter(w => !knownArtistWords.includes(w))
-    : qWords;
-
-  let qLeft = qNorm, qRight = '';
-  if (hasHyphen) {
-    const parts = qNorm.split(' - ').map(p => p.trim());
-    qLeft = parts[0]; qRight = parts[1] || '';
-  }
-
-  for (let i = 0; i < Math.min(items.length, 50); i++) {
-    const t       = items[i];
-    const tTitle  = normalizeStr(removeFeat(t.title || ''));
-    const tArtist = normalizeStr(
-      t.performer?.name || t.artist?.name || t.artists?.[0]?.name ||
-      (t.artists && t.artists.length ? t.artists[0].name : '') || ''
-    );
-    let score = 0;
-
-    const targetStr  = (tTitle + ' ' + tArtist).replace(/[^a-z0-9\s]/gi, ' ');
-    const matchCount = qWords.filter(w => targetStr.includes(w)).length;
-    score += matchCount * 10;
-
-    let titleMatch = false, artistMatch = false;
-
-    if (hasHyphen) {
-      if (qLeft.length  && (tTitle  === qLeft  || tTitle.includes(qLeft)   || qLeft.includes(tTitle)))   titleMatch  = true;
-      if (qRight.length && (tTitle  === qRight || tTitle.includes(qRight)  || qRight.includes(tTitle)))  titleMatch  = true;
-      if (qLeft.length  && (tArtist === qLeft  || tArtist.includes(qLeft)  || qLeft.includes(tArtist)))  artistMatch = true;
-      if (qRight.length && (tArtist === qRight || tArtist.includes(qRight) || qRight.includes(tArtist))) artistMatch = true;
-    } else {
-      // titleMatch: only award if the track title contains words that are TITLE-EXCLUSIVE
-      // (i.e. words that are NOT part of the known artist name).
-      // This prevents "Dead Butterflies" by Architects from getting titleMatch
-      // when query is "dead butterflies embers" and we know artist is "Dead Butterflies".
-      const titleHitsTitleOnly = titleOnlyWords.filter(w => tTitle.includes(w)).length;
-      const titleHitsAll       = qWords.filter(w => tTitle.includes(w)).length;
-      if (titleOnlyWords.length > 0) {
-        // We have title-exclusive words — require at least one to be in tTitle
-        if (titleHitsTitleOnly > 0 && (qNorm === tTitle || qNorm.includes(tTitle) || tTitle.includes(qNorm))) titleMatch = true;
-        if (tTitle === qNorm) titleMatch = true;
-      } else {
-        // No title-only words (all query words are artist words) — use loose match
-        if (tTitle.length && (qNorm === tTitle || qNorm.includes(tTitle) || tTitle.includes(qNorm))) titleMatch = true;
-      }
-      if (tArtist.length && (qNorm === tArtist || qNorm.includes(tArtist) || tArtist.includes(qNorm))) artistMatch = true;
-    }
-
-    if (titleMatch)  score += 40;
-    if (artistMatch) score += 40;
-    if (titleMatch && artistMatch) score += 100;
-
-    // Exact title bonus
-    if (!hasHyphen && (tTitle === qNorm || (titleOnlyWords.length && titleOnlyWords.every(w => tTitle.includes(w)) && tTitle.split(' ').length <= titleOnlyWords.length + 1))) score += 60;
-    if (hasHyphen && (tTitle === qLeft || tTitle === qRight)) score += 60;
-
-    // Title guillotine — kills results with no query word in the title
-    const titleWordsMatch = qWords.filter(w => tTitle.includes(w)).length;
-    if (titleWordsMatch === 0 && tTitle !== qNorm) {
-      if (qNorm !== tArtist && !tArtist.includes(qNorm)) score -= 100;
-    }
-
-    // KEY: if we know the artist and this track's artist doesn't match → penalize heavily
-    if (knownArtistNorm && tArtist && !tArtist.includes(knownArtistNorm) && !knownArtistNorm.includes(tArtist)) {
-      score -= 150;
-    }
-
-    // Anti-cover/karaoke spam
-    if (!/\b(cover|karaoke|tribute|instrumental|8-bit)\b/i.test(qNorm) &&
-         /\b(cover|karaoke|tribute|instrumental|8-bit)\b/i.test(t.title || '')) {
-      score -= 500;
-    }
-
-    if (score > bestScore) { bestScore = score; bestItem = t; }
-  }
-  return { item: bestItem, score: bestScore };
-}
-
-// ─── ISRC resolution: TIDAL + Deezer in parallel ─────────────────────────────
-// Replaces the old single-source qobuzFindByIsrc sequential loop.
-// Both engines run simultaneously — whichever scores higher wins.
-// ISRC confirmed match cached 24h; miss cached 30 min.
-const DEEZER_API = 'https://api.deezer.com';
-const ISRC_MIN_SCORE = 100; // minimum scoring engine threshold for a valid match
-
-async function getIsrcFromTidal(query, instanceUrl, knownArtist) {
-  try {
-    const data = await hifiGetForTokenSafe(instanceUrl, '/search/', { s: query, limit: 20 });
-    let items = data?.tracks?.items || data?.items || data?.data?.items ||
-                data?.data?.tracks?.items || (Array.isArray(data) ? data : []);
-    if (!items.length) return null;
-    const match = scoringFindBest(items, query, knownArtist);
-    if (!match.item || match.score < ISRC_MIN_SCORE) return null;
-    const track = match.item;
-    let isrc = track.isrc;
-    if (!isrc) {
-      const info = await hifiGetForTokenSafe(instanceUrl, '/info/', { id: track.id });
-      isrc = info?.isrc || info?.data?.isrc || null;
-    }
-    console.log('[isrc] TIDAL hit score=' + match.score + ' isrc=' + isrc + ' for: ' + query);
-    return { isrc, track, source: 'tidal', score: match.score };
-  } catch(e) { return null; }
-}
-
-async function getIsrcFromDeezer(query, knownArtist) {
-  try {
-    const r = await axios.get(DEEZER_API + '/search/track', {
-      params: { q: query },
-      headers: { 'User-Agent': UA },
-      timeout: 8000
-    });
-    const items = r.data?.data || [];
-    if (!items.length) return null;
-    const match = scoringFindBest(items, query, knownArtist);
-    if (!match.item || match.score < ISRC_MIN_SCORE) return null;
-    const track = match.item;
-    let isrc = track.isrc;
-    if (!isrc) {
-      try {
-        const r2 = await axios.get(DEEZER_API + '/track/' + track.id, {
-          headers: { 'User-Agent': UA }, timeout: 5000
-        });
-        isrc = r2.data?.isrc || null;
-      } catch(e) {}
-    }
-    console.log('[isrc] Deezer hit score=' + match.score + ' isrc=' + isrc + ' for: ' + query);
-    return { isrc, track, source: 'deezer', score: match.score };
-  } catch(e) { return null; }
-}
-
-// resolveIsrc: race TIDAL and Deezer in parallel, pick the higher-scoring winner.
-// Returns { isrc, track, source, score } or null.
-async function resolveIsrc(title, artist, instanceUrl) {
-  const query = (artist ? artist + ' ' : '') + removeFeat(title || '');
-  const cacheKey = 'isrc2:' + query.toLowerCase();
-  const cached = cGet(cacheKey);
-  if (cached === 'MISS') return null;
-  if (cached) return cached;
-
-  const [tidalResult, deezerResult] = await Promise.all([
-    getIsrcFromTidal(query, instanceUrl, artist),
-    getIsrcFromDeezer(query, artist)
-  ]);
-
-  let winner = null;
-  if (tidalResult && deezerResult) {
-    winner = tidalResult.score >= deezerResult.score ? tidalResult : deezerResult;
-    console.log('[isrc] Winner: ' + winner.source.toUpperCase() +
-      ' (' + winner.score + ' vs ' + (winner === tidalResult ? deezerResult.score : tidalResult.score) + ')');
-  } else {
-    winner = tidalResult || deezerResult;
-  }
-
-  if (winner) {
-    // Sanity: winner track title must share at least one word with the searched title
-    // prevents "Dead Butterflies" (artist) matching the song "Dead Butterflies" by another artist
-    const _norm = s => String(s||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').trim();
-    const _qWords = _norm(removeFeat(title||'')).split(/\s+/).filter(w => w.length > 1);
-    const _wTitle = _norm(winner.track?.title || winner.track?.name || '');
-    const _overlap = _qWords.filter(w => _wTitle.includes(w)).length;
-    if (_qWords.length > 0 && _overlap === 0) {
-      console.log('[isrc] title mismatch rejected: query="' + title + '" winner="' + (winner.track?.title||'?') + '" — caching MISS');
-      cSet(cacheKey, 'MISS', 1800);
-      return null;
-    }
-    cSet(cacheKey, winner, 86400); // cache 24h
-    return winner;
-  }
-  cSet(cacheKey, 'MISS', 1800); // miss cached 30 min
-  return null;
-}
-
-// qobuzFindByIsrc: looks up a Qobuz track by confirmed ISRC via direct Qobuz API.
-// Uses /track/search?query=ISRC — no proxy hop, no sequential fallback.
-// Hit cached 24h, miss cached 30 min.
-async function qobuzFindByIsrc(isrc, wantTitle = null, wantArtist = null) {
-  if (!isrc) return null;
-  const normIsrc = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  const wantIsrc = normIsrc(isrc);
-  if (!wantIsrc) return null;
-
-  const cacheKey = 'qisrc:' + wantIsrc;
-  const cached = cGet(cacheKey);
-  if (cached === 'MISS') return null;
-  if (cached) return cached;
-
-  try {
-    const data = await qobuzApi('/track/search', { query: wantIsrc, limit: 50 }); // increased to catch Hi-Res editions further down the result list
-    if (data) {
-      const items = (data?.tracks?.items || []).filter(t => t && t.isrc && normIsrc(t.isrc) === wantIsrc);
-      const match = qobuzPickBestEdition(items, wantTitle, wantArtist, wantIsrc);
-      if (match && match.id) {
-        cSet(cacheKey, match, 1800); // 30min — short TTL so Hi-Res editions aren't locked out by cached SD pressings
-        console.log('[qobuz] isrc HIT', isrc, '->', match.id, match.title, '|', 'bd=' + (match.bit_depth || '?'), 'sr=' + (match.maximum_sampling_rate || match.sampling_rate || '?'));
-        return match;
-      }
-    }
-  } catch(e) {}
-
-  cSet(cacheKey, 'MISS', 1800);
-  return null;
-}
-
-
-// qobuzFindBestTrack: upgraded 4-tier lookup.
-// Tier 1: resolve ISRC via parallel TIDAL+Deezer engines → Qobuz ISRC lookup (exact match).
-// Tier 2: Qobuz title+artist search using scoring engine (was simple includes check).
-// Tier 3: Qobuz raw text search (last resort fallback).
-// All tiers cached to avoid redundant outbound calls.
-async function qobuzFindBestTrack(title, artist, isrc, instanceUrl) {
-  let isrcCandidate = null;
-  let titleCandidate = null;
-
-  if (isrc) {
-    isrcCandidate = await qobuzFindByIsrc(isrc, title, artist);
-    if (!isrcCandidate) console.log('[qobuz] bare ISRC miss for', isrc, '— trying parallel resolution');
-  }
-
-  if (!isrcCandidate && title) {
-    const resolved = await resolveIsrc(title, artist, instanceUrl);
-    if (resolved && resolved.isrc) {
-      isrcCandidate = await qobuzFindByIsrc(resolved.isrc, title, artist);
-      if (!isrcCandidate) console.log('[qobuz] resolved ISRC', resolved.isrc, 'not in Qobuz vault — falling to title search');
-    }
-  }
-
-  if (title) {
-    const cacheKey = 'qmatch2:' + (title || '').toLowerCase() + ':' + (artist || '').toLowerCase();
-    const cached = cGet(cacheKey);
-    if (cached !== 'MISS' && cached) titleCandidate = cached;
-    else {
-      const q = (artist ? artist + ' ' : '') + removeFeat(title);
-      for (const inst of QOBUZ_INSTANCES) {
-        try {
-          const r = await axios.get(inst + '/search/', {
-            params: { q, limit: 30 },
-            headers: { 'User-Agent': UA },
-            timeout: 10000
-          });
-          const items = r.data?.tracks?.items || [];
-          if (!items.length) continue;
-          const match = scoringFindBest(items, (artist ? artist + ' ' : '') + title, artist);
-          if (match.item && match.score >= 40) {
-            if (inst !== activeQobuzInstance) activeQobuzInstance = inst;
-            cSet(cacheKey, match.item, 3600);
-            console.log('[qobuz] title search HIT score=' + match.score, match.item.title);
-            titleCandidate = match.item;
-            break;
-          }
-        } catch(e) { continue; }
-      }
-      if (!titleCandidate) cSet(cacheKey, 'MISS', 1800);
-    }
-  }
-
-  if (isrcCandidate && titleCandidate) {
-    const isrcScore = qobuzTrackQualityScore(isrcCandidate);
-    const titleScore = qobuzTrackQualityScore(titleCandidate);
-    // Check if titleCandidate is plausibly the same song (title+artist match)
-    const normStr = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-    const isrcTitle  = normStr(removeFeat(isrcCandidate.title || ''));
-    const titleTitle = normStr(removeFeat(titleCandidate.title || ''));
-    const isrcArtist  = normStr(trackArtist(isrcCandidate));
-    const titleArtist = normStr(trackArtist(titleCandidate));
-    const sameTitle  = isrcTitle === titleTitle || isrcTitle.includes(titleTitle) || titleTitle.includes(isrcTitle);
-    const sameArtist = isrcArtist === titleArtist || isrcArtist.includes(titleArtist) || titleArtist.includes(isrcArtist);
-    const sameSong   = sameTitle && sameArtist;
-
-    if (sameSong && titleScore > isrcScore) {
-      // Title search found a higher-quality pressing of the same song — use it (e.g. Hi-Res vs CD)
-      console.log('[qobuz] title candidate is higher quality pressing of same song — upgrading', 'isrc=' + isrcScore, 'title=' + titleScore, 'isrcId=' + isrcCandidate.id, 'titleId=' + titleCandidate.id);
-      return titleCandidate;
-    }
-    if (!sameSong) {
-      // Different song entirely — ISRC match is authoritative, ignore title candidate
-      console.log('[qobuz] ISRC match wins (different song detected)', 'isrc=' + isrcScore, 'title=' + titleScore);
-    }
-    return isrcCandidate;
-  }
-
-  return isrcCandidate || titleCandidate || null;
-}
-
-// ─── Qobuz direct search — used alongside TIDAL search, results get merged ──
-async function qobuzSearchDirect(query, limit) {
-  try {
-    const data = await qobuzApi('/track/search', { query, limit: (limit || 20) });
-    return (data?.tracks?.items || []).filter(t => t && t.id);
-  } catch(e) {
-    return null;
-  }
-}
-
-function qobuzCoverUrl(album) {
-  if (!album?.image) return undefined;
-  return album.image.large || album.image.small || album.image.thumbnail || undefined;
-}
-
-// ─── Unified stream quality scoring (Qobuz vs TIDAL comparison) ──────────────
-// Higher score = better audio. Compares tier first, then bit depth + sample rate.
-function streamQualityScore(s) {
-  if (!s) return -1;
-  const q  = (s.quality || '').toLowerCase();
-  const sq = (s.streamQuality || '').toLowerCase();
-  let score = sq.includes('hi_res') ? 400
-    : sq.includes('lossless') ? 300
-    : sq.includes('high') ? 200
-    : sq.includes('low') ? 100
-    : 0;
-  const bd = q.match(/(\d+)-bit/);
-  const sr = q.match(/(\d+)\s*khz/);
-  if (bd) score += parseInt(bd[1], 10) * 10;
-  if (sr) score += Math.min(parseInt(sr[1], 10), 192);
-  return score;
-}
-
-// Combined search quality rank — used to dedupe same song across TIDAL + Qobuz
 const MERGED_QUALITY_RANK = { HIRES_LOSSLESS: 4, HI_RES_LOSSLESS: 4, LOSSLESS: 3, HIGH: 2, LOW: 1 };
 
 
@@ -1019,35 +309,6 @@ async function redisLoadTrackMeta(tid) {
 const raw = await upstashCmd('GET', 'mc:tmeta:' + tid);
 if (!raw) return null;
 try { return JSON.parse(raw); } catch(e) { return null; }
-}
-
-// Persist Qobuz track ID mapping (TIDAL id -> Qobuz track obj) to Redis
-// Survives across CF Worker isolates — fixes cross-isolate cache miss problem
-async function redisSaveQobuzId(tidalId, qobuzTrack) {
-  if (!tidalId || !qobuzTrack || !qobuzTrack.id) return;
-  await upstashCmd('SET', 'mc:qid:' + tidalId,
-    JSON.stringify({ id: qobuzTrack.id, title: qobuzTrack.title, isrc: qobuzTrack.isrc || null, bitdepth: qobuzTrack.bitdepth, maximumsamplingrate: qobuzTrack.maximumsamplingrate, samplingrate: qobuzTrack.samplingrate, hires: qobuzTrack.hires, hires_streamable: qobuzTrack.hires_streamable, streamable: qobuzTrack.streamable, displayable: qobuzTrack.displayable }),
-    'EX', 86400);
-}
-
-async function redisLoadQobuzId(tidalId) {
-  const raw = await upstashCmd('GET', 'mc:qid:' + tidalId);
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch(e) { return null; }
-}
-
-// Persist pre-warmed Qobuz stream URL to Redis so any isolate can serve it instantly
-async function redisSaveQobuzStream(tidalId, prefKey, streamResult) {
-  if (!tidalId || !streamResult) return;
-  const k = 'mc:qstream:' + tidalId + ':' + (prefKey || 'auto');
-  await upstashCmd('SET', k, JSON.stringify(streamResult), 'EX', 1680); // 28min = Qobuz URL lifetime
-}
-
-async function redisLoadQobuzStream(tidalId, prefKey) {
-  const k = 'mc:qstream:' + tidalId + ':' + (prefKey || 'auto');
-  const raw = await upstashCmd('GET', k);
-  if (!raw) return null;
-  try { return JSON.parse(raw); } catch(e) { return null; }
 }
 
 async function redisSave(token, entry) {
@@ -1258,7 +519,7 @@ function buildConfigPage(baseUrl) {
 var h = '';
 h += '<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8">';
 h += '<meta name="viewport" content="width=device-width,initial-scale=1">';
-h += '<title>Claudo - TIDAL + Qobuz</title>';
+h += '<title>Claudo - TIDAL</title>';
 h += '<style>';
 h += '*{box-sizing:border-box;margin:0;padding:0}';
 h += 'body{background:#080808;color:#e0e0e0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;display:flex;flex-direction:column;align-items:center;padding:48px 20px 64px}';
@@ -1291,11 +552,9 @@ h += '.ql-group-label{font-size:10px;color:#555;text-transform:uppercase;letter-
 h += '.ql-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:4px}';
 h += '.ql-btn{flex:1;min-width:calc(50% - 4px);cursor:pointer;border:1px solid #2a2a2a;border-radius:12px;background:#0a0a0a;color:#555;font-size:12px;font-weight:700;padding:12px 8px;text-align:center;transition:all .15s;letter-spacing:.04em;line-height:1.4}';
 h += '.ql-btn:hover{border-color:#444;color:#aaa}';
-h += '.ql-btn.sel-q{background:#0d1520;border-color:#4a9eff;color:#4a9eff}';  // Qobuz selected
 h += '.ql-btn.sel-t{background:#120d20;border-color:#9b4aff;color:#9b4aff}';  // TIDAL selected
 h += '.ql-sub{font-size:10px;font-weight:400;opacity:.6;display:block;margin-top:2px}';
 h += '.qual-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:20px;font-size:12px;font-weight:600;margin-bottom:10px}';
-h += '.qual-badge.qobuz{background:#0d1520;color:#4a9eff;border:1px solid #1a3050}';
 h += '.qual-badge.tidal{background:#120d20;color:#9b4aff;border:1px solid #1a2a40}';
 h += '.qual-badge.none{background:#111;color:#555;border:1px solid #1e1e1e}';
 // Instance health
@@ -1311,18 +570,18 @@ h += '<svg width="52" height="52" viewBox="0 0 52 52" fill="none" style="margin-
 
 h += '<div class="card">';
 h += '<h1>Claudo for Eclipse</h1>';
-h += '<p class="sub">Full TIDAL catalog &mdash; FLAC Hi-Res 24-bit, FLAC 16-bit, AAC fallback &mdash; no account needed. Qobuz Hi-Res &rarr; TIDAL FLAC &rarr; fallback.</p>';
+h += '<p class="sub">Full TIDAL catalog &mdash; FLAC Hi-Res 24-bit up to 192kHz DASH, FLAC 16-bit, AAC fallback &mdash; no account needed.</p>';
 h += '<div class="tip"><b>Save your URL.</b> Paste it below to refresh without reinstalling.</div>';
-h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC Hi-Res 24-bit</span><span class="pill hi">FLAC 16-bit</span><span class="pill hi">Qobuz Hi-Res</span></div>';
+h += '<div class="pills"><span class="pill">Tracks &middot; Albums &middot; Artists</span><span class="pill hi">FLAC Hi-Res 24-bit</span><span class="pill hi">FLAC 16-bit</span><span class="pill hi">Dolby Atmos</span></div>';
 
 h += '<div class="lbl">Custom Hi&#8209;Fi Instance <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 h += '<input type="text" id="customInstance" placeholder="https://your-instance.example.com">';
 h += '<div class="hint">Leave blank to use the shared pool. Paste your own self-hosted Hi-Fi API URL to lock this token exclusively to your instance.</div>';
 
-// Quality selector — split into Qobuz group + TIDAL group, single selection across both
+// Quality selector — TIDAL tiers, single selection
 h += '<div class="lbl">Preferred Audio Quality <span style="color:#2a2a2a;font-weight:400;text-transform:none">(optional)</span></div>';
 
-h += '<div class="ql-group-label">&#9675; Qobuz</div>';
+h += '<div class="ql-group-label">&#9679; TIDAL</div>';
 h += '<div class="ql-row">';
 h += '<div class="ql-btn" id="ql-HIMAX"    onclick="selectQ(\'HIMAX\',\'q\')">Hi-Res 192<span class="ql-sub">24-bit / up to 192kHz</span></div>';
 h += '<div class="ql-btn" id="ql-HI96"     onclick="selectQ(\'HI96\',\'q\')">Hi-Res 96<span class="ql-sub">24-bit / up to 96kHz</span></div>';
@@ -1359,9 +618,9 @@ h += '<div class="steps">';
 h += '<div class="step"><div class="sn">1</div><div class="st">Select a quality tier above, then click <b>Generate</b></div></div>';
 h += '<div class="step"><div class="sn">2</div><div class="st">Open <b>Eclipse</b> &rarr; Settings &rarr; Connections &rarr; Add Connection &rarr; Addon</div></div>';
 h += '<div class="step"><div class="sn">3</div><div class="st">Paste your URL and tap <b>Install</b></div></div>';
-h += '<div class="step"><div class="sn">4</div><div class="st">Search TIDAL\'s full catalog &mdash; Qobuz Hi-Res played first automatically</div></div>';
+h += '<div class="step"><div class="sn">4</div><div class="st">Search TIDAL\'s full catalog &mdash; Hi-Res FLAC DASH streams play first automatically</div></div>';
 h += '</div>';
-h += '<div class="warn">Stream priority: <b>Hi-Res 192kHz</b> &rarr; Hi-Res 96kHz &rarr; CD Quality FLAC &rarr; AAC 320. AAC 320 plays when FLAC is unavailable on Qobuz, with TIDAL as fallback for all tiers.</div>';
+h += '<div class="warn">Stream priority: <b>Hi-Res FLAC 24-bit</b> (DASH, up to 192kHz) &rarr; CD Quality FLAC 16-bit &rarr; AAC 320. Dolby Atmos tracks stream Atmos-only when available.</div>';
 h += '</div>';
 
 
@@ -1384,7 +643,7 @@ h += '<p class="sub" style="margin-bottom:14px">Tests if each audio quality tier
 h += '<div class="inst-list" id="qtList"><div style="color:#333;font-size:13px">Checking tiers...</div></div>';
 h += '</div>';
 
-h += '<footer>Claudo Eclipse Addon &bull; TIDAL search &bull; Qobuz Hi-Res streams</footer>';
+h += '<footer>Claudo Eclipse Addon &bull; TIDAL search &bull; Hi-Res FLAC DASH streams</footer>';
 
 // JS
 h += '<script>';
@@ -1405,12 +664,12 @@ h += '  if(selQ===q){selQ=null;selGroup=null;}else{selQ=q;selGroup=grp;}';
 h += '  ALLKEYS.forEach(function(k){';
 h += '    var el=document.getElementById("ql-"+k);';
 h += '    if(!el)return;';
-h += '    el.classList.remove("sel-q","sel-t");';
-h += '    if(selQ===k)el.classList.add(selGroup==="q"?"sel-q":"sel-t");';
+h += '    el.classList.remove("sel-t");';
+h += '    if(selQ===k)el.classList.add("sel-t");';
 h += '  });';
 h += '  var hint=document.getElementById("qlHint");';
 h += '  if(selQ){';
-h += '    hint.textContent="Selected: "+QLABELS[selQ]+" \u2014 Qobuz first, TIDAL fallback.";';
+h += '    hint.textContent="Selected: "+QLABELS[selQ]+" \u2014 Hi-Res FLAC DASH first.";';
 h += '  }else{';
 h += '    hint.textContent="No preference \u2014 auto-selects best quality: Hi-Res \u2192 CD Quality \u2192 AAC 320.";';
 h += '  }';
@@ -1421,7 +680,7 @@ h += 'function updateBadge(){';
 h += '  var b=document.getElementById("genQualBadge");';
 h += '  if(!b)return;';
 h += '  if(!selQ){b.className="qual-badge none";b.textContent="No quality preference";return;}';
-h += '  b.className="qual-badge qobuz";b.innerHTML="&#9675; Qobuz \u00b7 "+QLABELS[selQ];';
+h += '  b.className="qual-badge tidal";b.innerHTML="&#9679; TIDAL \u00b7 "+QLABELS[selQ];';
 h += '}';
 
 h += 'function generate(){';
@@ -1483,7 +742,7 @@ h += 'if(t.ok){var ms=document.createElement("span");ms.className="inst-ms";ms.t
 h += 'list.appendChild(row);';
 h += '});';
 h += 'var s=d.summary||{};var sum=document.createElement("div");sum.style.cssText="margin-top:10px;font-size:12px;color:#555";';
-h += 'sum.textContent="Qobuz: "+s.qobuz+" | TIDAL: "+s.tidal;';
+h += 'sum.textContent="TIDAL: "+s.tidal;';
 h += 'list.appendChild(sum);';
 h += '}).catch(function(e){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Test failed: \'+e.message+\'</div>\';});';
 h += '}';
@@ -1574,69 +833,50 @@ app.get('/instances', async c => {
   return Response.json({ instances: results });
 });
 
-app.get('/qobuz-ping', async c => {
-  try {
-    await qobuzGetFileUrl(236929828, 6);
-    return Response.json({ ok: true, status: 200 });
-  } catch(e) {
-    return Response.json({ ok: false, error: e.message });
-  }
-});
-
 app.get('/quality-test', async c => {
-  // Track ids are engine-specific: Qobuz ids resolve on Qobuz, TIDAL ids on the
-  // hifi-api instances. 1781887 = Billie Jean (verified FLAC 24-bit at
-  // HI_RES_LOSSLESS on all instances). 236929828 = What Makes You Beautiful
-  // (24-bit, verified streamable on every Qobuz pool credential).
-  const QOBUZ_TEST_TRACK_ID = '236929828';
+  // 1781887 = Billie Jean (verified FLAC 24-bit at HI_RES_LOSSLESS on all instances).
+  // The dash tier exercises the full /dash/{id} DASH pipeline (FLAC_HIRES first).
   const TIDAL_TEST_TRACK_ID = '1781887';
   const TIERS = [
-    { id: 'qobuz_himax',    label: 'Qobuz Hi-Res 192',    type: 'qobuz', format: 27 },
-    { id: 'qobuz_hi96',     label: 'Qobuz Hi-Res 96',     type: 'qobuz', format: 7 },
-    { id: 'qobuz_lossless', label: 'Qobuz CD FLAC',        type: 'qobuz', format: 6 },
-    { id: 'qobuz_aac320',   label: 'Qobuz AAC 320',        type: 'qobuz', format: 5 },
-    { id: 'tidal_hires',    label: 'TIDAL Hi-Res FLAC',    type: 'tidal', quality: 'HI_RES_LOSSLESS' },
-    { id: 'tidal_lossless', label: 'TIDAL FLAC 16-bit',    type: 'tidal', quality: 'LOSSLESS' },
-    { id: 'tidal_aac320',   label: 'TIDAL AAC 320',        type: 'tidal', quality: 'HIGH' },
-    { id: 'tidal_aac96',    label: 'TIDAL AAC 96',         type: 'tidal', quality: 'LOW' },
+    { id: 'dash_hires',     label: 'DASH Hi-Res FLAC',          type: 'dash' },
+    { id: 'tidal_hires',    label: 'TIDAL Hi-Res FLAC',          type: 'tidal', quality: 'HI_RES_LOSSLESS' },
+    { id: 'tidal_lossless', label: 'TIDAL FLAC 16-bit',          type: 'tidal', quality: 'LOSSLESS' },
+    { id: 'tidal_aac320',   label: 'TIDAL AAC 320',              type: 'tidal', quality: 'HIGH' },
+    { id: 'tidal_aac96',    label: 'TIDAL AAC 96',               type: 'tidal', quality: 'LOW' },
   ];
   const results = await Promise.all(TIERS.map(async tier => {
     const attempt = async () => {
       const start = Date.now();
       try {
-        if (tier.type === 'qobuz') {
-          try {
-            const d = await qobuzGetFileUrl(Number(QOBUZ_TEST_TRACK_ID), tier.format);
-            return { id: tier.id, label: tier.label, ok: true, ms: Date.now() - start, samplingRate: d?.sampling_rate || null, bitDepth: d?.bit_depth || null };
-          } catch(e) {
-            return { id: tier.id, label: tier.label, ok: false, ms: Date.now() - start, error: e.message };
-          }
-        } else {
-          // Mirror the real stream path (getTidalStream): hls manifest for lossless tiers.
-          const params = { id: TIDAL_TEST_TRACK_ID, quality: tier.quality };
-          if (tier.quality === 'HI_RES_LOSSLESS' || tier.quality === 'LOSSLESS') params.manifest = 'hls';
-          const data = await hifiGet('/track/', params);
-          const payload = data && data.data ? data.data : data;
-          // Green = a stream URL is actually obtainable (instances may downgrade
-          // a requested tier — e.g. LOSSLESS -> HIGH AAC — the delivered codec is
-          // reported so the downgrade stays visible).
-          let dec = null;
-          if (payload && payload.manifest) dec = decodeManifest(payload.manifest);
-          const hasUrl = !!(dec && dec.url);
+        if (tier.type === 'dash') {
+          const d = await getTidalDashStream(TIDAL_TEST_TRACK_ID, null, false);
           return {
-            id: tier.id, label: tier.label, ok: hasUrl, ms: Date.now() - start,
-            deliveredQuality: payload && payload.audioQuality || null,
-            codec: dec && dec.codec || null,
-            bitDepth: payload && payload.bitDepth || null,
+            id: tier.id, label: tier.label, ok: !!d, ms: Date.now() - start,
+            deliveredQuality: d && d.streamQuality || null,
+            codec: d && d.codec || null,
           };
         }
+        // Mirror the real stream fallback path (getTidalStream): hls manifest for lossless tiers.
+        const params = { id: TIDAL_TEST_TRACK_ID, quality: tier.quality };
+        if (tier.quality === 'HI_RES_LOSSLESS' || tier.quality === 'LOSSLESS') params.manifest = 'hls';
+        const data = await hifiGet('/track/', params);
+        const payload = data && data.data ? data.data : data;
+        // Green = a stream URL is actually obtainable (instances may downgrade
+        // a requested tier — e.g. LOSSLESS -> HIGH AAC — the delivered codec is
+        // reported so the downgrade stays visible).
+        let dec = null;
+        if (payload && payload.manifest) dec = decodeManifest(payload.manifest);
+        const hasUrl = !!(dec && dec.url);
+        return {
+          id: tier.id, label: tier.label, ok: hasUrl, ms: Date.now() - start,
+          deliveredQuality: payload && payload.audioQuality || null,
+          codec: dec && dec.codec || null,
+          bitDepth: payload && payload.bitDepth || null,
+        };
       } catch(e) {
         return { id: tier.id, label: tier.label, ok: false, ms: Date.now() - start, error: e.message };
       }
     };
-    // Retry once on failure — a single dead credential in the pool can burn all
-    // rotation attempts on one request (e.g. QTE re-adding a 401ing cred between
-    // its own tests). The retry gets fresh picks and lands on a healthy cred.
     let result = await attempt();
     if (!result.ok) {
       await new Promise(r => setTimeout(r, 250));
@@ -1644,20 +884,17 @@ app.get('/quality-test', async c => {
     }
     return result;
   }));
-  const qobuzOk = results.filter(r => r.id.startsWith('qobuz') && r.ok).length;
-  const tidalOk = results.filter(r => r.id.startsWith('tidal') && r.ok).length;
-  return Response.json({ results, summary: { qobuz: qobuzOk + '/4', tidal: tidalOk + '/4' } });
+  const tidalOk = results.filter(r => r.ok).length;
+  return Response.json({ results, summary: { tidal: tidalOk + '/' + TIERS.length } });
 });
 
 app.get('/health', c => {
 return Response.json({
   status: 'ok',
-  version: '2.4.6',
+  version: '3.0.0',
   activeInstance,
   instanceHealthy,
-  qobuzBase: activeQobuzInstance,
   cachedTracks: TRACK_META_CACHE.size,
-  cachedQobuzIds: QOBUZ_TRACK_ID_CACHE.size,
   activeTokens: TOKEN_CACHE.size,
   rateLimits: {
     globalDailyUsed: globalDailyCount,
@@ -1678,7 +915,7 @@ return Response.json({
 id: 'com.eclipse.claudo.' + token.slice(0, 8),
 name: (() => { const { embeddedName } = parseTokenParam(c.req.param('token')); return embeddedName || entry.addonName || 'Claudo'; })(),
 version: '3.0.0',
-description: 'TIDAL catalog search + Qobuz Hi-Res 24-bit streams. Falls back to TIDAL Lossless/AAC. No account required.',
+description: 'TIDAL catalog search + Hi-Res 24-bit FLAC DASH streams. FLAC/Lossless/AAC. No account required.',
 icon: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRtklZxzKIxXbfKsPsGTlnL6lbQqrr1fsIuJY2g4Xtt4w&s=10',
 resources: ['search', 'stream', 'catalog'],
 types: ['track', 'album', 'artist', 'playlist']
@@ -1741,14 +978,14 @@ return Response.json({ error: 'Search failed', tracks: [], albums: [], artists: 
 });
 
 // ─── Search pipeline: build a full search response ──────────────────────────────
-// All five upstream calls (TIDAL s=/al=/a=/p= + Qobuz) run in parallel and each
-// result is cached independently (memory + Redis, 24h), so repeat searches
-// assemble from sub-caches instead of the network. Auxiliary calls (albums,
-// artists, playlists, Qobuz) are time-boxed so a slow one can never stall the
-// response — the critical track search gets the full budget. When the composite
-// cache misses, the sub-caches (same 24h TTL) are provably stale too, so their
-// Redis reads are skipped and the network is hit directly.
-async function buildSearchResult(q, limit, inst, compositeMissP, opts = {}) {
+// All four upstream calls (TIDAL s=/al=/a=/p=) run in parallel and each result
+// is cached independently (memory + Redis, 24h), so repeat searches assemble
+// from sub-caches instead of the network. Auxiliary calls (albums, artists,
+// playlists) are time-boxed so a slow one can never stall the response — the
+// critical track search gets the full budget. When the composite cache misses,
+// the sub-caches (same 24h TTL) are provably stale too, so their Redis reads
+// are skipped and the network is hit directly.
+async function buildSearchResult(q, limit, inst, compositeMissP) {
   const sKey = (type, n) => 'mc:subs:' + (inst || 'pool') + ':' + type + ':' + q.toLowerCase() + ':' + n;
   const subFetch = async (key, fn, timeoutMs) => {
     const mem = cGet(key);
@@ -1763,19 +1000,15 @@ async function buildSearchResult(q, limit, inst, compositeMissP, opts = {}) {
     return val;
   };
 
-  const [mainData, alData, arData, plData, qobuzItems] = await Promise.all([
+  const [mainData, alData, arData, plData] = await Promise.all([
     subFetch(sKey('s', limit), () => hifiGetForToken(inst, '/search/', { s: q, limit, offset: 0 }), 8000),
     subFetch(sKey('al', Math.min(limit, 20)), () => hifiGetForTokenSafe(inst, '/search/', { al: q, limit: Math.min(limit, 20), offset: 0 }), 800),
     subFetch(sKey('a', Math.min(limit, 20)), () => hifiGetForTokenSafe(inst, '/search/', { a: q, limit: Math.min(limit, 20), offset: 0 }), 800),
     subFetch(sKey('p', 20), () => hifiGetForTokenSafe(inst, '/search/', { p: q, limit: 20, offset: 0 }), 700),
-    subFetch(sKey('q', limit + 10), () => qobuzSearchDirect(q, limit + 10), 800),
   ]);
 const data = mainData || null;
 // Items array (tracks) at data.data.items OR data.items
 const items = data?.data?.items || data?.items || [];
-
-// Qobuz search runs in parallel (no extra latency) — its tracks top up the
-// result list only when TIDAL comes up short, never as ISRC duplicates.
 
 const albumMap = {}, artistMap = {}, artistHits = {}, tracks = [];
 for (let i = 0; i < items.length; i++) {
@@ -1796,37 +1029,6 @@ const tTitle = t.title || 'Unknown';
 const tArtist = trackArtist(t);
 cacheTrackMeta(t.id, tTitle, tArtist, t.isrc || null, isAtmosTrack(t));
 redisCacheTrackMeta(String(t.id), tTitle, tArtist, t.isrc || null, isAtmosTrack(t));
-// Background Qobuz pre-warm — find track AND pre-warm stream URL into cache
-// so /stream/:id returns instantly from cache without any live Qobuz API calls.
-// Also persists to Redis so any CF Worker isolate can serve the stream instantly.
-// Skipped when opts.skipPrewarm (cron prewarmer) — protects the Qobuz token
-// from burst stream-call load; streams prewarm lazily when users play them.
-if (!opts.skipPrewarm) (async () => {
-  try {
-    const qTrack = await qobuzFindBestTrack(tTitle, tArtist, t.isrc || null, inst);
-    if (qTrack && qTrack.id) {
-      cacheQobuzTrackId(t.id, qTrack); // writes to in-memory + Redis (cross-isolate)
-      // Pre-warm all quality tiers in parallel — await so streams are in Redis before user taps play
-      const preWarmKeys = [null, 'HIMAX', 'HI96', 'LOSSLESS', 'AAC320'];
-      const streamResults = await Promise.allSettled(
-        preWarmKeys.map(async key => {
-          const cKey = 'qstream:' + qTrack.id + ':' + (key || 'auto');
-          let result = cGet(cKey);
-          if (!result) result = await qobuzStream(qTrack.id, key).catch(() => null);
-          if (result) {
-            // Write to Redis keyed by TIDAL id so cross-isolate stream lookups are instant
-            await redisSaveQobuzStream(t.id, key, result).catch(() => {});
-          }
-          return result;
-        })
-      );
-      const firstStream = streamResults.find(r => r.status === 'fulfilled' && r.value)?.value;
-      if (firstStream) {
-        console.log('[prewarm] cached stream to Redis for tid=' + t.id + ' qid=' + qTrack.id + ' quality=' + firstStream.quality);
-      }
-    }
-  } catch(e) {}
-})();
 const tFormat = (t.audioQuality === 'HIGH' || t.audioQuality === 'LOW') ? 'aac' : 'flac';
       tracks.push({ id: String(t.id), title: atmosPrefix(t) + tTitle + atmosSuffix(t), artist: tArtist, album: t.album ? t.album.title : undefined, albumId: t.album?.id ? String(t.album.id) : undefined, albumArtworkURL: t.album?.cover ? coverUrl(t.album.cover, 1080) : undefined, trackNumber: t.trackNumber || undefined, year: t.album?.releaseDate ? String(t.album.releaseDate).slice(0, 4) : undefined, duration: trackDuration(t), artworkURL: coverUrl(t.album ? t.album.cover : null, 1080), format: tFormat, isrc: t.isrc || undefined, audioQuality: t.audioQuality || undefined, provider: 'Tidal', audioModes: t.audioModes || undefined });
     }
@@ -1846,67 +1048,6 @@ for (const a of arItems) {
   const arid = String(a.id);
   if (!artistMap[arid]) artistMap[arid] = { id: arid, name: a.name || 'Unknown', artworkURL: coverUrl(a.picture, 320), ...(a.genres && a.genres.length ? { genres: a.genres.map(g => g.name || g).filter(Boolean) } : {}) };
   artistHits[arid] = (artistHits[arid] || 0) + 1;
-}
-
-// === MERGE: Qobuz top-up tracks (only when TIDAL came up short) ─────────────
-// Qobuz IDs are namespaced with "qo:" prefix so they never collide with TIDAL's
-// numeric IDs. /stream, /album, /artist routes detect the prefix and resolve
-// through the Qobuz direct API.
-const QO_PREFIX = 'qo:';
-const qobuzItemsArr = Array.isArray(qobuzItems) ? qobuzItems : [];
-let remainingSlots = Math.max(0, limit - tracks.length);
-if (qobuzItemsArr.length > 0) {
-  console.log('[search] TIDAL yielded', tracks.length, 'of', limit, '— Qobuz top-up can fill', remainingSlots, 'slot(s)');
-}
-// Best pressing first (quality score), then drop ISRC duplicates of TIDAL hits
-const tidalIsrcs = new Set(tracks.map(t => t.isrc ? String(t.isrc).toUpperCase().replace(/[^A-Z0-9]/g, '') : null).filter(Boolean));
-const seenQIsrc = new Set();
-const qobuzRanked = [...qobuzItemsArr].sort((a, b) => qobuzTrackQualityScore(b) - qobuzTrackQualityScore(a));
-for (const qt of qobuzRanked) {
-  if (remainingSlots <= 0) break;
-  if (!qt || !qt.id) continue;
-  const qIsrcNorm = String(qt.isrc || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-  if (qIsrcNorm && (tidalIsrcs.has(qIsrcNorm) || seenQIsrc.has(qIsrcNorm))) continue;
-  if (qIsrcNorm) seenQIsrc.add(qIsrcNorm);
-  remainingSlots--;
-  const qtTitle = qt.title || 'Unknown';
-  const qtArtist = qt.performer?.name || 'Unknown';
-  const qIsHiRes = !!(qt.hires || qt.hires_streamable || qt.maximum_bit_depth > 16);
-  const qAudioQuality = qIsHiRes ? 'HI_RES_LOSSLESS' : 'LOSSLESS';
-  const qTrackId = QO_PREFIX + String(qt.id);
-  // Cache so /stream/:id can resolve this Qobuz track instantly (also Redis cross-isolate)
-  cacheTrackMeta(qTrackId, qtTitle, qtArtist, qt.isrc || null);
-  cacheQobuzTrackId(qTrackId, qt);
-  // Qobuz albums/artists — namespaced too, only added when TIDAL didn't surface them
-  if (qt.album) {
-    const qabid = QO_PREFIX + String(qt.album.id || qt.album.qobuz_id || '');
-    if (qabid !== QO_PREFIX && !albumMap[qabid]) albumMap[qabid] = { id: qabid, title: qt.album.title || 'Unknown', artist: qtArtist, artworkURL: qobuzCoverUrl(qt.album), trackCount: qt.album.tracks_count, year: qt.album.release_date_original ? String(qt.album.release_date_original).slice(0, 4) : undefined };
-  }
-  if (qt.performer) {
-    const qarid = QO_PREFIX + String(qt.performer.id || '');
-    if (qarid !== QO_PREFIX && !artistMap[qarid] && !Object.values(artistMap).some(a => (a.name || '').toLowerCase() === (qt.performer.name || '').toLowerCase())) {
-      artistMap[qarid] = { id: qarid, name: qt.performer.name || 'Unknown', artworkURL: qobuzCoverUrl(qt.album) };
-    }
-  }
-  tracks.push({ id: qTrackId, title: qtTitle, artist: qtArtist, album: qt.album?.title || undefined, albumId: (qt.album?.id || qt.album?.qobuz_id) ? QO_PREFIX + String(qt.album.id || qt.album.qobuz_id) : undefined, albumArtworkURL: qt.album ? qobuzCoverUrl(qt.album) : undefined, trackNumber: qt.track_number || undefined, year: qt.album?.release_date_original ? String(qt.album.release_date_original).slice(0, 4) : undefined, duration: trackDuration(qt), artworkURL: qobuzCoverUrl(qt.album), format: 'flac', isrc: qt.isrc || undefined, audioQuality: qAudioQuality, provider: 'Qobuz' });
-  // Background pre-warm: cache Qobuz stream URLs so /stream returns instantly
-  // (skipped in cron prewarmer — see opts.skipPrewarm above)
-  if (!opts.skipPrewarm) (async () => {
-    try {
-      const preWarmKeys = [null, 'HIMAX', 'HI96', 'LOSSLESS', 'AAC320'];
-      const streamResults = await Promise.allSettled(
-        preWarmKeys.map(async key => {
-          const cKey = 'qstream:' + qt.id + ':' + (key || 'auto');
-          let result = cGet(cKey);
-          if (!result) result = await qobuzStream(qt.id, key).catch(() => null);
-          if (result) await redisSaveQobuzStream(qTrackId, key, result).catch(() => {});
-          return result;
-        })
-      );
-      const firstStream = streamResults.find(r => r.status === 'fulfilled' && r.value)?.value;
-      if (firstStream) console.log('[prewarm] qobuz-only tid=' + qTrackId + ' qid=' + qt.id + ' quality=' + firstStream.quality);
-    } catch(e) {}
-  })();
 }
 
 const artistList = Object.keys(artistMap)
@@ -1942,9 +1083,8 @@ for (const p of [...(Array.isArray(plFromSearch) ? plFromSearch : []),
   if (plItems.length >= 10) break;
 }
 
-// === DEDUP: collapse same song across TIDAL + Qobuz into one result.
-// Keeps the entry with the highest audio quality (Hi-Res > Lossless > AAC),
-// so the best available source is what Eclipse streams.
+// === DEDUP: collapse duplicate results for the same song.
+// Keeps the entry with the highest audio quality (Hi-Res > Lossless > AAC).
 const seenTracks = new Map();
 for (const t of tracks) {
   const key = (t.title || '').toLowerCase().replace(/[^a-z0-9]/g, '') + '||' + (t.artist || '').toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -1964,7 +1104,93 @@ return result;
 }
 });
 
-// ─── Stream: Qobuz Hi-Res first, TIDAL fallback ────────────────────────────────
+// ── TIDAL DASH stream helper — hifi /dash/{id} ───────────────────────────────
+// The hifi instance 302-redirects to a fresh Tidal DASH manifest requesting
+// FLAC_HIRES,FLAC,EAC3_JOC,AACLC in priority order. We follow the redirect,
+// inspect the MPD's <Representation id="FLAC_HIRES,176400,24"> tags, and return
+// the highest available tier: Hi-Res FLAC > FLAC 16-bit > AAC. Atmos tracks
+// must contain EAC3_JOC — anything else is refused (no stereo fallback).
+async function getTidalDashStream(tid, inst, atmosOnly) {
+  const base = inst || activeInstance;
+  let mpdUrl = null;
+  try {
+    const r = await withHardTimeout(axios.get(base + '/dash/' + encodeURIComponent(tid), {
+      maxRedirects: 0,
+      timeout: 8000,
+      validateStatus: s => (s >= 200 && s < 400) || s === 404,
+    }), 8000, 'dash');
+    if (r.status === 301 || r.status === 302 || r.status === 303 || r.status === 307) {
+      mpdUrl = r.headers.location || null;
+    } else if (r.status === 404) {
+      return null; // instance has no /dash/ endpoint — caller falls back to /track/
+    }
+  } catch(e) {
+    return null;
+  }
+  if (!mpdUrl) return null;
+  if (!/^https?:/i.test(mpdUrl)) {
+    try { mpdUrl = new URL(mpdUrl, base + '/').href; } catch(e) { return null; }
+  }
+  let xml = null;
+  try {
+    const m = await withHardTimeout(axios.get(mpdUrl, { timeout: 8000, headers: { 'User-Agent': UA } }), 8000, 'mpd');
+    xml = typeof m.data === 'string' ? m.data : null;
+  } catch(e) {
+    return null;
+  }
+  if (!xml || !xml.includes('<MPD')) return null;
+
+  const reps = [];
+  for (const tag of String(xml).split(/<Representation\b/).slice(1)) {
+    const head = tag.slice(0, tag.indexOf('>'));
+    if (!head) continue;
+    const id = /id="([^"]*)"/.exec(head);
+    const codecs = /codecs="([^"]*)"/.exec(head);
+    if (id) reps.push({ id: id[1], codec: codecs ? codecs[1] : '' });
+  }
+  if (!reps.length) return null;
+
+  const classify = rep => {
+    const id = rep.id;
+    if (id.includes('FLAC_HIRES')) return 4;
+    if (id.includes('EAC3_JOC') || rep.codec.toLowerCase().includes('ec-3')) return 3;
+    if (id.includes('FLAC') || rep.codec.toLowerCase().includes('flac')) return 2;
+    if (id.includes('AAC') || rep.codec.toLowerCase().includes('mp4a') || rep.codec.toLowerCase().includes('aac')) return 1;
+    return 0;
+  };
+  const best = reps.reduce((a, b) => classify(b) > classify(a) ? b : a, reps[0]);
+  const cls = classify(best);
+  if (!cls) return null;
+  if (atmosOnly && cls !== 3) {
+    console.log('[tidal] Atmos track ' + tid + ': /dash/ returned non-Atmos MPD — no fallback to stereo');
+    return null;
+  }
+
+  const nums = best.id.match(/(\d{5,6}),(\d{1,2})$/);
+  const sampleRate = nums ? nums[1] : null;
+  const bitDepth = nums ? nums[2] : null;
+  const srDetail = sampleRate ? ' · ' + (bitDepth ? bitDepth + '-bit / ' : '') + (Number(sampleRate) / 1000) + ' kHz' : '';
+  const label = cls === 4 ? 'Hi-Res FLAC' + srDetail
+    : cls === 3 ? 'Dolby Atmos'
+    : cls === 2 ? 'FLAC 16-bit / 44.1 kHz'
+    : '320kbps AAC';
+  const streamQuality = cls === 3 ? 'DOLBY_ATMOS'
+    : cls === 4 ? 'HI_RES_LOSSLESS'
+    : cls === 2 ? 'LOSSLESS'
+    : 'HIGH';
+  console.log('[tidal] DASH OK for ' + tid + ' — ' + best.id + ' (sample rate ' + (sampleRate || '?') + ')');
+  return {
+    url: mpdUrl,
+    format: cls === 3 ? 'aac' : cls === 1 ? 'aac' : 'flac',
+    quality: 'Tidal · ' + label,
+    streamQuality: '[Tidal] ' + streamQuality,
+    codec: best.codec || null,
+    atmos: cls === 3,
+    expiresAt: Math.floor(Date.now() / 1000) + 1680, // MPD tokens are short-lived — 28 min
+  };
+}
+
+// ─── Stream: TIDAL DASH first, /track/ fallback ───────────────────────────────
 app.get('/u/:token/stream/:id', async c => {
 return withToken(c, async entry => {
 
@@ -1991,10 +1217,6 @@ if (!checkBulkDownloadLimit(entry)) {
 const tid = c.req.param('id');
 const inst = entry.instanceUrl;
 const pref = entry.preferredQuality;
-// Qobuz-only tracks come back from combined search as "qo:<qobuzId>".
-// These have no TIDAL equivalent — resolve and stream straight from Qobuz.
-const isQobuzOnly = String(tid).startsWith('qo:');
-const qobuzOnlyId = isQobuzOnly ? String(tid).slice(3) : null;
 
 const atmosDedupeKey = String(c.req.query('title') || '').trim().startsWith('◗◖ ') ? ':atmos' : '';
 return dedupeCall('stream:' + tid + ':' + (inst || 'pool') + ':' + (pref || 'auto') + atmosDedupeKey, async () => {
@@ -2045,7 +1267,7 @@ if (!atmosOnly) {
 
 // Flag unknown (stale cache, Eclipse-passed title, direct ID call) — verify
 // against /info/ once and persist the verdict so the next request is free.
-if (!atmosOnly && !atmosKnown && !isQobuzOnly) {
+if (!atmosOnly && !atmosKnown) {
   try {
     const trackInfo = await hifiGetForTokenSafe(inst, '/info/', { id: tid });
     const payload = trackInfo?.resource || trackInfo?.data || trackInfo;
@@ -2086,17 +1308,9 @@ if (!qTitle && !qIsrc) {
     console.log('meta: HiFi cold-lookup failed for tid', tid, '-', e.message);
   }
 }
-if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid, '- skipping Qobuz');
+if (!qTitle && !qIsrc) console.log('meta: no cache for tid', tid);
 
 // ── Quality maps ─────────────────────────────────────────────────────────────
-const PREF_TO_QOBUZ_KEY = {
-  'HI_RES_LOSSLESS': 'HIMAX', 'HIRESLOSSLESS': 'HIMAX', 'HIMAX': 'HIMAX',
-  'HI96': 'HI96', 'LOSSLESS': 'LOSSLESS',
-  'HIGH': 'AAC320', 'AAC320': null,  // HiFi-only tier
-  'LOW': 'AAC96',  'AAC96': 'AAC96',
-  // TIDAL-only tiers — Qobuz is skipped via isTidalOnlyPref above, these are never reached
-  'TIDAL_HIMAX': null, 'TIDAL_LOSSLESS': null, 'TIDAL_HIGH': null, 'TIDAL_LOW': null,
-};
 const PREF_TO_TIDAL = {
   'HI_RES_LOSSLESS': 'HI_RES_LOSSLESS', 'HIRESLOSSLESS': 'HI_RES_LOSSLESS',
   'HIMAX': 'HI_RES_LOSSLESS', 'HI96': 'HI_RES_LOSSLESS',
@@ -2186,103 +1400,26 @@ async function getTidalStream() {
   return null;
 }
 
-// ── Steps 4+5: Fire Qobuz AND TIDAL in parallel ───────────────────────────────
-// Both providers resolve their best available stream. After both settle, the
-// unified quality score picks the winner — NOT whoever responds first.
-// Qobuz cascade: pref controls the format order tried (27->7->6->5 for Hi-Res tiers).
-// Skip Qobuz only if: user explicitly chose a TIDAL-only tier, OR we have no metadata at all.
-const qobuzPrefKey = pref ? (PREF_TO_QOBUZ_KEY[pref] || null) : null;
-const isTidalOnlyPref = pref && ['TIDAL_HIMAX','TIDAL_LOSSLESS','TIDAL_HIGH','TIDAL_LOW','AAC320'].includes(pref);
-const skipQobuz = atmosOnly ? true : (isQobuzOnly ? false : (isTidalOnlyPref || (!qTitle && !qIsrc)));
-if (atmosOnly) console.log('[stream] Atmos-only mode — Qobuz skipped (Qobuz has no Dolby Atmos, no fallback allowed)');
-
-// Qobuz promise — full find+stream pipeline
-const qobuzPromise = skipQobuz ? Promise.resolve(null) : (async () => {
+// ── TIDAL stream — DASH first, /track/ waterfall fallback ────────────────────
+// getTidalDashStream hits the hifi instance's /dash/{id} (new DASH pipeline:
+// FLAC_HIRES,FLAC,EAC3_JOC,AACLC priority). If the instance doesn't expose
+// /dash/ (or it fails), fall back to the classic /track/ waterfall.
+const tidalPromise = (async () => {
   try {
-    // Fast path: check TIDAL->Qobuz track ID cache (populated at search/pre-warm time).
-    // Cache hit = skip the entire qobuzFindBestTrack pipeline entirely.
-    let qTrack = getCachedQobuzTrack(tid);
-    if (qTrack) {
-      console.log('[stream] qobuz id-cache HIT (memory) tid=' + tid + ' -> qobuzId=' + qTrack.id);
-    } else if (isQobuzOnly && qobuzOnlyId) {
-      // Qobuz-only track from combined search — the Qobuz ID is embedded in the
-      // "qo:" prefix itself, so no lookup needed.
-      qTrack = { id: qobuzOnlyId, title: qTitle || null, artist: qArtist || null };
-      console.log('[stream] qobuz-only track, direct qid=' + qobuzOnlyId);
-    } else {
-      // Check Redis — survives across CF Worker isolates (fixes cross-isolate cache miss)
-      qTrack = await redisLoadQobuzId(tid);
-      if (qTrack) {
-        cSet('qid:' + tid, qTrack, 3600); // warm local memory too
-        console.log('[stream] qobuz id-cache HIT (redis) tid=' + tid + ' -> qobuzId=' + qTrack.id);
-      }
+    const dash = await getTidalDashStream(tid, inst, atmosOnly);
+    if (dash) {
+      console.log('[stream] DASH HIT tid=' + tid + ' ' + dash.quality + ' (codec=' + (dash.codec || '?') + ')');
+      return dash;
     }
-    if (!qTrack) {
-      // Also check if Redis has a pre-warmed stream URL directly (fastest possible path)
-      const preWarmedStream = await redisLoadQobuzStream(tid, qobuzPrefKey);
-      if (preWarmedStream) {
-        console.log('[stream] qobuz stream HIT (redis pre-warm) tid=' + tid + ' quality=' + preWarmedStream.quality);
-        return preWarmedStream;
-      }
-    }
-    if (!qTrack) {
-      qTrack = await qobuzFindBestTrack(qTitle, qArtist, qIsrc, entry.instanceUrl);
-      if (qTrack && qTrack.id) cacheQobuzTrackId(tid, qTrack); // writes to both memory + Redis
-    }
-    if (!qTrack || !qTrack.id) return null;
-    // Title sanity check: if we have a known title and the Qobuz track title shares
-    // zero words with it, reject the match — prevents wrong-song streams.
-    // EXCEPTION: identical ISRC is authoritative for song identity — titles may
-    // differ legitimately (romanized vs Japanese, e.g. "Abunaikioku" vs "アブナイキオク").
-    if (qTitle && qTrack.title) {
-      const normIsrc = s => String(s || '').toUpperCase().replace(/[^A-Z0-9]/g, '');
-      const sameIsrc = !!(qIsrc && qTrack.isrc && normIsrc(qIsrc) === normIsrc(qTrack.isrc));
-      if (!sameIsrc) {
-        const norm = s => String(s||'').toLowerCase().replace(/[^a-z0-9\s]/g,' ').trim();
-        const wantWords = norm(qTitle).split(/\s+/).filter(w => w.length > 1);
-        const gotWords  = norm(qTrack.title).split(/\s+/).filter(w => w.length > 1);
-        const overlap   = wantWords.filter(w => gotWords.includes(w)).length;
-        if (wantWords.length > 0 && overlap === 0) {
-          console.warn('[stream] qobuz title mismatch: wanted "' + qTitle + '" got "' + qTrack.title + '" — skipping');
-          return null;
-        }
-      } else {
-        console.log('[stream] qobuz match trusted by ISRC', qIsrc, '->', qTrack.title);
-      }
-    }
-    const qStream = await qobuzStream(qTrack.id, qobuzPrefKey);
-    if (qStream) {
-      console.log('[stream] qobuz HIT', qTrack.id, qStream.quality);
-      return qStream;
-    }
-    return null;
+    if (atmosOnly) console.log('[stream] /dash/ unavailable for Atmos track ' + tid + ' — trying /track/ Atmos path');
+    return await getTidalStream();
   } catch(e) {
-    console.warn('[stream] qobuz error:', e.message);
+    console.warn('[stream] tidal error:', e.message);
     return null;
   }
 })();
 
-// TIDAL promise — runs immediately in parallel (skipped for Qobuz-only tracks,
-// which have no TIDAL equivalent and would only add latency/fail)
-const tidalPromise = isQobuzOnly ? Promise.resolve(null) : (async () => {
-  try { return await getTidalStream(); } catch(e) { return null; }
-})();
-
-// ── Combine: wait for BOTH, then pick the stream with the highest quality ──
-// No racing — each provider resolves its best available stream, and the
-// unified quality score (tier + bit depth + sample rate) decides the winner.
-const [qResult, tResult] = await Promise.all([qobuzPromise, tidalPromise]);
-
-const qScore = streamQualityScore(qResult);
-const tScore = streamQualityScore(tResult);
-
-let best = null;
-if (qResult && tResult) {
-  best = qScore >= tScore ? qResult : tResult; // ties prefer Qobuz (typically 24-bit/192)
-  console.log('[stream] quality compare: Qobuz=' + (qResult.quality || '?') + ' (' + qScore + ') vs TIDAL=' + (tResult.quality || '?') + ' (' + tScore + ') — picked ' + (best === qResult ? 'Qobuz' : 'TIDAL'));
-} else {
-  best = qResult || tResult;
-}
+const best = await tidalPromise;
 
 if (best) {
   cSet('tstream:' + tid + ':' + (pref || 'auto') + (atmosOnly ? ':atmos' : ''), best, 1680);
@@ -2303,32 +1440,7 @@ app.get('/u/:token/album/:id', async c => {
 return withToken(c, async entry => {
 const aid = c.req.param('id');
 const inst = entry.instanceUrl;
-// Qobuz albums from combined search are namespaced "qo:<qobuzAlbumId>"
-const isQobuzAlbum = String(aid).startsWith('qo:');
-const qobuzAlbumId = isQobuzAlbum ? String(aid).slice(3) : null;
 try {
-  if (isQobuzAlbum) {
-    // Fetch album + tracks directly from Qobuz (rotating credential pool)
-    let album = null;
-    try {
-      album = await qobuzApi('/album/get', { album_id: qobuzAlbumId, limit: 100, offset: 0 }, { timeout: 10000 });
-    } catch(e) {
-      return Response.json({ error: 'Qobuz album fetch failed: ' + e.message }, { status: 502 });
-    }
-    const rawItems = album?.tracks?.items || album?.tracks || [];
-    const artistName = album?.artist?.name || 'Unknown';
-    const cover = qobuzCoverUrl(album?.image ? { image: album.image } : null);
-    const tracks = (Array.isArray(rawItems) ? rawItems : []).map((t, i) => {
-      if (!t || !t.id) return null;
-      const tTitle = t.title || 'Unknown';
-      const tArtist = t.performer?.name || artistName;
-      const qId = 'qo:' + String(t.id);
-      cacheTrackMeta(qId, tTitle, tArtist, t.isrc || null);
-      cacheQobuzTrackId(qId, t);
-      return { id: qId, title: tTitle, artist: tArtist, duration: t.duration ? Math.floor(t.duration) : undefined, trackNumber: t.track_number || i + 1, artworkURL: cover, format: 'flac', isrc: t.isrc || undefined };
-    }).filter(Boolean);
-    return Response.json({ id: String(aid), title: album?.title || 'Unknown', artist: artistName, artworkURL: cover, year: album?.release_date_original ? String(album.release_date_original).slice(0, 4) : undefined, trackCount: album?.tracks_count || tracks.length, tracks });
-  }
   const data = await hifiGetForToken(inst, '/album/', { id: aid, limit: 100, offset: 0 });
   // Unwrap all known HiFi API response shapes
   const album = data?.data?.id ? data.data
@@ -2372,27 +1484,6 @@ app.get('/u/:token/artist/:id', async c => {
   return withToken(c, async entry => {
     const rawAid = String(c.req.param('id'));
     const inst = entry.instanceUrl;
-    // Qobuz artists from combined search are namespaced "qo:<qobuzArtistId>"
-    const isQobuzArtist = rawAid.startsWith('qo:');
-    if (isQobuzArtist) {
-      const qarId = rawAid.slice(3);
-      try {
-        // Artist info + top tracks + albums straight from Qobuz (rotating credential pool)
-        const data = await qobuzApi('/artist/get', { artist_id: qarId, extra: 'tracks', limit: 30 }, { timeout: 10000 });
-        const artistName = data?.name || 'Unknown';
-        const cover = qobuzCoverUrl(data?.image ? { image: data.image } : null);
-        const topTracks = (data?.tracks?.items || []).map(t => {
-          if (!t || !t.id) return null;
-          const qId = 'qo:' + String(t.id);
-          cacheTrackMeta(qId, t.title || 'Unknown', t.performer?.name || artistName, t.isrc || null);
-          cacheQobuzTrackId(qId, t);
-          return { id: qId, title: t.title || 'Unknown', artist: t.performer?.name || artistName, duration: t.duration ? Math.floor(t.duration) : undefined, artworkURL: qobuzCoverUrl(t.album), streamURL: undefined };
-        }).filter(Boolean);
-        return Response.json({ id: rawAid, name: artistName, artworkURL: cover, genres: (data?.genres || []).map(g => g.name).filter(Boolean), topTracks, albums: [] });
-      } catch(e) {
-        return Response.json({ error: 'Qobuz artist fetch failed: ' + e.message }, { status: 502 });
-      }
-    }
     const aid = parseInt(rawAid, 10);
     if (isNaN(aid)) return Response.json({ error: 'Invalid artist ID' }, { status: 400 });
 
@@ -2714,7 +1805,7 @@ async function _spineGetTrackStreamUrl(trackId, quality) {
   var tidalId = trackId.slice(sep + 2);
   return _spineFetch('/u/' + token + '/stream/' + encodeURIComponent(tidalId), {})
     .then(function(data) {
-      var aq = data.streamQuality || ((data.quality === 'hires' || data.quality === 'lossless' || data.format === 'flac' || data.source === 'qobuz') ? 'LOSSLESS' : 'HIGH');
+      var aq = data.streamQuality || ((data.quality === 'hires' || data.quality === 'lossless' || data.format === 'flac') ? 'LOSSLESS' : 'HIGH');
       return { streamUrl: data.url || data.streamUrl || null, track: { id: trackId, audioQuality: aq } };
     }).catch(function() {
       return { streamUrl: null, track: { id: trackId, audioQuality: 'HIGH' } };
@@ -2773,7 +1864,7 @@ return {
   id: 'claudo-tidal',
   name: 'Claudo',
   version: '3.0.0',
-  labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
+  labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'TIDAL'],
   searchTracks: _spineSearchTracks,
   getTrackStreamUrl: _spineGetTrackStreamUrl,
   getAlbum: _spineGetAlbum,
@@ -2796,7 +1887,7 @@ app.get('/8spine', async c => {
     name: 'Claudo',
     author: 'Ricky',
     version: '3.0.0',
-    description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
+    description: 'TIDAL full catalog search + Hi-Res 24-bit FLAC DASH streams. FLAC/Lossless/HiRes/Atmos. No account required.',
     download: base + '/8spine.js'
   });
 });
@@ -2830,8 +1921,8 @@ app.get('/8spine-source.json', async c => {
     name: 'Claudo',
     author: 'Ricky',
     version: '3.0.0',
-    description: 'TIDAL full catalog search + Qobuz Hi-Res 24-bit streams. FLAC/Lossless/HiRes. No account required.',
-    labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'QOBUZ', 'TIDAL'],
+    description: 'TIDAL full catalog search + Hi-Res 24-bit FLAC DASH streams. FLAC/Lossless/HiRes/Atmos. No account required.',
+    labels: ['FLAC', 'LOSSLESS', 'HI-RES', 'TIDAL'],
     download: base + '/8spine.js'
   };
 
@@ -2864,8 +1955,7 @@ app.get('/8spine-source.json', async c => {
 // Every hour, re-search the top-30 most-searched queries so fresh tokens get a
 // ~100ms warm hit instead of a cold upstream round-trip. Stream pre-warm is
 // SKIPPED here on purpose — stream URLs refresh lazily on play; the cron only
-// keeps the search result caches warm (protects the Qobuz token from burst
-// stream-call load that has caused token bans before).
+// keeps the search result caches warm.
 const PREWARM_TOP_N = 30;
 async function prewarmPopular() {
   try {
@@ -2876,7 +1966,7 @@ async function prewarmPopular() {
     for (let i = 0; i < queries.length; i += 5) {
       await Promise.all(queries.slice(i, i + 5).map(async q => {
         const cacheKey = 'mc:search:pool:' + q + ':20';
-        const result = await buildSearchResult(q, 20, null, null, { skipPrewarm: true });
+        const result = await buildSearchResult(q, 20, null, null);
         if (result) {
           cSet(cacheKey, result, 300);
           await upstashCmd('SET', cacheKey, JSON.stringify(result), 'EX', 86400).catch(() => {});
@@ -2887,10 +1977,6 @@ async function prewarmPopular() {
     console.log('[prewarm] failed: ' + (e && e.message));
   }
 }
-
-// Kick off the initial QTE credential sync at boot — the first Qobuz request
-// awaits it (qteEnsureSync), so there's no cold-pool window after a deploy.
-qteEnsureSync();
 
 export default {
   fetch: (req, env, ctx) => {
