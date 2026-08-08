@@ -743,6 +743,7 @@ h += 'list.appendChild(row);';
 h += '});';
 h += 'var s=d.summary||{};var sum=document.createElement("div");sum.style.cssText="margin-top:10px;font-size:12px;color:#555";';
 h += 'sum.textContent="TIDAL: "+s.tidal;';
+h += 'if(s.atmos){var a=document.createElement("div");a.style.cssText="margin-top:2px;font-size:12px;color:"+(s.atmos.indexOf("OK")===0?"#4a9a4a":"#c04040");a.textContent="Dolby Atmos: "+s.atmos;sum.appendChild(a);}';
 h += 'list.appendChild(sum);';
 h += '}).catch(function(e){list.innerHTML=\'<div style="color:#c04040;font-size:13px">Test failed: \'+e.message+\'</div>\';});';
 h += '}';
@@ -837,12 +838,14 @@ app.get('/quality-test', async c => {
   // 1781887 = Billie Jean (verified FLAC 24-bit at HI_RES_LOSSLESS on all instances).
   // The dash tier exercises the full /dash/{id} DASH pipeline (FLAC_HIRES first).
   const TIDAL_TEST_TRACK_ID = '1781887';
+  const ATMOS_TEST_TRACK_ID = '522737219';
   const TIERS = [
     { id: 'dash_hires',     label: 'DASH Hi-Res FLAC',          type: 'dash' },
     { id: 'tidal_hires',    label: 'TIDAL Hi-Res FLAC',          type: 'tidal', quality: 'HI_RES_LOSSLESS' },
     { id: 'tidal_lossless', label: 'TIDAL FLAC 16-bit',          type: 'tidal', quality: 'LOSSLESS' },
     { id: 'tidal_aac320',   label: 'TIDAL AAC 320',              type: 'tidal', quality: 'HIGH' },
     { id: 'tidal_aac96',    label: 'TIDAL AAC 96',               type: 'tidal', quality: 'LOW' },
+    { id: 'dolby_atmos',    label: 'Dolby Atmos (E-AC-3 JOC)',   type: 'atmos' },
   ];
   const results = await Promise.all(TIERS.map(async tier => {
     const attempt = async () => {
@@ -852,6 +855,16 @@ app.get('/quality-test', async c => {
           const d = await getTidalDashStream(TIDAL_TEST_TRACK_ID, null, false);
           return {
             id: tier.id, label: tier.label, ok: !!d, ms: Date.now() - start,
+            deliveredQuality: d && d.streamQuality || null,
+            codec: d && d.codec || null,
+          };
+        }
+        if (tier.type === 'atmos') {
+          // Atmos gate enforced (atmosOnly=true): a stereo MPD fails the test —
+          // real Atmos requires an EAC3_JOC (ec-3) representation.
+          const d = await getTidalDashStream(ATMOS_TEST_TRACK_ID, null, true);
+          return {
+            id: tier.id, label: tier.label, ok: !!(d && d.atmos), ms: Date.now() - start,
             deliveredQuality: d && d.streamQuality || null,
             codec: d && d.codec || null,
           };
@@ -884,8 +897,14 @@ app.get('/quality-test', async c => {
     }
     return result;
   }));
-  const tidalOk = results.filter(r => r.ok).length;
-  return Response.json({ results, summary: { tidal: tidalOk + '/' + TIERS.length } });
+  const tidalOk = results.filter(r => r.ok && r.id !== 'dolby_atmos').length;
+  const atmos = results.find(r => r.id === 'dolby_atmos');
+  return Response.json({ results, summary: {
+    tidal: tidalOk + '/' + (TIERS.length - 1),
+    atmos: atmos && atmos.ok
+      ? 'OK (' + (atmos.codec || 'E-AC-3 JOC') + ')'
+      : 'unavailable',
+  } });
 });
 
 app.get('/health', c => {
