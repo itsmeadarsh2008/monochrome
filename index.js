@@ -1114,13 +1114,14 @@ async function getTidalDashStream(tid, inst, atmosOnly) {
   const base = inst || activeInstance;
   let mpdUrl = null;
   try {
-    const r = await withHardTimeout(axios.get(base + '/dash/' + encodeURIComponent(tid), {
-      maxRedirects: 0,
-      timeout: 8000,
-      validateStatus: s => (s >= 200 && s < 400) || s === 404,
+    // Native fetch with redirect: 'manual' — axios/fetch-adapter can't be
+    // trusted to hand back the 3xx response + location header.
+    const r = await withHardTimeout(fetch(base + '/dash/' + encodeURIComponent(tid), {
+      headers: { 'User-Agent': UA },
+      redirect: 'manual',
     }), 8000, 'dash');
     if (r.status === 301 || r.status === 302 || r.status === 303 || r.status === 307) {
-      mpdUrl = r.headers.location || null;
+      mpdUrl = r.headers.get('location');
     } else if (r.status === 404) {
       return null; // instance has no /dash/ endpoint — caller falls back to /track/
     }
@@ -1133,8 +1134,8 @@ async function getTidalDashStream(tid, inst, atmosOnly) {
   }
   let xml = null;
   try {
-    const m = await withHardTimeout(axios.get(mpdUrl, { timeout: 8000, headers: { 'User-Agent': UA } }), 8000, 'mpd');
-    xml = typeof m.data === 'string' ? m.data : null;
+    const m = await withHardTimeout(fetch(mpdUrl, { headers: { 'User-Agent': UA } }), 8000, 'mpd');
+    if (m.ok) xml = await m.text();
   } catch(e) {
     return null;
   }
@@ -1980,11 +1981,9 @@ async function prewarmPopular() {
 
 export default {
   fetch: (req, env, ctx) => {
-    captureEnv(env);
     return app.fetch(req, env, ctx);
   },
   async scheduled(event, env, ctx) {
-    captureEnv(env);
     ctx.waitUntil(prewarmPopular());
   },
 };
