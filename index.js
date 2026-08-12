@@ -1299,10 +1299,7 @@ app.get("/quality-test", async (c) => {
             // budget) — enough coverage to prove init + media are fetchable
             // and the file is a real, growing, playable audio/mp4.
             const asm = await getDashAssembly(TIDAL_TEST_TRACK_ID, null, 4);
-            const { coverage } = asm
-              ? await dashTableSlice(asm, 500000)
-              : { coverage: 0 };
-            const playable = coverage > 500000;
+            const playable = !!(asm && asm.entries.length >= 2);
             return {
               id: tier.id,
               label: tier.label,
@@ -1310,7 +1307,7 @@ app.get("/quality-test", async (c) => {
               ms: Date.now() - start,
               deliveredQuality: playable ? "[Tidal] HI_RES_LOSSLESS" : null,
               codec: (asm && asm.codec) || null,
-              sizeMB: playable ? Math.round(coverage / 1048576) : null,
+              segments: asm ? asm.entries.length - 1 : null,
             };
           }
           if (tier.type === "atmos") {
@@ -2182,128 +2179,63 @@ async function dashTableSlice(asm, needBytes) {
     return { table: t, coverage };
   }
   // Probe up to 45 missing sizes this request (MPD fetch was cached/cheap, so
-  // total subrequests stay ≤ 48).
+  // total subrequests stay ≤ 48). Small waves — the Tidal CDN throttles
+  // bursts of parallel connections to the same host.
   const startIdx = t.sizes.length;
   const budget = Math.min(45, asm.entries.length - startIdx);
-  const probes = await Promise.allSettled(
-    asm.entries
-      .slice(startIdx, startIdx + budget)
-      .map((e) =>
-        fetch(e.url, {
-          headers: { "User-Agent": UA, Range: "bytes=0-0" },
-        }),
-      ),
-  );
-  for (let i = 0; i < probes.length; i++) {
-    const r = probes[i];
-    if (r.status !== "fulfilled" || !r.value.ok) break;
-    const cr = r.value.headers.get("content-range") || "";
-    const size = parseInt(cr.split("/")[1], 10);
-    if (!size) break;
-    t.sizes.push(size);
-    coverage += size;
+  let probed = 0;
+  const WAVE = 8;
+  while (probed < budget) {
+    const chunk = Math.min(WAVE, budget - probed);
+    const probes = await Promise.allSettled(
+      asm.entries
+        .slice(startIdx + probed, startIdx + probed + chunk)
+        .map((e) =>
+          fetch(e.url, {
+            headers: { "User-Agent": UA, Range: "bytes=0-0" },
+          }),
+        ),
+    );
+    let got = 0;
+    for (let i = 0; i < probes.length; i++) {
+      const r = probes[i];
+      if (r.status !== "fulfilled" || !r.value.ok) break;
+      const cr = r.value.headers.get("content-range") || "";
+      const size = parseInt(cr.split("/")[1], 10);
+      if (!size) break;
+      t.sizes.push(size);
+      coverage += size;
+      got++;
+    }
+    probed += probes.length;
+    if (got < probes.length) break; // failures suggest throttling — stop probing
   }
   return { table: t, coverage };
 }
 
-// dashStreamResponse: serve the assembled (possibly still-growing) file with
-// byte-range support. Ranges beyond the currently known coverage get a
-// transient 502 + Retry-After so the next request lands on more coverage —
-// playback converges within 1-2 requests on a cold table.
-function dashStreamResponse(asm, table, coverage, rangeHeader) {
-  const known = table.sizes.length;
-  const entries = asm.entries.slice(0, known);
-  let s = 0;
-  let e = coverage - 1;
-  let status = 200;
-  if (rangeHeader) {
-    const m = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader).trim());
-    if (m && (m[1] !== "" || m[2] !== "")) {
-      if (m[1] !== "" && m[2] !== "") {
-        s = parseInt(m[1], 10);
-        e = Math.min(parseInt(m[2], 10), coverage - 1);
-      } else if (m[1] !== "") {
-        s = parseInt(m[1], 10);
-        e = coverage - 1;
-      } else {
-        s = Math.max(coverage - parseInt(m[2], 10), 0);
-        e = coverage - 1;
-      }
-      if (s > e || s >= coverage) {
-        return new Response(null, {
-          status: 416,
-          headers: { "Content-Range": "bytes */" + coverage },
-        });
-      }
-      status = 206;
-    }
+// buildDashHls: wrap the DASH segment URLs in an HLS (fMP4) playlist. The
+// player fetches segments DIRECTLY (its IP is not CDN-blocked — Cloudflare
+// egress gets 403 on sp-ad-fa.audio.tidal.com); the worker only serves the
+// playlist, which is built from the MPD we CAN fetch.
+function buildDashHls(asm) {
+  const dur = "3.994";
+  const lines = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    "#EXT-X-TARGETDURATION:4",
+    "#EXT-X-MEDIA-SEQUENCE:0",
+    "#EXT-X-PLAYLIST-TYPE:VOD",
+    '#EXT-X-MAP:URI="' + asm.entries[0].url + '"',
+  ];
+  for (let i = 1; i < asm.entries.length; i++) {
+    lines.push("#EXTINF:" + dur + ",");
+    lines.push(asm.entries[i].url);
   }
-
-  let off = 0;
-  const parts = [];
-  for (let i = 0; i < entries.length; i++) {
-    const size = table.sizes[i];
-    const segS = off;
-    const segE = off + size - 1;
-    if (segE >= s && segS <= e) {
-      parts.push({
-        url: entries[i].url,
-        from: Math.max(s, segS) - segS,
-        to: Math.min(e, segE) - segS,
-      });
-    }
-    off += size;
-    if (off > e) break;
-  }
-
-  // Ordered streaming: at most 6 segment fetches in flight, bodies emitted in
-  // file order (FIFO on launch order = index order).
-  const body = new ReadableStream({
-    async start(controller) {
-      try {
-        const W = 6;
-        let i = 0;
-        const q = [];
-        while (i < parts.length) {
-          while (q.length < W && i < parts.length) {
-            const part = parts[i++];
-            q.push(
-              fetch(part.url, {
-                headers: {
-                  "User-Agent": UA,
-                  Range: "bytes=" + part.from + "-" + part.to,
-                },
-              }),
-            );
-          }
-          const r = await q.shift();
-          if (!r.ok || !r.body) throw new Error("segment HTTP " + r.status);
-          const reader = r.body.getReader();
-          for (;;) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            controller.enqueue(value);
-          }
-        }
-        controller.close();
-      } catch (err) {
-        controller.error(err);
-      }
-    },
-  });
-  const headers = {
-    "Content-Type": "audio/mp4",
-    "Accept-Ranges": "bytes",
-    "Content-Length": String(e - s + 1),
-    "Cache-Control": "no-store",
-  };
-  if (status === 206) {
-    headers["Content-Range"] = "bytes " + s + "-" + e + "/" + coverage;
-  }
-  return new Response(body, { status, headers });
+  lines.push("#EXT-X-ENDLIST");
+  return lines.join("\n") + "\n";
 }
 
-// ─── DASH single-file proxy — /u/:token/dash/:id ─────────────────────────────
+// ─── DASH proxy — /u/:token/dash/:id → HLS wrapper playlist ───────────────────
 // URL handed to Eclipse for the FLAC/Hi-Res/Atmos tiers. The class query
 // selects the representation (4=Hi-Res FLAC, 3=EAC3_JOC Atmos, 2=FLAC 16).
 app.get("/u/:token/dash/:id", async (c) => {
@@ -2311,46 +2243,18 @@ app.get("/u/:token/dash/:id", async (c) => {
     const tid = c.req.param("id");
     const cls = parseInt(String(c.req.query("class") || "4"), 10) || 4;
     const asm = await getDashAssembly(tid, entry.instanceUrl, cls);
-    if (!asm) {
+    if (!asm || asm.entries.length < 2) {
       return Response.json(
-        { error: "DASH assembly unavailable for track " + tid },
+        { error: "DASH manifest unavailable for track " + tid },
         { status: 502 },
       );
     }
-    // How far must we cover? The whole file for a plain GET; a bit past the
-    // requested range for byte-range requests (AVPlayer always starts at 0
-    // and crawls forward, so the table converges as playback progresses).
-    const rangeHeader = c.req.header("range");
-    let need = asm.entries.length ? Infinity : 0;
-    if (rangeHeader) {
-      const m = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader).trim());
-      if (m && m[1] !== "") need = parseInt(m[1], 10) + 1;
-    }
-    const { table, coverage } = await dashTableSlice(
-      asm,
-      need === Infinity ? asm.entries.length : need,
-    );
-    // A proper byte-range response demands the file be coherent through the
-    // requested end — hand the client a retry when the table hasn't reached
-    // it yet (coverage grows on every request until the table is complete).
-    if (coverage <= need && need !== Infinity) {
-      return new Response(null, {
-        status: 502,
-        headers: { "Retry-After": "1", "Cache-Control": "no-store" },
-      });
-    }
-    if (rangeHeader && coverage <= 0) {
-      return new Response(null, {
-        status: 502,
-        headers: { "Retry-After": "1", "Cache-Control": "no-store" },
-      });
-    }
-    return dashStreamResponse(
-      asm,
-      table,
-      coverage,
-      rangeHeader && coverage > 0 ? rangeHeader : null,
-    );
+    return new Response(buildDashHls(asm), {
+      headers: {
+        "Content-Type": "application/vnd.apple.mpegurl",
+        "Cache-Control": "private, max-age=1200",
+      },
+    });
   });
 });
 
@@ -2819,10 +2723,6 @@ app.get("/u/:token/stream/:id", async (c) => {
                 atmosOnly ? 3 : prefClass(pref),
               );
               if (asm && asm.cls !== 1) {
-                // Prime the segment-size table now (≤45 probes fit this
-                // request's budget) so the proxy's first byte-range request
-                // is served without a retry round-trip.
-                dashTableSlice(asm, 500000).catch(() => {});
                 const rawToken = parseTokenParam(c.req.param("token")).token;
                 const baseUrl =
                   (c.req.header("x-forwarded-proto") || "https") +
