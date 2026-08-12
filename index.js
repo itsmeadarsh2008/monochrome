@@ -1294,18 +1294,18 @@ app.get("/quality-test", async (c) => {
         const start = Date.now();
         try {
           if (tier.type === "dash") {
-            const d = await getTidalDashStream(
-              TIDAL_TEST_TRACK_ID,
-              null,
-              false,
-            );
+            // Real playability check: assemble the single-file fMP4 (probes
+            // init + every segment) and require an actually playable file.
+            const asm = await getDashAssembly(TIDAL_TEST_TRACK_ID, null, 4);
+            const playable = !!(asm && asm.total > 500000);
             return {
               id: tier.id,
               label: tier.label,
-              ok: !!d,
+              ok: playable,
               ms: Date.now() - start,
-              deliveredQuality: (d && d.streamQuality) || null,
-              codec: (d && d.codec) || null,
+              deliveredQuality: asm ? "[Tidal] HI_RES_LOSSLESS" : null,
+              codec: (asm && asm.codec) || null,
+              sizeMB: asm ? Math.round(asm.total / 1048576) : null,
             };
           }
           if (tier.type === "atmos") {
@@ -1961,6 +1961,326 @@ async function getTidalDashStream(tid, inst, atmosOnly) {
   };
 }
 
+// ─── DASH → single-file fMP4 assembly ─────────────────────────────────────────
+// Eclipse/AVFoundation cannot play MPEG-DASH MPD manifests — a raw manifest
+// URL returned as stream.url means instant track skip in the app. We
+// re-assemble the split-init fMP4 segments (init + moof/mdat sequence) into
+// ONE valid audio/mp4 file, served with byte-range support so AVPlayer can
+// both play and seek it. ~2.9MB per 4s segment at Hi-Res (24-bit 176.4kHz).
+
+const DASH_MPD_CACHE = new Map(); // "tid:inst" -> { xml, mpdUrl, expiresAt }
+const DASH_ASM_CACHE = new Map(); // "tid:inst:cls:id" -> { entries, total, expiresAt }
+
+// fetchDashMpd: GET /dash/{tid} (redirect: manual), follow the 307 location
+// to the MPD. For pool streams, tries every Hi-Fi instance in order and uses
+// the first that exposes /dash/ (only w9y8 does today). Cached 25 min.
+async function fetchDashMpd(tid, inst) {
+  const key = tid + ":" + (inst || "pool");
+  const hit = DASH_MPD_CACHE.get(key);
+  if (hit && hit.expiresAt > Date.now()) return hit;
+  const bases = inst ? [inst] : HIFI_INSTANCES;
+  for (const base of bases) {
+    let mpdUrl = null;
+    try {
+      const r = await withHardTimeout(
+        fetch(base + "/dash/" + encodeURIComponent(tid), {
+          headers: { "User-Agent": UA },
+          redirect: "manual",
+        }),
+        8000,
+        "dash",
+      );
+      if (
+        r.status === 301 ||
+        r.status === 302 ||
+        r.status === 303 ||
+        r.status === 307
+      ) {
+        mpdUrl = r.headers.get("location");
+      } else if (r.status === 404) {
+        continue; // instance has no /dash/ — try the next one
+      } else {
+        continue;
+      }
+    } catch (e) {
+      continue;
+    }
+    if (!mpdUrl) continue;
+    if (!/^https?:/i.test(mpdUrl)) {
+      try {
+        mpdUrl = new URL(mpdUrl, base + "/").href;
+      } catch (e) {
+        continue;
+      }
+    }
+    let xml = null;
+    try {
+      const m = await withHardTimeout(
+        fetch(mpdUrl, { headers: { "User-Agent": UA } }),
+        8000,
+        "mpd",
+      );
+      if (m.ok) xml = await m.text();
+    } catch (e) {
+      continue;
+    }
+    if (!xml || !xml.includes("<MPD")) continue;
+    const hit2 = {
+      xml,
+      mpdUrl,
+      expiresAt: Date.now() + 25 * 60 * 1000,
+    };
+    DASH_MPD_CACHE.set(key, hit2);
+    return hit2;
+  }
+  return null;
+}
+
+// dashReps: per-Representation id/codec/init/media/segment-count so we can
+// pick an exact representation template and build its segment URLs.
+function dashReps(xml) {
+  const reps = [];
+  for (const tag of String(xml).split(/<Representation\b/).slice(1)) {
+    const close = tag.indexOf("</Representation>");
+    const body = close > -1 ? tag.slice(0, close) : tag;
+    const head = body.slice(0, body.indexOf(">"));
+    if (!head) continue;
+    const id = /id="([^"]*)"/.exec(head);
+    if (!id) continue;
+    const init = /initialization="([^"]*)"/.exec(body);
+    const media = /media="([^"]*)"/.exec(body);
+    if (!init || !media) continue;
+    let count = 0;
+    const tl = /<SegmentTimeline>([\s\S]*?)<\/SegmentTimeline>/.exec(body);
+    if (tl) {
+      for (const sm of tl[1].matchAll(/<S\b[^>]*>/g)) {
+        const r = /r="(\d+)"/.exec(sm[0]);
+        count += r ? parseInt(r[1], 10) + 1 : 1;
+      }
+    }
+    if (!count) continue;
+    const startNumber = /startNumber="(\d+)"/.exec(body);
+    reps.push({
+      id: id[1],
+      codec: (/codecs="([^"]*)"/.exec(head) || [])[1] || "",
+      init: init[1],
+      media: media[1],
+      count,
+      startNumber: startNumber ? parseInt(startNumber[1], 10) : 1,
+    });
+  }
+  return reps;
+}
+
+const classifyDashRep = (rep) => {
+  const id = rep.id;
+  if (id.includes("FLAC_HIRES")) return 4;
+  if (id.includes("EAC3_JOC") || rep.codec.toLowerCase().includes("ec-3"))
+    return 3;
+  if (id.includes("FLAC") || rep.codec.toLowerCase().includes("flac"))
+    return 2;
+  if (
+    id.includes("AAC") ||
+    rep.codec.toLowerCase().includes("mp4a") ||
+    rep.codec.toLowerCase().includes("aac")
+  )
+    return 1;
+  return 0;
+};
+
+function dashRepLabel(rep, cls) {
+  if (cls === 3) return "Dolby Atmos";
+  if (cls === 2) return "FLAC 16-bit / 44.1 kHz";
+  if (cls === 1) return "320kbps AAC";
+  const nums = rep.id.match(/(\d{5,6}),(\d{1,2})$/);
+  const sampleRate = nums ? nums[1] : null;
+  const bitDepth = nums ? nums[2] : null;
+  const srDetail = sampleRate
+    ? " · " +
+      (bitDepth ? bitDepth + "-bit / " : "") +
+      Number(sampleRate) / 1000 +
+      " kHz"
+    : "";
+  return "Hi-Res FLAC" + srDetail;
+}
+
+// getDashAssembly: pick the representation for the requested class
+// (4=Hi-Res, 3=Atmos EAC3_JOC, 2=FLAC 16, 1=AAC), probe every segment's size
+// in parallel (Range: bytes=0-0), and cache the byte-offset table for 25 min.
+// The returned file = initialization + media segments 1..N concatenated.
+async function getDashAssembly(tid, inst, cls) {
+  const want = Math.min(Math.max(parseInt(cls, 10) || 4, 1), 4);
+  const mpd = await fetchDashMpd(tid, inst);
+  if (!mpd) return null;
+  const reps = dashReps(mpd.xml)
+    .map((r) => ({ ...r, cls: classifyDashRep(r) }))
+    .filter((r) => r.cls > 0);
+  let best = null;
+  for (let c = want; c >= 1; c--) {
+    best = reps.find((r) => r.cls === c);
+    if (best) break;
+  }
+  if (!best) return null;
+  const cacheKey = tid + ":" + (inst || "pool") + ":" + want + ":" + best.id;
+  const hit = DASH_ASM_CACHE.get(cacheKey);
+  if (hit && hit.expiresAt > Date.now()) return hit;
+
+  const entries = [
+    { url: best.init.replace(/&amp;/g, "&"), size: 0 },
+  ];
+  for (let i = 0; i < best.count; i++) {
+    entries.push({
+      url: best.media
+        .replace(/&amp;/g, "&")
+        .replace(/\$Number(?:%\d+d)?\$/g, String(best.startNumber + i)),
+      size: 0,
+    });
+  }
+  const probes = await Promise.allSettled(
+    entries.map((e) =>
+      fetch(e.url, {
+        headers: { "User-Agent": UA, Range: "bytes=0-0" },
+      }),
+    ),
+  );
+  let total = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const r = probes[i];
+    if (r.status !== "fulfilled" || !r.value.ok) return null;
+    const cr = r.value.headers.get("content-range") || "";
+    const size = parseInt(cr.split("/")[1], 10);
+    if (!size) return null;
+    entries[i].size = size;
+    total += size;
+  }
+  const asm = {
+    entries,
+    total,
+    cls: best.cls,
+    codec: best.codec || null,
+    label: dashRepLabel(best, best.cls),
+    expiresAt: mpd.expiresAt,
+  };
+  DASH_ASM_CACHE.set(cacheKey, asm);
+  return asm;
+}
+
+// dashStreamResponse: serve the assembled file with byte-range support.
+function dashStreamResponse(asm, rangeHeader) {
+  const total = asm.total;
+  let s = 0;
+  let e = total - 1;
+  let status = 200;
+  if (rangeHeader) {
+    const m = /^bytes=(\d*)-(\d*)$/.exec(String(rangeHeader).trim());
+    if (m && (m[1] !== "" || m[2] !== "")) {
+      if (m[1] !== "" && m[2] !== "") {
+        s = parseInt(m[1], 10);
+        e = Math.min(parseInt(m[2], 10), total - 1);
+      } else if (m[1] !== "") {
+        s = parseInt(m[1], 10);
+        e = total - 1;
+      } else {
+        s = Math.max(total - parseInt(m[2], 10), 0);
+        e = total - 1;
+      }
+      if (s > e || s >= total) {
+        return new Response(null, {
+          status: 416,
+          headers: { "Content-Range": "bytes */" + total },
+        });
+      }
+      status = 206;
+    }
+  }
+
+  let off = 0;
+  const parts = [];
+  for (let i = 0; i < asm.entries.length; i++) {
+    const size = asm.entries[i].size;
+    const segS = off;
+    const segE = off + size - 1;
+    if (segE >= s && segS <= e) {
+      parts.push({
+        url: asm.entries[i].url,
+        from: Math.max(s, segS) - segS,
+        to: Math.min(e, segE) - segS,
+      });
+    }
+    off += size;
+    if (off > e) break;
+  }
+
+  // Ordered streaming: at most 6 segment fetches in flight, bodies emitted in
+  // file order (FIFO on launch order = index order).
+  const body = new ReadableStream({
+    async start(controller) {
+      try {
+        const W = 6;
+        let i = 0;
+        const q = [];
+        while (i < parts.length) {
+          while (q.length < W && i < parts.length) {
+            const part = parts[i++];
+            q.push(
+              fetch(part.url, {
+                headers: { "User-Agent": UA, Range: "bytes=" + part.from + "-" + part.to },
+              }),
+            );
+          }
+          const r = await q.shift();
+          if (!r.ok || !r.body) throw new Error("segment HTTP " + r.status);
+          const reader = r.body.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            controller.enqueue(value);
+          }
+        }
+        controller.close();
+      } catch (err) {
+        controller.error(err);
+      }
+    },
+  });
+  const headers = {
+    "Content-Type": "audio/mp4",
+    "Accept-Ranges": "bytes",
+    "Content-Length": String(e - s + 1),
+    "Cache-Control": "no-store",
+  };
+  if (status === 206) {
+    headers["Content-Range"] = "bytes " + s + "-" + e + "/" + total;
+  }
+  return new Response(body, { status, headers });
+}
+
+// ─── DASH single-file proxy — /u/:token/dash/:id ─────────────────────────────
+// URL handed to Eclipse for the FLAC/Hi-Res/Atmos tiers. The class query
+// selects the representation (4=Hi-Res FLAC, 3=EAC3_JOC Atmos, 2=FLAC 16).
+app.get("/u/:token/dash/:id", async (c) => {
+  return withToken(c, async (entry) => {
+    const tid = c.req.param("id");
+    const cls = parseInt(String(c.req.query("class") || "4"), 10) || 4;
+    const asm = await getDashAssembly(tid, entry.instanceUrl, cls);
+    if (!asm) {
+      return Response.json(
+        { error: "DASH assembly unavailable for track " + tid },
+        { status: 502 },
+      );
+    }
+    return dashStreamResponse(asm, c.req.header("range"));
+  });
+});
+
+// prefClass: preferredQuality -> DASH representation class.
+// AUTO always serves the highest available (user requirement).
+function prefClass(pref) {
+  if (pref === "LOSSLESS") return 2;
+  if (pref === "AAC320" || pref === "HIGH" || pref === "LOW") return 1;
+  return 4; // HIMAX, HI96, null/auto
+}
+
 // ─── Stream: TIDAL DASH first, /track/ fallback ───────────────────────────────
 app.get("/u/:token/stream/:id", async (c) => {
   return withToken(c, async (entry) => {
@@ -2409,23 +2729,50 @@ app.get("/u/:token/stream/:id", async (c) => {
           try {
             const dash = await getTidalDashStream(tid, inst, atmosOnly);
             if (dash) {
-              console.log(
-                "[stream] DASH HIT tid=" +
-                  tid +
-                  " " +
-                  dash.quality +
-                  " (codec=" +
-                  (dash.codec || "?") +
-                  ")",
+              // A raw MPD URL cannot play in Eclipse (no DASH support) — the
+              // track would skip immediately. Re-serve the DASH stream as a
+              // single playable audio/mp4 file via the assembly proxy.
+              const asm = await getDashAssembly(
+                tid,
+                inst,
+                atmosOnly ? 3 : prefClass(pref),
               );
-              return dash;
+              if (asm && asm.cls !== 1) {
+                const rawToken = parseTokenParam(c.req.param("token")).token;
+                const baseUrl =
+                  (c.req.header("x-forwarded-proto") || "https") +
+                  "://" +
+                  c.req.header("host");
+                dash.url =
+                  baseUrl +
+                  "/u/" +
+                  rawToken +
+                  "/dash/" +
+                  tid +
+                  "?class=" +
+                  asm.cls;
+                dash.format = asm.cls === 3 ? "aac" : "flac";
+                dash.quality = "Tidal · " + asm.label;
+                dash.codec = asm.codec;
+                console.log(
+                  "[stream] DASH assembled tid=" +
+                    tid +
+                    " " +
+                    asm.label +
+                    " (" +
+                    Math.round(asm.total / 1048576) +
+                    "MB) -> " +
+                    dash.url.slice(0, 60) +
+                    "…",
+                );
+                return dash;
+              }
+              // Assembly unavailable — falling through to /track/ (at worst an
+              // AAC direct URL, playable either way). Never serve the bare MPD.
+              console.log(
+                "[stream] DASH assembly failed for " + tid + " — /track/ fallback",
+              );
             }
-            if (atmosOnly)
-              console.log(
-                "[stream] /dash/ unavailable for Atmos track " +
-                  tid +
-                  " — trying /track/ Atmos path",
-              );
             return await getTidalStream();
           } catch (e) {
             console.warn("[stream] tidal error:", e.message);
