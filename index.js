@@ -2294,7 +2294,7 @@ app.get("/u/:token/stream/:id", async (c) => {
       ? ":atmos"
       : "";
     const streamCacheKey =
-      "tstream:" +
+      "tstream:v2:" +
       tid +
       ":" +
       (inst || "pool") +
