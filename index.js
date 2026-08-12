@@ -1829,52 +1829,13 @@ app.get("/u/:token/search", async (c) => {
 // the highest available tier: Hi-Res FLAC > FLAC 16-bit > AAC. Atmos tracks
 // must contain EAC3_JOC — anything else is refused (no stereo fallback).
 async function getTidalDashStream(tid, inst, atmosOnly) {
-  const base = inst || activeInstance;
-  let mpdUrl = null;
-  try {
-    // Native fetch with redirect: 'manual' — axios/fetch-adapter can't be
-    // trusted to hand back the 3xx response + location header.
-    const r = await withHardTimeout(
-      fetch(base + "/dash/" + encodeURIComponent(tid), {
-        headers: { "User-Agent": UA },
-        redirect: "manual",
-      }),
-      8000,
-      "dash",
-    );
-    if (
-      r.status === 301 ||
-      r.status === 302 ||
-      r.status === 303 ||
-      r.status === 307
-    ) {
-      mpdUrl = r.headers.get("location");
-    } else if (r.status === 404) {
-      return null; // instance has no /dash/ endpoint — caller falls back to /track/
-    }
-  } catch (e) {
-    return null;
-  }
-  if (!mpdUrl) return null;
-  if (!/^https?:/i.test(mpdUrl)) {
-    try {
-      mpdUrl = new URL(mpdUrl, base + "/").href;
-    } catch (e) {
-      return null;
-    }
-  }
-  let xml = null;
-  try {
-    const m = await withHardTimeout(
-      fetch(mpdUrl, { headers: { "User-Agent": UA } }),
-      8000,
-      "mpd",
-    );
-    if (m.ok) xml = await m.text();
-  } catch (e) {
-    return null;
-  }
-  if (!xml || !xml.includes("<MPD")) return null;
+  // fetchDashMpd races every Hi-Fi instance (for pool streams) — bffw/api1
+  // lack /dash/, so a single activeInstance check silently breaks Hi-Res on
+  // pool tokens. Reuse the pool-aware resolver so DASH is always found.
+  const mpd = await fetchDashMpd(tid, inst);
+  if (!mpd) return null; // caller falls back to /track/
+  const mpdUrl = mpd.mpdUrl;
+  const xml = mpd.xml;
 
   const reps = [];
   for (const tag of String(xml)
