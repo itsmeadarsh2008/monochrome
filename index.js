@@ -16,9 +16,9 @@ async function parseBody(c) {
 }
 
 const HIFI_INSTANCES = [
+  "https://hifi-api-dn40.onrender.com",
   "https://hifi-api-w9y8.onrender.com",
   "https://hifi-api-bffw.onrender.com",
-  "https://hifi-api1.onrender.com",
 ];
 let activeInstance = HIFI_INSTANCES[0];
 let instanceHealthy = false;
