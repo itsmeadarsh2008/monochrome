@@ -2238,6 +2238,13 @@ function prefClass(pref) {
   return 4; // HIMAX, HI96, null/auto
 }
 
+function dashStreamQuality(cls) {
+  if (cls === 3) return "DOLBY_ATMOS";
+  if (cls === 4) return "HI_RES_LOSSLESS";
+  if (cls === 2) return "LOSSLESS";
+  return "HIGH";
+}
+
 // ─── Stream: TIDAL DASH first, /track/ fallback ───────────────────────────────
 app.get("/u/:token/stream/:id", async (c) => {
   return withToken(c, async (entry) => {
@@ -2679,28 +2686,24 @@ app.get("/u/:token/stream/:id", async (c) => {
         }
 
         // ── TIDAL stream — DASH first, /track/ waterfall fallback ────────────────────
-        // getTidalDashStream hits the hifi instance's /dash/{id} (new DASH pipeline:
-        // FLAC_HIRES,FLAC,EAC3_JOC,AACLC priority). If the instance doesn't expose
-        // /dash/ (or it fails), fall back to the classic /track/ waterfall.
+        // Resolve DASH ONCE (getTidalDashStream + getDashAssembly used to double
+        // the MPD fetch, which doubled the chance of a transient dn40 503-kill).
         const tidalPromise = (async () => {
           try {
-            const dash = await getTidalDashStream(tid, inst, atmosOnly);
-            if (dash) {
+            const wantClass = atmosOnly ? 3 : prefClass(pref);
+            const asm = await getDashAssembly(tid, inst, wantClass);
+            if (asm && asm.cls !== 1) {
               // A raw MPD URL cannot play in Eclipse (no DASH support) — the
-              // track would skip immediately. Re-serve the DASH stream as a
-              // single playable audio/mp4 file via the assembly proxy.
-              const asm = await getDashAssembly(
-                tid,
-                inst,
-                atmosOnly ? 3 : prefClass(pref),
-              );
-              if (asm && asm.cls !== 1) {
-                const rawToken = parseTokenParam(c.req.param("token")).token;
-                const baseUrl =
-                  (c.req.header("x-forwarded-proto") || "https") +
-                  "://" +
-                  c.req.header("host");
-                dash.url =
+              // track would skip immediately. Re-serve the DASH stream as an
+              // HLS playlist built from the MPD; the app fetches fMP4 FLAC
+              // segments directly (CDN 206s to client IPs).
+              const rawToken = parseTokenParam(c.req.param("token")).token;
+              const baseUrl =
+                (c.req.header("x-forwarded-proto") || "https") +
+                "://" +
+                c.req.header("host");
+              const dash = {
+                url:
                   baseUrl +
                   "/u/" +
                   String(rawToken)
@@ -2710,29 +2713,33 @@ app.get("/u/:token/stream/:id", async (c) => {
                   "/dash/" +
                   tid +
                   "?class=" +
-                  asm.cls;
-                dash.format = asm.cls === 3 ? "aac" : "flac";
-                dash.quality = "Tidal · " + asm.label;
-                dash.codec = asm.codec;
-                console.log(
-                  "[stream] DASH assembled tid=" +
-                    tid +
-                    " " +
-                    asm.label +
-                    " (" +
-                    asm.entries.length +
-                    " segs) -> " +
-                    dash.url.slice(0, 60) +
-                    "…",
-                );
-                return dash;
-              }
-              // Assembly unavailable — falling through to /track/ (at worst an
-              // AAC direct URL, playable either way). Never serve the bare MPD.
+                  asm.cls,
+                format: asm.cls === 3 ? "aac" : "flac",
+                quality: "Tidal · " + asm.label,
+                streamQuality: "[Tidal] " + dashStreamQuality(asm.cls),
+                codec: asm.codec,
+                atmos: asm.cls === 3,
+                expiresAt: Math.floor(Date.now() / 1000) + 1680,
+              };
               console.log(
-                "[stream] DASH assembly failed for " + tid + " — /track/ fallback",
+                "[stream] DASH resolved tid=" +
+                  tid +
+                  " " +
+                  asm.label +
+                  " (" +
+                  asm.entries.length +
+                  " segs) -> " +
+                  dash.url.slice(0, 60) +
+                  "…",
               );
+              return dash;
             }
+            if (atmosOnly)
+              console.log(
+                "[stream] /dash/ unavailable for Atmos track " +
+                  tid +
+                  " — trying /track/ Atmos path",
+              );
             return await getTidalStream();
           } catch (e) {
             console.warn("[stream] tidal error:", e.message);
