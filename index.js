@@ -1943,31 +1943,42 @@ async function fetchDashMpd(tid, inst) {
   if (hit && hit.expiresAt > Date.now()) return hit;
   const bases = inst ? [inst] : HIFI_INSTANCES;
   for (const base of bases) {
-    let mpdUrl = null;
-    try {
-      const r = await withHardTimeout(
-        fetch(base + "/dash/" + encodeURIComponent(tid), {
-          headers: { "User-Agent": UA },
-          redirect: "manual",
-        }),
-        8000,
-        "dash",
-      );
-      if (
-        r.status === 301 ||
-        r.status === 302 ||
-        r.status === 303 ||
-        r.status === 307
-      ) {
-        mpdUrl = r.headers.get("location");
-      } else if (r.status === 404) {
-        continue; // instance has no /dash/ — try the next one
-      } else {
+     let mpdUrl = null;
+    let attemptStatus = 0;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const r = await withHardTimeout(
+          fetch(base + "/dash/" + encodeURIComponent(tid), {
+            headers: { "User-Agent": UA },
+            redirect: "manual",
+          }),
+          8000,
+          "dash",
+        );
+        attemptStatus = r.status;
+        if (
+          r.status === 301 ||
+          r.status === 302 ||
+          r.status === 303 ||
+          r.status === 307
+        ) {
+          mpdUrl = r.headers.get("location");
+          break;
+        } else if (r.status === 404) {
+          break; // no /dash/ on this instance — permanent, try next instance
+        } else if (r.status >= 500) {
+          await new Promise((res) => setTimeout(res, 300 * (attempt + 1)));
+          continue; // transient (cold start / 503) — retry this instance
+        } else {
+          break;
+        }
+      } catch (e) {
+        attemptStatus = "err";
+        await new Promise((res) => setTimeout(res, 300 * (attempt + 1)));
         continue;
       }
-    } catch (e) {
-      continue;
     }
+    if (!mpdUrl && attemptStatus >= 500) continue;
     if (!mpdUrl) continue;
     if (!/^https?:/i.test(mpdUrl)) {
       try {
